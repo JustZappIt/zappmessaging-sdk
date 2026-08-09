@@ -120,7 +120,7 @@ const PEER_RATE_LIMIT_PER_MIN = getArgInt('peer-rate-limit', 120)
 const PEER_RATE_LIMIT_WINDOW_MS = 60000
 
 // --- Logging ---
-const LOG_LEVEL = getArg('log-level') || 'info'  // 'debug' | 'info' | 'warn' | 'error' | 'off'
+const LOG_LEVEL = getArg('log-level') || 'off'  // File diagnostics are opt-in with 'debug'
 
 module.exports = {
   BLIND_PEER_KEYS,

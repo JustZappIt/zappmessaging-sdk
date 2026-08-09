@@ -2,7 +2,7 @@
 //  ZMConversation.swift
 //  ZappMessaging
 //
-//  Represents a chat conversation (direct, group, store, or city)
+//  Represents a direct or group chat conversation
 //
 
 import Foundation
@@ -20,12 +20,6 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
     
     /// Group ID (for group chats only)
     public let groupId: String?
-    
-    /// Store ID (for store rooms only)
-    public let storeId: String?
-    
-    /// City slug (for city channels only)
-    public let citySlug: String?
     
     /// Creator's public key (for groups only)
     public let creatorKey: String?
@@ -50,8 +44,6 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
         type: ConversationType,
         participantIds: [String],
         groupId: String? = nil,
-        storeId: String? = nil,
-        citySlug: String? = nil,
         creatorKey: String? = nil,
         displayName: String,
         lastMessage: String? = nil,
@@ -63,8 +55,6 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
         self.type = type
         self.participantIds = participantIds
         self.groupId = groupId
-        self.storeId = storeId
-        self.citySlug = citySlug
         self.creatorKey = creatorKey
         self.displayName = displayName
         self.lastMessage = lastMessage
@@ -78,6 +68,4 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
 public enum ConversationType: String, Codable, Equatable, Sendable {
     case direct
     case group
-    case store
-    case city
 }

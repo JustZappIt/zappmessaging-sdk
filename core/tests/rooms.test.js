@@ -7,49 +7,11 @@ const assert = require('node:assert')
 const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const {
-  deriveStoreRoomTopic,
-  deriveCityChannelTopic,
   deriveDirectChatTopic,
   deriveGroupChatTopic,
   derivePersonalTopic,
   generateGroupId
 } = require('../lib/rooms')
-
-test('deriveStoreRoomTopic generates 32-byte topic', () => {
-  const topic = deriveStoreRoomTopic('store-123')
-  assert.ok(topic, 'Topic should be generated')
-  assert.strictEqual(topic.byteLength, 32, 'Topic should be 32 bytes')
-})
-
-test('deriveStoreRoomTopic is deterministic', () => {
-  const topic1 = deriveStoreRoomTopic('store-123')
-  const topic2 = deriveStoreRoomTopic('store-123')
-  assert.ok(b4a.equals(topic1, topic2), 'Same store ID should produce same topic')
-})
-
-test('deriveStoreRoomTopic produces different topics for different stores', () => {
-  const topic1 = deriveStoreRoomTopic('store-123')
-  const topic2 = deriveStoreRoomTopic('store-456')
-  assert.ok(!b4a.equals(topic1, topic2), 'Different store IDs should produce different topics')
-})
-
-test('deriveCityChannelTopic generates 32-byte topic', () => {
-  const topic = deriveCityChannelTopic('new-york')
-  assert.ok(topic, 'Topic should be generated')
-  assert.strictEqual(topic.byteLength, 32, 'Topic should be 32 bytes')
-})
-
-test('deriveCityChannelTopic is deterministic', () => {
-  const topic1 = deriveCityChannelTopic('london')
-  const topic2 = deriveCityChannelTopic('london')
-  assert.ok(b4a.equals(topic1, topic2), 'Same city should produce same topic')
-})
-
-test('deriveCityChannelTopic is case-insensitive', () => {
-  const topic1 = deriveCityChannelTopic('London')
-  const topic2 = deriveCityChannelTopic('london')
-  assert.ok(b4a.equals(topic1, topic2), 'City names should be case-insensitive')
-})
 
 test('deriveDirectChatTopic generates 32-byte topic', () => {
   const keyA = b4a.toString(crypto.randomBytes(32), 'hex')
@@ -136,4 +98,3 @@ test('generateGroupId produces unique IDs', () => {
   const id2 = generateGroupId()
   assert.notStrictEqual(id1, id2, 'Each call should produce a unique ID')
 })
-

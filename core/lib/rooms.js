@@ -9,28 +9,6 @@ const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
 
 /**
- * Derive topic for a store room
- * @param {string} storeId - Store identifier (UUID or similar)
- * @returns {Buffer} 32-byte topic
- */
-function deriveStoreRoomTopic(storeId) {
-  const data = b4a.from('store:' + storeId, 'utf8')
-  const seed = crypto.data(data) // Blake2b hash
-  return crypto.discoveryKey(seed)
-}
-
-/**
- * Derive topic for a city channel
- * @param {string} citySlug - City identifier (e.g., 'new-york', 'london')
- * @returns {Buffer} 32-byte topic
- */
-function deriveCityChannelTopic(citySlug) {
-  const data = b4a.from('city:' + citySlug.toLowerCase(), 'utf8')
-  const seed = crypto.data(data) // Blake2b hash
-  return crypto.discoveryKey(seed)
-}
-
-/**
  * Derive topic for a direct chat between two users
  * Order-independent: both users derive the same topic
  * @param {string} pubKeyHexA - First user's public key (hex)
@@ -77,8 +55,6 @@ function generateGroupId() {
 }
 
 module.exports = {
-  deriveStoreRoomTopic,
-  deriveCityChannelTopic,
   deriveDirectChatTopic,
   deriveGroupChatTopic,
   derivePersonalTopic,

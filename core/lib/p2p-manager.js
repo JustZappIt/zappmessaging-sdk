@@ -2,7 +2,7 @@
  * P2P Manager - Manages peer connections via Hyperswarm
  *
  * Uses topic-based discovery (swarm.join) for all connection types.
- * Supports direct chats, group chats, store rooms, and city channels.
+ * Supports direct chats and group chats.
  */
 
 const Hyperswarm = require('hyperswarm')
@@ -15,39 +15,16 @@ const { DHTHealthMonitor, HealthStatus } = require('./dht-health')
 const {
   deriveDirectChatTopic,
   deriveGroupChatTopic,
-  derivePersonalTopic,
-  deriveStoreRoomTopic,
-  deriveCityChannelTopic
+  derivePersonalTopic
 } = require('./rooms')
 const config = require('./config')
 const { registerPushEndpoint: registerPushEndpointRpc } = require('./push-register')
 const { putInvite, drainInvites, throughDht, throughHttps } = require('./invite-mailbox')
 const { ChatStore } = require('./chat-store')
 const { isMediaId, isPeerId } = require('./media-id')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-// Diagnostic logging (matches index.js pattern)
-let _diagFs, _diagPath, _diagOs, _diagFile
-try {
-  _diagFs = require('bare-fs')
-  _diagPath = require('bare-path')
-  _diagOs = require('bare-os')
-  const _dataDirArg = (typeof Bare !== 'undefined' ? Bare.argv : [])
-    .find(a => a.startsWith('--data-dir='))
-  const _baseDir = _dataDirArg
-    ? _dataDirArg.substring(_dataDirArg.indexOf('=') + 1)
-    : _diagPath.join(_diagOs.homedir(), 'Documents')
-  _diagFile = _diagPath.join(_baseDir, 'zappmessaging', 'p2p-diag.log')
-} catch (e) { /* logging unavailable */ }
-
-function diag (...args) {
-  try {
-    if (!_diagFs || !_diagFile) return
-    const logDir = _diagPath.dirname(_diagFile)
-    if (!_diagFs.existsSync(logDir)) _diagFs.mkdirSync(logDir, { recursive: true })
-    const line = new Date().toISOString() + ' [P2P] ' + args.join(' ') + '\n'
-    _diagFs.appendFileSync(_diagFile, line)
-  } catch (e) { /* ignore */ }
-}
+const diag = createDiagnosticLogger('P2P')
 
 /**
  * DHT Bootstrap Node Configuration - Multi-Tier Strategy
@@ -494,13 +471,13 @@ class P2PManager extends EventEmitter {
         // Run non-blocking so startup is not delayed for the common case.
         if (config.LOCAL_GATEWAY_IP) {
           const gatewayNode = { host: config.LOCAL_GATEWAY_IP, port: 49737 }
-          diag('LAN probe: pinging ' + config.LOCAL_GATEWAY_IP + ':49737 to detect Zapp peer on gateway …')
+          diag('LAN probe: checking configured gateway')
           this.swarm.dht.ping(gatewayNode).then(() => {
             if (!this.swarm || !this.swarm.dht) return
             this.swarm.dht.addNode(gatewayNode)
-            diag('LAN seed: gateway ' + config.LOCAL_GATEWAY_IP + ' is a Zapp DHT node — seeded routing table')
+            diag('LAN seed: configured gateway is a Zapp DHT node — seeded routing table')
           }).catch(() => {
-            diag('LAN probe: gateway ' + config.LOCAL_GATEWAY_IP + ' is not a DHT node (regular router) — skipping')
+            diag('LAN probe: configured gateway is not a DHT node — skipping')
           })
         }
       }
@@ -804,7 +781,7 @@ class P2PManager extends EventEmitter {
       )
       const topicHex = b4a.toString(topic, 'hex')
 
-      diag('Joining direct conversation:', conversationId, 'topic:', topicHex.substring(0, 12))
+      diag('Joining direct conversation:', conversationId.substring(0, 12), 'topic:', topicHex.substring(0, 12))
 
       const discovery = this.swarm.join(topic, { client: true, server: true })
 
@@ -876,7 +853,7 @@ class P2PManager extends EventEmitter {
       const topic = deriveGroupChatTopic(groupId)
       const topicHex = b4a.toString(topic, 'hex')
 
-      diag('Joining group conversation:', conversationId, 'members:', allParticipantKeyHexes.length)
+      diag('Joining group conversation:', conversationId.substring(0, 12), 'members:', allParticipantKeyHexes.length)
 
       const discovery = this.swarm.join(topic, { client: true, server: true })
 

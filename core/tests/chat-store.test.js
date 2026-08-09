@@ -52,38 +52,12 @@ test('createConversation creates group conversation', async () => {
   await store.deleteConversation(conv.id)
 })
 
-test('createConversation creates store room', async () => {
+test('createConversation rejects unsupported conversation types', async () => {
   const store = new ChatStore()
-  const storeId = 'store-123'
-  
-  const conv = await store.createConversation('store', [], { 
-    storeId,
-    displayName: 'Store Chat'
-  })
-  
-  assert.ok(conv, 'Conversation should be created')
-  assert.strictEqual(conv.type, 'store', 'Type should be store')
-  assert.strictEqual(conv.storeId, storeId, 'Store ID should match')
-  
-  // Cleanup
-  await store.deleteConversation(conv.id)
-})
-
-test('createConversation creates city channel', async () => {
-  const store = new ChatStore()
-  const citySlug = 'new-york'
-  
-  const conv = await store.createConversation('city', [], { 
-    citySlug,
-    displayName: 'New York'
-  })
-  
-  assert.ok(conv, 'Conversation should be created')
-  assert.strictEqual(conv.type, 'city', 'Type should be city')
-  assert.strictEqual(conv.citySlug, citySlug, 'City slug should match')
-  
-  // Cleanup
-  await store.deleteConversation(conv.id)
+  await assert.rejects(
+    store.createConversation('unsupported', []),
+    /Unsupported conversation type/
+  )
 })
 
 test('createConversation deduplicates direct chats', async () => {

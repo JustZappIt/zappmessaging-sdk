@@ -16,10 +16,6 @@ data class ZMConversation(
     val participantIds: List<String>,
     /** Group ID (for group chats only) */
     val groupId: String? = null,
-    /** Store identifier (for store rooms only) */
-    val storeId: String? = null,
-    /** City slug (for city channels only) */
-    val citySlug: String? = null,
     /** Creator's public key (for groups only) */
     val creatorKey: String? = null,
     /** Display name for the conversation */

@@ -42,8 +42,6 @@ enum ZMParse {
             type: type,
             participantIds: data["participantIds"] as? [String] ?? [],
             groupId: data["groupId"] as? String,
-            storeId: data["storeId"] as? String,
-            citySlug: data["citySlug"] as? String,
             creatorKey: data["creatorKey"] as? String,
             displayName: data["displayName"] as? String ?? "",
             lastMessage: data["lastMessage"] as? String,
