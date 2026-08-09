@@ -19,35 +19,13 @@
 const EventEmitter = require('bare-events')
 const b4a = require('b4a')
 const { BLIND_PEER_KEYS, BLIND_PEER_ADDRESS, CUSTOM_BOOTSTRAP_NODES, LOG_LEVEL } = require('./config')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-// Diagnostic logging
-let _diagFs, _diagPath, _diagOs, _diagFile
-try {
-  _diagFs = require('bare-fs')
-  _diagPath = require('bare-path')
-  _diagOs = require('bare-os')
-  const _dataDirArg = (typeof Bare !== 'undefined' ? Bare.argv : [])
-    .find(a => a.startsWith('--data-dir='))
-  const _baseDir = _dataDirArg
-    ? _dataDirArg.substring(_dataDirArg.indexOf('=') + 1)
-    : _diagPath.join(_diagOs.homedir(), 'Documents')
-  _diagFile = _diagPath.join(_baseDir, 'zappmessaging', 'blind-mirror-diag.log')
-} catch (e) { /* logging unavailable */ }
+const diag = createDiagnosticLogger('MIRROR')
 
-function diag (...args) {
-  try {
-    if (!_diagFs || !_diagFile) return
-    const logDir = _diagPath.dirname(_diagFile)
-    if (!_diagFs.existsSync(logDir)) _diagFs.mkdirSync(logDir, { recursive: true })
-    _diagFs.appendFileSync(_diagFile, new Date().toISOString() + ' [MIRROR] ' + args.join(' ') + '\n')
-  } catch (e) { /* ignore */ }
-}
-
-// Only logs when --log-level=debug is set. Use for high-frequency or sensitive
-// diagnostic output (stream lifecycle events, keypair dumps, probe details)
-// that should not appear in production logs.
+// Only logs when --log-level=debug is set. Use for high-frequency diagnostic
+// output that should not appear in production logs.
 function debugDiag (...args) {
-  if (LOG_LEVEL !== 'debug') return
   diag(...args)
 }
 

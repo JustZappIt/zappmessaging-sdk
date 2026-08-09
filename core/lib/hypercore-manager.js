@@ -28,29 +28,9 @@ const EventEmitter = require('bare-events')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { getInboundPushTopics } = require('./push-topics')
 const conversationKeys = require('./conversation-keys')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-// Diagnostic logging
-let _diagFs, _diagPath, _diagOs, _diagFile
-try {
-  _diagFs = require('bare-fs')
-  _diagPath = require('bare-path')
-  _diagOs = require('bare-os')
-  const _dataDirArg = (typeof Bare !== 'undefined' ? Bare.argv : [])
-    .find(a => a.startsWith('--data-dir='))
-  const _baseDir = _dataDirArg
-    ? _dataDirArg.substring(_dataDirArg.indexOf('=') + 1)
-    : _diagPath.join(_diagOs.homedir(), 'Documents')
-  _diagFile = _diagPath.join(_baseDir, 'zappmessaging', 'hypercore-diag.log')
-} catch (e) { /* logging unavailable */ }
-
-function diag (...args) {
-  try {
-    if (!_diagFs || !_diagFile) return
-    const logDir = _diagPath.dirname(_diagFile)
-    if (!_diagFs.existsSync(logDir)) _diagFs.mkdirSync(logDir, { recursive: true })
-    _diagFs.appendFileSync(_diagFile, new Date().toISOString() + ' [HC] ' + args.join(' ') + '\n')
-  } catch (e) { /* ignore */ }
-}
+const diag = createDiagnosticLogger('HC')
 
 const DRAIN_RETRY_BASE_MS = 250
 const DRAIN_RETRY_MAX_MS = 30000
@@ -130,14 +110,13 @@ class HypercoreManager extends EventEmitter {
     this.store = new Corestore(storePath)
     await this.store.ready()
     this._ready = true
-    diag('Corestore ready at ' + storePath)
+    diag('Corestore ready')
   }
 
   /**
    * Derive the encryption key for a conversation (v2 — see
    * conversation-keys.js). Direct chats use X25519 ECDH between the two
-   * identity keys; groups use the invite-distributed groupId; open rooms
-   * (store/city) keep a deterministic key with no confidentiality claim.
+   * identity keys; groups use the invite-distributed groupId.
    *
    * Fails closed: throws when the key context is missing, the conversation is
    * unknown, or the secret material for its type is unavailable. Callers all
@@ -159,15 +138,10 @@ class HypercoreManager extends EventEmitter {
       return conversationKeys.deriveGroupKey(conv.groupId, epoch)
     }
 
-    if (conv.type === 'store' || conv.type === 'city') {
-      return conversationKeys.derivePublicRoomKey(
-        conv.type,
-        conv.storeId || conv.citySlug || conversationId,
-        epoch
-      )
-    }
-
     // Direct chat: ECDH with the single remote participant.
+    if (conv.type !== 'direct') {
+      throw new Error('deriveEncryptionKey: unsupported conversation type ' + conv.type)
+    }
     const keyPair = this._keyContext.getIdentityKeyPair()
     if (!keyPair) {
       throw new Error('deriveEncryptionKey: identity unavailable')

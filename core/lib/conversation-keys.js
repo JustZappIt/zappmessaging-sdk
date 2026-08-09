@@ -20,9 +20,6 @@
  *   bound to the conversationId: each member stores the group under its own
  *   locally-random conversation id, so a conversationId-bound key could never
  *   interoperate across members.
- * - store/city rooms are open — anyone can join from a public identifier — so
- *   their cores keep a deterministic key and carry no confidentiality claim.
- *
  * Rollout is a clean cutover: blocks written under v1 keys are unreadable
  * under v2 and are skipped by the per-block error handling in the remote-core
  * watcher. Message history already ingested into the chat store is unaffected.
@@ -96,15 +93,4 @@ function deriveGroupKey (groupIdHex, epoch = 0) {
   return _keyedHash(groupId, 'zapp-enc:v2:group' + _epochSuffix(epoch))
 }
 
-/**
- * Deterministic key for open rooms (store/city). These are joinable from a
- * public identifier, so the key hides nothing from anyone who can join — it
- * only keeps the blind peer's stored blocks opaque.
- */
-function derivePublicRoomKey (kind, identifier, epoch = 0) {
-  const out = b4a.alloc(KEY_BYTES)
-  sodium.crypto_generichash(out, b4a.from('zapp-enc:v2:public:' + kind + ':' + identifier + _epochSuffix(epoch)))
-  return out
-}
-
-module.exports = { deriveDirectKey, deriveGroupKey, derivePublicRoomKey }
+module.exports = { deriveDirectKey, deriveGroupKey }

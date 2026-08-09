@@ -6,8 +6,6 @@
  */
 
 const fs = require('bare-fs')
-const path = require('bare-path')
-const os = require('bare-os')
 const bareIpc = require('bare-ipc')
 const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
@@ -15,30 +13,13 @@ const { ChatStore } = require('./chat-store')
 const mnemonic = require('./mnemonic')
 const config = require('./config')
 const { IPCRequestError, validateDirectParticipant } = require('./direct-recipient')
+const { createDiagnosticLogger } = require('./diagnostics')
 
 // Protocol version — bump when IPC message format changes
 const PROTOCOL_VERSION = '1.0'
 const SUPPORTED_FEATURES = ['messaging', 'groups', 'media', 'blind_peer', 'contacts', 'payments', 'read_receipts']
 
-// Diagnostic logging helper — writes to the OS temp directory so logs are
-// excluded from iCloud/ADB backups and are not user-accessible via file sharing.
-const _diagFile = path.join(os.tmpdir(), 'zappmessaging_diag.log')
-const _diagMaxBytes = 1048576 // 1 MB rotation limit
-
-function diag (...args) {
-  try {
-    // Rotate log if it exceeds the size limit
-    try {
-      const stat = fs.statSync(_diagFile)
-      if (stat.size >= _diagMaxBytes) {
-        fs.writeFileSync(_diagFile, '')
-      }
-    } catch (_) { /* file does not exist yet */ }
-    fs.appendFileSync(_diagFile, new Date().toISOString() + ' [IPC] ' + args.join(' ') + '\n')
-  } catch(e) {
-    // Ignore logging errors
-  }
-}
+const diag = createDiagnosticLogger('IPC')
 
 // Input validation helpers
 function isValidPublicKey(value) {
@@ -180,12 +161,11 @@ class IPCHandler {
   }
 
   async _processLine(line) {
-    diag('Processing IPC line: ' + line.substring(0, 100))
     let message
     try {
       message = JSON.parse(line)
     } catch (error) {
-      diag('Failed to parse IPC message:', line.substring(0, 100))
+      diag('Failed to parse IPC message')
       return
     }
 
@@ -446,15 +426,15 @@ class IPCHandler {
   async handleConversation(action, payload) {
     switch (action) {
       case 'create': {
+        if (payload.type !== 'direct' && payload.type !== 'group') {
+          throw new IPCRequestError(
+            'UNSUPPORTED_CONVERSATION_TYPE',
+            'Only direct and group conversations are supported'
+          )
+        }
         const options = {}
         if (payload.type === 'group') {
           options.creatorKey = this.identity.publicKeyHex
-        }
-        if (payload.storeId) {
-          options.storeId = payload.storeId
-        }
-        if (payload.citySlug) {
-          options.citySlug = payload.citySlug
         }
 
         let conversation
@@ -672,7 +652,7 @@ class IPCHandler {
         await this.p2pManager.sendInvite(participantId, inviteData)
       }
 
-      diag('Group setup complete: ' + conversation.displayName + ' (' + allKeys.length + ' members)')
+      diag('Group setup complete (' + allKeys.length + ' members)')
     } catch (error) {
       diag('Failed to setup group and send invites: ' + (error.stack || error.message || error))
     }
@@ -762,7 +742,7 @@ class IPCHandler {
 
       // Do not recreate a conversation the user explicitly left
       if (this.chatStore.hasLeftConversation(resolvedId)) {
-        diag('Ignoring direct invite for left conversation: ' + resolvedId)
+        diag('Ignoring direct invite for left conversation: ' + resolvedId.substring(0, 12))
         return true // rejected: terminal, nothing to retry
       }
 
@@ -833,7 +813,7 @@ class IPCHandler {
       // Notify Swift/Kotlin UI so the conversation appears in the list
       this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
-      diag('Accepted direct invite from ' + senderKey.substring(0, 12) + ' (' + displayName + ')')
+      diag('Accepted direct invite from ' + senderKey.substring(0, 12))
     } catch (error) {
       failed = true
       diag('Failed to handle direct invite: ' + (error.stack || error.message || error))
@@ -927,7 +907,7 @@ class IPCHandler {
       // Notify Swift/Kotlin UI about the new group
       this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
-      diag('Accepted group invite: ' + groupName + ' with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
+      diag('Accepted group invite with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
     } catch (error) {
       failed = true
       diag('Failed to handle group invite: ' + (error.stack || error.message || error))
@@ -958,7 +938,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
-    diag('Left group: ' + (conversation.displayName || conversationId))
+    diag('Left group: ' + conversationId.substring(0, 12))
     return { success: true }
   }
 
@@ -987,7 +967,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
-    diag('Deleted group: ' + (conversation.displayName || conversationId))
+    diag('Deleted group: ' + conversationId.substring(0, 12))
     return { success: true }
   }
 
@@ -1021,7 +1001,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
-    diag('Removed conversation: ' + (conversation.displayName || conversationId))
+    diag('Removed conversation: ' + conversationId.substring(0, 12))
     return { success: true }
   }
 
@@ -1073,7 +1053,7 @@ class IPCHandler {
         leaverKey: leaverHex
       })
 
-      diag('Peer ' + leaverHex.substring(0, 12) + ' left group ' + conversationId)
+      diag('Peer ' + leaverHex.substring(0, 12) + ' left group ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group leave: ' + (error.stack || error.message || error))
     }
@@ -1102,7 +1082,7 @@ class IPCHandler {
       }
       await this.chatStore.updateConversation(conversationId, { displayName: newName })
       this.pushEvent('conversation.group_renamed', { conversationId, newName })
-      diag('Group renamed to: ' + newName)
+      diag('Group renamed: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group renamed: ' + (error.stack || error.message || error))
     }
@@ -1162,7 +1142,7 @@ class IPCHandler {
         newMemberKey: normalizedNewMember,
         newMemberName
       })
-      diag('New member added to group: ' + (newMemberName || normalizedNewMember))
+      diag('New member added to group: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group member added: ' + (error.stack || error.message || error))
     }
@@ -1205,7 +1185,7 @@ class IPCHandler {
         displayName
       })
 
-      diag('Group deleted by owner: ' + displayName)
+      diag('Group deleted by owner: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group deleted: ' + (error.stack || error.message || error))
     }

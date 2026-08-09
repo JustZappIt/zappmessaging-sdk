@@ -60,8 +60,6 @@ final class ModelTests: XCTestCase {
     func testConversationTypes() {
         XCTAssertEqual(ConversationType.direct.rawValue, "direct")
         XCTAssertEqual(ConversationType.group.rawValue, "group")
-        XCTAssertEqual(ConversationType.store.rawValue, "store")
-        XCTAssertEqual(ConversationType.city.rawValue, "city")
     }
     
     func testGroupConversation() {

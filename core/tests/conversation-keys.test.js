@@ -6,7 +6,7 @@ const { test } = require('node:test')
 const assert = require('node:assert')
 const b4a = require('b4a')
 const crypto = require('hypercore-crypto')
-const { deriveDirectKey, deriveGroupKey, derivePublicRoomKey } = require('../lib/conversation-keys')
+const { deriveDirectKey, deriveGroupKey } = require('../lib/conversation-keys')
 
 function makeIdentity (seedByte) {
   return crypto.keyPair(b4a.alloc(32, seedByte))
@@ -71,11 +71,4 @@ test('group key depends only on groupId (+epoch), never a local conversation id'
 test('group key requires a full 32-byte groupId', () => {
   assert.throws(() => deriveGroupKey('abcd'), /bad groupId/)
   assert.throws(() => deriveGroupKey(null), /bad groupId/)
-})
-
-test('public room key is deterministic per kind + identifier', () => {
-  const a = derivePublicRoomKey('store', 'store-123')
-  assert.ok(b4a.equals(a, derivePublicRoomKey('store', 'store-123')))
-  assert.ok(!b4a.equals(a, derivePublicRoomKey('city', 'store-123')), 'Kind is bound')
-  assert.ok(!b4a.equals(a, derivePublicRoomKey('store', 'store-124')), 'Identifier is bound')
 })

@@ -10,9 +10,13 @@ const crypto = require('bare-crypto')
 const hcrypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
+const { createDiagnosticLogger } = require('./diagnostics')
+
+const diag = createDiagnosticLogger('CHAT')
 
 const MAX_PLATFORM_INT = 0x7fffffff
 const MAX_FUTURE_MESSAGE_SKEW_MS = 5 * 60 * 1000
+const SUPPORTED_CONVERSATION_TYPES = new Set(['direct', 'group'])
 // Thumbnails are UI previews, not the media payload. Keeping the encoded value
 // to 1 MiB guarantees a one-thumbnail IPC response stays comfortably below the
 // native 16 MiB frame ceiling, even after its JSON envelope is added.
@@ -32,6 +36,12 @@ function normalizeMessageTimestamp (value, receivedAt = Date.now()) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return receivedAt
   const timestamp = Math.trunc(value)
   return timestamp > receivedAt + MAX_FUTURE_MESSAGE_SKEW_MS ? receivedAt : timestamp
+}
+
+function assertSupportedConversationType (type) {
+  if (!SUPPORTED_CONVERSATION_TYPES.has(type)) {
+    throw new Error('Unsupported conversation type: ' + type)
+  }
 }
 
 // ── Chronological ordering ──────────────────────────────────────────────────
@@ -107,29 +117,6 @@ function readNormalizedMessages (messagesPath, { strict = false } = {}) {
   return messages
 }
 
-// Diagnostic logging
-let _diagFs, _diagPath, _diagOs, _diagFile
-try {
-  _diagFs = require('bare-fs')
-  _diagPath = require('bare-path')
-  _diagOs = require('bare-os')
-  const _dataDirArg = (typeof Bare !== 'undefined' ? Bare.argv : [])
-    .find(a => a.startsWith('--data-dir='))
-  const _baseDir = _dataDirArg
-    ? _dataDirArg.substring(_dataDirArg.indexOf('=') + 1)
-    : _diagPath.join(_diagOs.homedir(), 'Documents')
-  _diagFile = _diagPath.join(_baseDir, 'zappmessaging', 'chat-store-diag.log')
-} catch (e) { /* logging unavailable */ }
-
-function diag (...args) {
-  try {
-    if (!_diagFs || !_diagFile) return
-    const logDir = _diagPath.dirname(_diagFile)
-    if (!_diagFs.existsSync(logDir)) _diagFs.mkdirSync(logDir, { recursive: true })
-    _diagFs.appendFileSync(_diagFile, new Date().toISOString() + ' [CHAT] ' + args.join(' ') + '\n')
-  } catch (e) { /* ignore */ }
-}
-
 class ChatStore {
   constructor() {
     this.storagePath = path.join(getDataDir(), 'chats')
@@ -158,6 +145,9 @@ class ChatStore {
       const convos = readJSON(indexPath)
       if (convos && Array.isArray(convos)) {
         for (const conv of convos) {
+          // Keep unsupported legacy records on disk for a non-destructive
+          // upgrade, but do not expose them as chats.
+          if (!SUPPORTED_CONVERSATION_TYPES.has(conv.type)) continue
           if (!Array.isArray(conv.participantIds)) conv.participantIds = []
           this.conversations.set(conv.id, conv)
         }
@@ -278,27 +268,20 @@ class ChatStore {
 
   /**
    * Create a new conversation
-   * @param {string} type - Conversation type (direct, group, store, city)
+   * @param {string} type - Conversation type (direct or group)
    * @param {Array<string>} participantIds - Participant public keys
-   * @param {Object} options - Additional options (groupId, creatorKey, displayName, storeId, citySlug)
+   * @param {Object} options - Additional options (groupId, creatorKey, displayName)
    * @returns {Object} Created conversation
    */
   async createConversation(type, participantIds, options = {}) {
-    const { groupId, creatorKey, displayName, storeId, citySlug } = options
+    assertSupportedConversationType(type)
+    const { groupId } = options
 
     // Check if conversation already exists
-    for (const [id, conv] of this.conversations) {
+    for (const conv of this.conversations.values()) {
       if (conv.type === type) {
         // For groups with a groupId, dedup by groupId
         if (type === 'group' && groupId && conv.groupId === groupId) {
-          return conv
-        }
-        // For store rooms, dedup by storeId
-        if (type === 'store' && storeId && conv.storeId === storeId) {
-          return conv
-        }
-        // For city channels, dedup by citySlug
-        if (type === 'city' && citySlug && conv.citySlug === citySlug) {
           return conv
         }
         // For direct chats, dedup by participants
@@ -317,13 +300,14 @@ class ChatStore {
   /**
    * Create a new conversation with a specific ID
    * @param {string} conversationId - Conversation ID to use
-   * @param {string} type - Conversation type (direct, group, store, city)
+   * @param {string} type - Conversation type (direct or group)
    * @param {Array<string>} participantIds - Participant public keys
-   * @param {Object} options - Additional options (groupId, creatorKey, displayName, storeId, citySlug)
+   * @param {Object} options - Additional options (groupId, creatorKey, displayName)
    * @returns {Object} Created conversation
    */
   async createConversationWithId(conversationId, type, participantIds, options = {}) {
-    const { groupId, creatorKey, displayName, storeId, citySlug } = options
+    assertSupportedConversationType(type)
+    const { groupId, creatorKey, displayName } = options
     const safeParticipants = Array.isArray(participantIds) ? participantIds.filter(Boolean) : []
     const conversation = {
       id: conversationId,
@@ -331,8 +315,6 @@ class ChatStore {
       participantIds: safeParticipants,
       groupId: type === 'group' ? (groupId || crypto.randomBytes(32).toString('hex')) : undefined,
       creatorKey: type === 'group' ? (creatorKey || undefined) : undefined,
-      storeId: type === 'store' ? storeId : undefined,
-      citySlug: type === 'city' ? citySlug : undefined,
       displayName: displayName || safeParticipants[0]?.substring(0, 8) || 'Unknown',
       lastMessage: null,
       lastMessageTimestamp: null,
@@ -380,7 +362,7 @@ class ChatStore {
     const conv = this.conversations.get(conversationId)
     if (!conv) return null
     // Allowlist: only permit known safe fields to be updated
-    const allowedFields = ['displayName', 'lastMessage', 'lastMessageTimestamp', 'participantIds', 'groupId', 'creatorKey', 'storeId', 'citySlug', 'localCoreKey', 'remoteCoreKeys']
+    const allowedFields = ['displayName', 'lastMessage', 'lastMessageTimestamp', 'participantIds', 'groupId', 'creatorKey', 'localCoreKey', 'remoteCoreKeys']
     for (const key of allowedFields) {
       if (updates.hasOwnProperty(key)) {
         conv[key] = updates[key]
@@ -552,7 +534,7 @@ class ChatStore {
           writeJSON(messagesPath, messages)
         }
       } catch (err) {
-        diag('Failed to update media path for', convId, err)
+        diag('Failed to update media path for', convId.substring(0, 12), err)
       }
     }
   }

@@ -342,16 +342,12 @@ class ZappMessagingSDK {
      * @param type Conversation type
      * @param participants List of participant public keys
      * @param displayName Optional display name
-     * @param storeId Store identifier (required for store type)
-     * @param citySlug City slug (required for city type)
      * @return The created conversation
      */
     suspend fun createConversation(
         type: ConversationType,
         participants: List<String>,
-        displayName: String? = null,
-        storeId: String? = null,
-        citySlug: String? = null
+        displayName: String? = null
     ): ZMConversation {
         requireIdentity()
 
@@ -359,8 +355,6 @@ class ZappMessagingSDK {
             put("type", type.rawValue)
             put("participants", JsonArray(participants.map { JsonPrimitive(it) }))
             displayName?.let { put("displayName", it) }
-            storeId?.let { put("storeId", it) }
-            citySlug?.let { put("citySlug", it) }
         }
 
         val response = ipcBridge.sendRequest("conversation.create", payload)

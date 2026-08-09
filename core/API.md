@@ -295,11 +295,6 @@ Create a new conversation.
 }
 ```
 
-The handler also accepts `"type": "store"` with a `storeId` and `"type": "city"`
-with a `citySlug`, but neither is implemented: only `direct` and `group` join a
-swarm topic, so a store or city conversation is persisted as a local-only record
-that never sends or receives. Do not build against them.
-
 A direct conversation takes exactly one participant, and its id is derived
 deterministically from both public keys, so both sides land in the same room.
 Creating one that already exists reuses the existing record and re-sends the
@@ -1286,7 +1281,8 @@ practice.
 - **Media**: `<dataDir>/zappmessaging/media/{hash}.{ext}`
 - **Corestore**: `<dataDir>/zappmessaging/corestore/`
 - **Remote core index**: `<dataDir>/zappmessaging/corekeys.json`
-- **Logs**: `<dataDir>/zappmessaging/diag.log`, plus an IPC log in the OS temp directory
+- **Debug diagnostics**: disabled by default; `--log-level=debug` writes a bounded
+  `<dataDir>/zappmessaging/debug.log` for local troubleshooting
 
 Deleting `<dataDir>/zappmessaging/` wipes all chat state.
 

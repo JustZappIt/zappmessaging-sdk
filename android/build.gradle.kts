@@ -45,9 +45,8 @@ val inviteMailboxUrl: String = localProps.getProperty("INVITE_MAILBOX_URL")
     ?: providers.environmentVariable("INVITE_MAILBOX_URL").orNull
     ?: ""
 
-// Worklet log level: 'debug' | 'info' | 'warn' | 'error' | 'off'. Empty = use
-// JS-side default ('info'). Set ZAPP_MESSAGING_LOG_LEVEL=debug to enable verbose
-// stream/probe/keypair diagnostics in blind-mirror & p2p-manager.
+// File diagnostics are disabled by default. Set ZAPP_MESSAGING_LOG_LEVEL=debug
+// only for short-lived local troubleshooting; output is bounded to 1 MiB.
 val zappMessagingLogLevel: String = localProps.getProperty("ZAPP_MESSAGING_LOG_LEVEL")
     ?: providers.gradleProperty("ZAPP_MESSAGING_LOG_LEVEL").orNull
     ?: providers.environmentVariable("ZAPP_MESSAGING_LOG_LEVEL").orNull

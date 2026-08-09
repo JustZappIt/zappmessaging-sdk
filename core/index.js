@@ -5,52 +5,21 @@
  * and communicates with the Swift/Kotlin wrapper via IPC.
  */
 
+const { createDiagnosticLogger } = require('./lib/diagnostics')
+const diag = createDiagnosticLogger('CORE')
+
 // Catch uncaught errors to prevent SIGABRT - MUST be first
 if (typeof Bare !== 'undefined') {
   Bare.on('uncaughtException', (err) => {
-    console.error('Uncaught exception:', err)
-    diag('UNCAUGHT EXCEPTION: ' + (err.stack || err.message || err))
+    diag('Uncaught exception:', err)
   })
 
   Bare.on('unhandledRejection', (reason) => {
-    console.error('Unhandled rejection:', reason)
-    diag('UNHANDLED REJECTION: ' + (reason && reason.stack ? reason.stack : reason))
+    diag('Unhandled rejection:', reason)
   })
 }
 
 diag('ZappMessaging worklet starting...')
-
-// Diagnostic logging helper - write to file since console.log may not appear in unified log
-let _diagFs, _diagPath, _diagOs, _diagFile
-try {
-  _diagFs = require('bare-fs')
-  _diagPath = require('bare-path')
-  _diagOs = require('bare-os')
-
-  // Resolve base dir: use --data-dir arg on Android, else homedir()/Documents
-  const _dataDirArg = (typeof Bare !== 'undefined' ? Bare.argv : [])
-    .find(a => a.startsWith('--data-dir='))
-  const _baseDir = _dataDirArg
-    ? _dataDirArg.substring(_dataDirArg.indexOf('=') + 1)
-    : _diagPath.join(_diagOs.homedir(), 'Documents')
-  _diagFile = _diagPath.join(_baseDir, 'zappmessaging', 'diag.log')
-} catch (e) {
-  // Logging modules failed to load - diag() will be a no-op
-}
-
-function diag (...args) {
-  try {
-    if (!_diagFs || !_diagFile) return
-    const logDir = _diagPath.dirname(_diagFile)
-    if (!_diagFs.existsSync(logDir)) {
-      _diagFs.mkdirSync(logDir, { recursive: true })
-    }
-    const line = new Date().toISOString() + ' ' + args.join(' ') + '\n'
-    _diagFs.appendFileSync(_diagFile, line)
-  } catch (e) {
-    // Ignore logging errors
-  }
-}
 
 const { runBounded } = require('./lib/async-pool')
 const { STARTUP_JOIN_CONCURRENCY } = require('./lib/config')
@@ -713,7 +682,7 @@ async function initialize() {
 
         // Do not recreate a conversation the user explicitly left
         if (isConversationMissing && chatStore && chatStore.hasLeftConversation(conversationId)) {
-          diag('Ignoring message for left conversation: ' + conversationId)
+          diag('Ignoring message for left conversation: ' + conversationId.substring(0, 12))
           return
         }
 
@@ -907,7 +876,7 @@ async function initialize() {
           try {
             return await join.run()
           } catch (e) {
-            diag('Auto-reconnect failed for ' + join.conversationId + ': ' + (e.message || e))
+            diag('Auto-reconnect failed for ' + join.conversationId.substring(0, 12) + ': ' + (e.message || e))
             return false
           }
         })

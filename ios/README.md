@@ -122,10 +122,6 @@ let conversation = try await sdk.createConversation(
 )
 ```
 
-`ConversationType` also declares `.store` and `.city`, but neither is wired up:
-`conversation.create` persists them locally and never joins a swarm topic, so
-they exchange no messages. Do not build against them.
-
 ### Send Messages
 
 ```swift
@@ -266,7 +262,7 @@ func sceneDidDisconnect() {
 User's cryptographic identity with Ed25519 public key.
 
 ### ZMConversation
-Chat conversation (direct, group, store, or city).
+Direct or group chat conversation.
 
 ### ZMMessage
 Individual message with optional media attachments.

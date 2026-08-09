@@ -9,24 +9,18 @@ import kotlinx.serialization.Serializable
 @Serializable
 enum class ConversationType {
     @SerialName("direct") DIRECT,
-    @SerialName("group") GROUP,
-    @SerialName("store") STORE,
-    @SerialName("city") CITY;
+    @SerialName("group") GROUP;
 
     val rawValue: String
         get() = when (this) {
             DIRECT -> "direct"
             GROUP -> "group"
-            STORE -> "store"
-            CITY -> "city"
         }
 
     companion object {
         fun fromRaw(value: String): ConversationType? = when (value) {
             "direct" -> DIRECT
             "group" -> GROUP
-            "store" -> STORE
-            "city" -> CITY
             else -> null
         }
     }

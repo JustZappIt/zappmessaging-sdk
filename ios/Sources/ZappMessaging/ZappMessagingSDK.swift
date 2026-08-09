@@ -278,9 +278,7 @@ public final class ZappMessagingSDK: ObservableObject {
     public func createConversation(
         type: ConversationType,
         participants: [String],
-        displayName: String? = nil,
-        storeId: String? = nil,
-        citySlug: String? = nil
+        displayName: String? = nil
     ) async throws -> ZMConversation {
         guard identity != nil else {
             throw ZMError.identityNotFound
@@ -289,9 +287,7 @@ public final class ZappMessagingSDK: ObservableObject {
         let conversation = try await ipcBridge.createConversation(
             type: type,
             participants: participants,
-            displayName: displayName,
-            storeId: storeId,
-            citySlug: citySlug
+            displayName: displayName
         )
 
         do {

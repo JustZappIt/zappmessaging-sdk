@@ -253,17 +253,13 @@ extension IPCBridge {
     func createConversation(
         type: ConversationType,
         participants: [String],
-        displayName: String?,
-        storeId: String? = nil,
-        citySlug: String? = nil
+        displayName: String?
     ) async throws -> ZMConversation {
         var payload: [String: Any] = [
             "type": type.rawValue,
             "participants": participants
         ]
         payload["displayName"] = displayName
-        payload["storeId"] = storeId
-        payload["citySlug"] = citySlug
 
         let response = try await sendRequest(type: "conversation.create", payload: payload)
         guard let conversationData = response["conversation"] as? [String: Any],

@@ -28,6 +28,14 @@ test('direct participant validation distinguishes missing and malformed keys', (
   )
 })
 
+test('conversation creation rejects unsupported types with a stable code', async () => {
+  const handler = Object.create(IPCHandler.prototype)
+  await assert.rejects(
+    handler.handleConversation('create', { type: 'unsupported', participants: [] }),
+    error => error.code === 'UNSUPPORTED_CONVERSATION_TYPE'
+  )
+})
+
 test('outgoing status uses relay acknowledgement instead of a socket write', () => {
   const handler = Object.create(IPCHandler.prototype)
   const relayed = []
