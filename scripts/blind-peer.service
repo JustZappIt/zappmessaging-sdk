@@ -1,0 +1,38 @@
+# Systemd service for ZappMessaging Blind Peer
+#
+# Install:
+#   sudo cp scripts/blind-peer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable blind-peer
+#   sudo systemctl start blind-peer
+#
+# Logs:
+#   journalctl -u blind-peer -f
+#
+# The public key is printed on first start -- check logs:
+#   journalctl -u blind-peer | grep "public key"
+
+[Unit]
+Description=ZappMessaging Blind Peer Server
+After=network.target
+
+[Service]
+Type=simple
+User=blindpeer
+WorkingDirectory=/opt/blind-peer
+ExecStart=/usr/bin/node /opt/blind-peer/server/blind-peer-relay.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=BLIND_PEER_STORAGE=/opt/blind-peer/data
+Environment=BLIND_PEER_PORT=49737
+Environment=BLIND_PEER_MAX_STORAGE=10gb
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/blind-peer/data
+
+[Install]
+WantedBy=multi-user.target

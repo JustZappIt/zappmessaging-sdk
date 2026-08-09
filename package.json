@@ -1,0 +1,61 @@
+{
+  "name": "zappmessaging",
+  "version": "1.0.0",
+  "description": "Open-source peer-to-peer messaging SDK for Zapp applications, built on the Holepunch/Pear stack (Hyperswarm + Bare)",
+  "main": "core/index.js",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JustZappIt/zappmessaging-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JustZappIt/zappmessaging-sdk/issues"
+  },
+  "homepage": "https://github.com/JustZappIt/zappmessaging-sdk#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "bare-pack --preset ios --base . --out ios/Resources/worklet.bundle core/index.js && node scripts/write-ios-artifact-manifest.js",
+    "build:android": "bare-pack --preset android --base . --out android/src/main/assets/worklet.bundle core/index.js",
+    "link": "node scripts/link-addons.js ios ios/Addons",
+    "link:android": "node scripts/link-addons.js android android/src/main/jniLibs",
+    "setup": "npm install && npm run link && npm run build",
+    "setup:android": "npm install && npm run link:android && npm run build:android",
+    "setup:all": "npm install && npm run link && npm run build && npm run link:android && npm run build:android",
+    "test": "node --require ./core/tests/helpers/node-compat.js --test core/tests/*.test.js",
+    "test:identity": "bare test/identity-golden-vectors.js",
+    "lint": "echo 'Linting not configured yet'"
+  },
+  "keywords": [
+    "p2p",
+    "messaging",
+    "hyperswarm",
+    "bare",
+    "ios",
+    "android"
+  ],
+  "author": "JustZappIt",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "dependencies": {
+    "b4a": "^1.8.0",
+    "bare-crypto": "^1.13.4",
+    "bare-events": "^2.8.2",
+    "bare-fs": "^4.5.5",
+    "bare-ipc": "^1.1.1",
+    "bare-path": "^3.0.0",
+    "blind-peering": "2.4.1",
+    "compact-encoding": "3.3.0",
+    "corestore": "^7.8.0",
+    "hypercore-crypto": "^3.6.1",
+    "hypercore-id-encoding": "1.3.0",
+    "hyperswarm": "^4.17.0",
+    "protomux-rpc": "1.7.1",
+    "sodium-universal": "^5.0.1"
+  },
+  "devDependencies": {
+    "bare-link": "^3.0.0",
+    "bare-pack": "^2.0.0"
+  }
+}

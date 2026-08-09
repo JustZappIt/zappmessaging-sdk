@@ -1,0 +1,85 @@
+name: ZappMessaging
+include:
+  - Addons/addons.yml
+targets:
+  ZappMessaging:
+    type: framework
+    platform: iOS
+    deploymentTarget: "16.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.justzappit.zappmessaging
+        # Without this, SDKROOT=iphoneos alone makes xcodebuild offer only
+        # *device* destinations, so `xcodebuild test` cannot resolve a simulator.
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: NO
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        DEBUG_INFORMATION_FORMAT: dwarf
+        ENABLE_PREVIEWS: NO
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) Frameworks"
+        SWIFT_INCLUDE_PATHS: "$(inherited) Frameworks"
+      configs:
+        Debug:
+          # Must be YES: the test bundle uses `@testable import ZappMessaging`
+          # to drive IPCBridge/BareWorkletManager directly. With NO, the module
+          # will not resolve and the whole test target fails to compile.
+          ENABLE_TESTABILITY: YES
+        Release:
+          ENABLE_TESTABILITY: NO
+    dependencies:
+      - framework: Frameworks/BareKit.xcframework
+        embed: false
+    sources:
+      - path: Sources/ZappMessaging
+        excludes:
+          - "**/.DS_Store"
+    resources:
+      - path: Resources/worklet.bundle
+    # The bundle and the native addons are produced by `npm run setup` at the
+    # repository root, not by a build phase. Do not reintroduce a phase that
+    # interpolates ${PWD} or ${PATH}: XcodeGen resolves those when it generates
+    # the project, which bakes the generating machine's absolute paths and full
+    # shell PATH into the committed .pbxproj.
+    postBuildScripts:
+      - name: Copy Bundle to Framework
+        script: |
+          # Copy the worklet bundle into the built framework
+          if [ -f "${SRCROOT}/Resources/worklet.bundle" ]; then
+            cp "${SRCROOT}/Resources/worklet.bundle" "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.framework/"
+            echo "Copied worklet.bundle to framework"
+          else
+            echo "error: worklet.bundle not found at ${SRCROOT}/Resources/worklet.bundle"
+            echo "note: run 'npm run setup' at the repository root to build it"
+            exit 1
+          fi
+        outputFiles:
+          - "${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.framework/worklet.bundle"
+  
+  ZappMessagingTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    settings:
+      base:
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.justzappit.zappmessaging.tests
+    sources:
+      - Tests/ZappMessagingTests
+    dependencies:
+      - target: ZappMessaging
+
+schemes:
+  ZappMessaging:
+    build:
+      targets:
+        ZappMessaging: all
+        ZappMessagingTests: [test]
+    test:
+      targets:
+        - ZappMessagingTests
+      gatherCoverageData: false
