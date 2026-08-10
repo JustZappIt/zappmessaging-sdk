@@ -32,6 +32,7 @@ actor BareWorkletManager {
     func start(config: ZappMessagingConfig, ipcBridge: IPCBridge) async throws {
         guard !isRunning, !isRecovering else { return }
 
+        ZMLog.configure(level: config.logLevel)
         lifecycleGeneration &+= 1
         self.config = config
         self.ipcBridge = ipcBridge
@@ -40,7 +41,7 @@ actor BareWorkletManager {
         isRunning = true
         restartAttempts = 0
         if isSuspended { worklet?.suspend() }
-        print("[BareWorkletManager] Worklet started successfully")
+        ZMLog.debug("BareWorkletManager", "Worklet started")
     }
 
     private func startWorklet(config: ZappMessagingConfig, ipcBridge: IPCBridge) throws {
@@ -63,7 +64,7 @@ actor BareWorkletManager {
         if let keyHex = IdentityFileKeyStore.getOrCreateKeyHex() {
             arguments.append("--identity-file-key=\(keyHex)")
         } else {
-            print("[BareWorkletManager] WARNING: Keychain unavailable — identity.json stays plaintext")
+            ZMLog.error("BareWorkletManager", "Identity encryption key unavailable")
         }
 
         try nextWorklet.start(arguments: arguments)
@@ -89,7 +90,7 @@ actor BareWorkletManager {
         isSuspended = false
         isRecovering = false
         restartAttempts = 0
-        print("[BareWorkletManager] Worklet stopped")
+        ZMLog.debug("BareWorkletManager", "Worklet stopped")
     }
     
     /// Suspend the worklet (for app backgrounding)
@@ -99,7 +100,7 @@ actor BareWorkletManager {
         
         worklet?.suspend()
         
-        print("[BareWorkletManager] Worklet suspended")
+        ZMLog.debug("BareWorkletManager", "Worklet suspended")
     }
     
     /// Resume the worklet (from app backgrounding)
@@ -109,7 +110,7 @@ actor BareWorkletManager {
         
         worklet?.resume()
         
-        print("[BareWorkletManager] Worklet resumed")
+        ZMLog.debug("BareWorkletManager", "Worklet resumed")
     }
     
     // MARK: - State
@@ -152,8 +153,7 @@ actor BareWorkletManager {
         }
 
         restartAttempts += 1
-        print("[BareWorkletManager] Restarting after terminal IPC failure " +
-              "(attempt \(restartAttempts)/\(maxRestartAttempts))")
+        ZMLog.warning("BareWorkletManager", "Restarting after terminal IPC failure")
         do {
             try startWorklet(config: config, ipcBridge: ipcBridge)
             isRunning = true
@@ -162,14 +162,14 @@ actor BareWorkletManager {
             guard lifecycleGeneration == recoveryGeneration, isRecovering else { return }
             isRecovering = false
             failureHandler?(error, true)
-            print("[BareWorkletManager] Worklet restart succeeded")
+            ZMLog.debug("BareWorkletManager", "Worklet restart succeeded")
         } catch {
             worklet?.stop()
             worklet = nil
             isRunning = false
             isRecovering = false
             failureHandler?(error, false)
-            print("[BareWorkletManager] Worklet restart exhausted: \(error)")
+            ZMLog.error("BareWorkletManager", "Worklet restart exhausted")
         }
     }
 }

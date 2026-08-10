@@ -105,6 +105,7 @@ public final class ZappMessagingSDK: ObservableObject {
     ///   will not work. See `ZappMessagingConfig`.
     public init(config: ZappMessagingConfig) {
         self.config = config
+        ZMLog.configure(level: config.logLevel)
     }
 
     /// Initialize the SDK
@@ -140,7 +141,7 @@ public final class ZappMessagingSDK: ObservableObject {
         do {
             identity = try await ipcBridge.getIdentity()
         } catch {
-            print("[SDK] Failed to load identity on init: \(error)")
+            ZMLog.debug("SDK", "No existing identity available during initialization")
         }
 
         if identity != nil {
@@ -149,7 +150,7 @@ public final class ZappMessagingSDK: ObservableObject {
                 try await refreshContacts()
                 _ = try await getConnectionStatus()
             } catch {
-                print("[SDK] Failed to load initial data: \(error)")
+                ZMLog.warning("SDK", "Initial data refresh failed")
             }
         }
 
@@ -163,8 +164,6 @@ public final class ZappMessagingSDK: ObservableObject {
     /// `identity.get` went out too early, came back empty, and the app concluded
     /// the user had no chat identity.
     private func negotiateProtocolWithRetry() async throws {
-        var lastError: Error?
-
         for attempt in 1...Self.startupMaxRetries {
             try await Task.sleep(nanoseconds: Self.startupProbeDelayMs * UInt64(attempt) * 1_000_000)
 
@@ -172,12 +171,11 @@ public final class ZappMessagingSDK: ObservableObject {
                 try await ipcBridge.negotiateProtocol()
                 return
             } catch {
-                lastError = error
-                print("[SDK] Protocol probe \(attempt)/\(Self.startupMaxRetries) failed: \(error)")
+                ZMLog.warning("SDK", "Worklet readiness probe \(attempt) failed")
             }
         }
 
-        print("[SDK] Worklet never became ready: \(String(describing: lastError))")
+        ZMLog.error("SDK", "Worklet readiness probes exhausted")
         throw ZMError.notInitialized
     }
 
@@ -252,7 +250,7 @@ public final class ZappMessagingSDK: ObservableObject {
             // The identity restore has already succeeded and is durable. A
             // transient list failure must not make the host report that restore
             // itself failed.
-            print("[SDK] Identity restored; initial data refresh failed: \(error)")
+            ZMLog.warning("SDK", "Post-restore data refresh failed")
         }
 
         return restoredIdentity
@@ -604,7 +602,7 @@ public final class ZappMessagingSDK: ObservableObject {
                     message: error.localizedDescription
                 )
             )
-            print("[SDK] Connection refresh after resume failed: \(error)")
+            ZMLog.warning("SDK", "Connection refresh after resume failed")
         }
     }
 
@@ -672,7 +670,7 @@ public final class ZappMessagingSDK: ObservableObject {
             operationalFailure.send(
                 ZMOperationalFailure(operation: .pushNotification, code: .pushFailed, message: message)
             )
-            print("[SDK] Advisory blind-push request failed: \(message)")
+            ZMLog.warning("SDK", "Advisory blind-push request failed")
             
         case "conversation.invite_received":
             guard let conversationData = payload["conversation"] as? [String: Any],
@@ -767,7 +765,7 @@ public final class ZappMessagingSDK: ObservableObject {
             operationalFailure.send(
                 ZMOperationalFailure(operation: .messagePersist, code: .persistFailed, message: message)
             )
-            print("[SDK] Hypercore persist FAILED for \(message)")
+            ZMLog.error("SDK", "Message persistence failed")
 
         case "ipc.error":
             let code = payload["code"] as? String ?? "IPC_ERROR"
@@ -779,10 +777,10 @@ public final class ZappMessagingSDK: ObservableObject {
                     message: message
                 )
             )
-            print("[SDK] IPC error \(code): \(message)")
+            ZMLog.error("SDK", "Worklet reported an IPC error")
 
         default:
-            print("[SDK] Unhandled event: \(eventType)")
+            ZMLog.debug("SDK", "Unhandled event type received")
         }
     }
 
@@ -852,7 +850,7 @@ public final class ZappMessagingSDK: ObservableObject {
                 timeout: 5
             )
         } catch {
-            print("[SDK] Failed to return platform HTTPS response: \(error)")
+            ZMLog.warning("SDK", "Platform HTTPS response delivery failed")
         }
     }
 
@@ -898,7 +896,7 @@ public final class ZappMessagingSDK: ObservableObject {
                             message: error.localizedDescription
                         )
                     )
-                    print("[SDK] Conversation refresh after \(trigger.rawValue) failed: \(error)")
+                    ZMLog.warning("SDK", "Conversation refresh failed")
                     return
                 }
             } while self.conversationRefreshNeedsFollowup && !Task.isCancelled

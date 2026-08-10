@@ -14,6 +14,28 @@ import XCTest
 @testable import ZappMessaging
 
 final class SDKContractTests: XCTestCase {
+    func testNativeDiagnosticsRequireExplicitDebugOptIn() {
+        defer { ZMLog.configure(level: nil) }
+
+        var evaluated = false
+        func diagnostic() -> String {
+            evaluated = true
+            return "structural diagnostic"
+        }
+
+        ZMLog.configure(level: nil)
+        ZMLog.debug("Test", diagnostic())
+        XCTAssertFalse(evaluated)
+
+        ZMLog.configure(level: "info")
+        ZMLog.debug("Test", diagnostic())
+        XCTAssertFalse(evaluated)
+
+        ZMLog.configure(level: "DeBuG")
+        ZMLog.debug("Test", diagnostic())
+        XCTAssertTrue(evaluated)
+    }
+
 
     /// Decode a JSON object exactly the way production does: through
     /// `AnyCodable`, then unwrapped to `[String: Any]`. Reproducing the real path

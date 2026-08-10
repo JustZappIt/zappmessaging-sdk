@@ -138,7 +138,7 @@ actor IPCBridge {
             // is not sufficient on its own.
             let lineByteCount = receiveBuffer.distance(from: receiveBuffer.startIndex, to: newlineIndex)
             if lineByteCount > maxLineBytes {
-                print("[IPCBridge] IPC frame exceeds \(maxLineBytes) bytes; skipping it")
+                ZMLog.warning("IPCBridge", "Oversized IPC frame skipped")
                 receiveBuffer.removeSubrange(...newlineIndex)
                 continue
             }
@@ -147,7 +147,7 @@ actor IPCBridge {
             receiveBuffer.removeSubrange(...newlineIndex)
             guard !lineData.isEmpty else { continue }
             guard let line = String(data: lineData, encoding: .utf8) else {
-                print("[IPCBridge] Discarding invalid UTF-8 frame of \(lineData.count) bytes")
+                ZMLog.warning("IPCBridge", "Invalid UTF-8 IPC frame skipped")
                 continue
             }
             processLine(line)
@@ -158,7 +158,7 @@ actor IPCBridge {
         // whole buffer was cleared — killing every in-flight request and
         // deterministically bricking a media-heavy conversation on retry.
         if receiveBuffer.count > maxLineBytes {
-            print("[IPCBridge] IPC frame exceeds \(maxLineBytes) bytes without a newline; skipping it")
+            ZMLog.warning("IPCBridge", "Unterminated oversized IPC frame skipped")
             skippingOversizedLine = true
             receiveBuffer.removeAll(keepingCapacity: false)
         }
@@ -179,8 +179,8 @@ actor IPCBridge {
             return
         }
 
-        // Log unrecognized messages for debugging
-        print("[IPCBridge] Skipping non-JSON or unrecognized message: \(line.prefix(120))")
+        // Never include the raw frame: it may contain message or identity data.
+        ZMLog.warning("IPCBridge", "Malformed or unrecognized IPC frame skipped")
     }
 
     private func handleResponse(_ response: IPCResponse) {

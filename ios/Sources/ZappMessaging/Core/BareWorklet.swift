@@ -46,16 +46,6 @@ enum WorkletState {
     case running
     case suspended
     case failed(Error)
-
-    var description: String {
-        switch self {
-        case .notStarted: return "notStarted"
-        case .starting: return "starting"
-        case .running: return "running"
-        case .suspended: return "suspended"
-        case .failed(let error): return "failed(\(error))"
-        }
-    }
 }
 
 /// Manages a Bare runtime worklet and its IPC channel.
@@ -83,24 +73,24 @@ class ZMBareWorklet {
         let config = BareWorkletConfiguration.default()
         config?.memoryLimit = 128 * 1024 * 1024
         self.worklet = BareWorklet(configuration: config)
-        print("[BareWorklet] Initialized with memory limit: 128MB")
+        ZMLog.debug("BareWorklet", "Worklet initialized")
     }
 
     /// Verify bundle exists and is valid
     private func verifyBundle(at path: String) throws -> Bool {
         guard FileManager.default.fileExists(atPath: path) else {
-            print("[BareWorklet] Bundle not found at path: \(path)")
+            ZMLog.error("BareWorklet", "Worklet bundle not found")
             return false
         }
 
         // Verify bundle is not empty
         let attributes = try FileManager.default.attributesOfItem(atPath: path)
         guard let fileSize = attributes[.size] as? UInt64, fileSize > 0 else {
-            print("[BareWorklet] Bundle at path is empty: \(path)")
+            ZMLog.error("BareWorklet", "Worklet bundle is empty")
             return false
         }
 
-        print("[BareWorklet] Bundle verified: \(fileSize) bytes at \(path)")
+        ZMLog.debug("BareWorklet", "Worklet bundle verified")
         return true
     }
 
@@ -157,9 +147,7 @@ class ZMBareWorklet {
 
         guard let finalBundlePath = bundlePath else {
             stateLock.withLock { state = .failed(BareWorkletError.bundleNotFound) }
-            print("[BareWorklet] ERROR: worklet.bundle not found!")
-            print("[BareWorklet] Searched in framework bundle: \(frameworkBundle.bundlePath)")
-            print("[BareWorklet] Searched in main bundle: \(Bundle.main.bundlePath)")
+            ZMLog.error("BareWorklet", "Worklet bundle unavailable")
             throw BareWorkletError.bundleNotFound
         }
 
@@ -175,16 +163,13 @@ class ZMBareWorklet {
             throw BareWorkletError.startupFailed("Bundle verification failed: \(error.localizedDescription)")
         }
 
-        print("[BareWorklet] Starting worklet from bundle: \(targetBundle.bundlePath)")
-        // --identity-file-key carries the identity-file encryption key.
-        let redactedArgv = arguments.map {
-            $0.hasPrefix("--identity-file-key=") ? "--identity-file-key=<redacted>" : $0
-        }
-        print("[BareWorklet] argv: \(redactedArgv)")
+        // Arguments include paths, network configuration and the identity-file
+        // key. Never log argv, even with individual fields redacted.
+        ZMLog.debug("BareWorklet", "Starting worklet")
 
         // PHASE 1: Transition to .starting state
         stateLock.withLock { state = .starting }
-        print("[BareWorklet] State: .starting")
+        ZMLog.debug("BareWorklet", "State changed to starting")
 
         // PHASE 2: Start the worklet BEFORE creating IPC.
         // bare_worklet_start() sets up the pipe FDs via a barrier.
@@ -197,11 +182,11 @@ class ZMBareWorklet {
         // PHASE 3: Create IPC (now FDs are valid)
         guard let ipcChannel = BareIPC(worklet: worklet) else {
             stateLock.withLock { state = .failed(BareWorkletError.ipcNotAvailable) }
-            print("[BareWorklet] State: .failed (IPC creation failed)")
+            ZMLog.error("BareWorklet", "IPC channel creation failed")
             throw BareWorkletError.ipcNotAvailable
         }
         stateLock.withLock { self.ipc = ipcChannel }
-        print("[BareWorklet] IPC channel created successfully")
+        ZMLog.debug("BareWorklet", "IPC channel created")
 
         // PHASE 4: Set up IPC listener
         // A peer can produce IPC faster than Swift parses it. Keep the queue bounded so
@@ -213,7 +198,7 @@ class ZMBareWorklet {
 
         listenerTask = Task { [weak self] in
             defer {
-                print("[BareWorklet] IPC listener ended")
+                ZMLog.debug("BareWorklet", "IPC listener ended")
             }
 
             for await data in stream {
@@ -222,7 +207,7 @@ class ZMBareWorklet {
                 // An oversized chunk means framing or the core violated the IPC contract.
                 // Continuing would parse the remaining stream at the wrong boundary.
                 guard data.count <= 1_048_576 else {
-                    print("[BareWorklet] Rejecting oversized message (\(data.count) bytes)")
+                    ZMLog.warning("BareWorklet", "Oversized IPC message rejected")
                     self?.handleTerminalFailure(BareWorkletError.ipcMessageTooLarge(data.count))
                     break
                 }
@@ -231,7 +216,7 @@ class ZMBareWorklet {
                     await onIPC(data)
                 }
             }
-            print("[BareWorklet] IPC listener stream ended normally")
+            ZMLog.debug("BareWorklet", "IPC listener stream ended")
         }
 
         // PHASE 5: Mark running before arming readability. BareKit may invoke
@@ -262,8 +247,7 @@ class ZMBareWorklet {
                 }
             }
         }
-        print("[BareWorklet] State: .running")
-        print("[BareWorklet] Worklet started successfully, IPC listener active")
+        ZMLog.debug("BareWorklet", "Worklet running with IPC listener active")
     }
     
     /// Let the IPC thread unwind before terminating. `terminate()` races it, and
@@ -300,7 +284,7 @@ class ZMBareWorklet {
             state = .notStarted
         }
 
-        print("[BareWorklet] Stopped and terminated")
+        ZMLog.debug("BareWorklet", "Worklet stopped")
     }
     
     func suspend() {
@@ -310,11 +294,11 @@ class ZMBareWorklet {
             return value
         }
         guard case .running = priorState else {
-            print("[BareWorklet] Cannot suspend: current state is \(priorState.description)")
+            ZMLog.warning("BareWorklet", "Suspend ignored in current state")
             return
         }
         worklet?.suspend()
-        print("[BareWorklet] State: .suspended")
+        ZMLog.debug("BareWorklet", "Worklet suspended")
     }
 
     func resume() {
@@ -324,11 +308,11 @@ class ZMBareWorklet {
             return value
         }
         guard case .suspended = priorState else {
-            print("[BareWorklet] Cannot resume: current state is \(priorState.description)")
+            ZMLog.warning("BareWorklet", "Resume ignored in current state")
             return
         }
         worklet?.resume()
-        print("[BareWorklet] State: .running (resumed)")
+        ZMLog.debug("BareWorklet", "Worklet resumed")
     }
     
     func sendIPC(_ data: Data) async throws {
@@ -356,7 +340,7 @@ class ZMBareWorklet {
             return true
         }
         guard shouldReport else { return }
-        print("[BareWorklet] Terminal IPC failure: \(error)")
+        ZMLog.error("BareWorklet", "Terminal IPC failure")
         onTerminalFailure?(error)
     }
 }

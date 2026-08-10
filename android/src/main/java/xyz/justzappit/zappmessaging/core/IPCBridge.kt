@@ -1,10 +1,10 @@
 package xyz.justzappit.zappmessaging.core
 
-import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
+import xyz.justzappit.zappmessaging.ZMLog
 import xyz.justzappit.zappmessaging.models.*
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
@@ -126,7 +126,7 @@ class IPCBridge {
                 // frame may arrive in one callback, so the unterminated-tail
                 // check below is not sufficient on its own.
                 if (newlineIndex > maxLineBytes) {
-                    Log.w(TAG, "IPC frame exceeds $maxLineBytes bytes; skipping it")
+                    ZMLog.warning(TAG) { "Oversized IPC frame skipped" }
                     receiveBuffer = receiveBuffer.copyOfRange(newlineIndex + 1, receiveBuffer.size)
                     continue
                 }
@@ -144,7 +144,7 @@ class IPCBridge {
             // the whole buffer was cleared — killing every in-flight request and
             // deterministically bricking a media-heavy conversation on retry.
             if (receiveBuffer.size > maxLineBytes) {
-                Log.w(TAG, "IPC frame exceeds $maxLineBytes bytes without a newline; skipping it")
+                ZMLog.warning(TAG) { "Unterminated oversized IPC frame skipped" }
                 skippingOversized = true
                 receiveBuffer = ByteArray(0)
             }
@@ -155,7 +155,7 @@ class IPCBridge {
         try {
             val element = json.parseToJsonElement(line)
             if (element !is JsonObject) {
-                Log.w(TAG, "Skipping non-object JSON: ${line.take(120)}")
+                ZMLog.warning(TAG) { "Non-object IPC frame skipped" }
                 return
             }
 
@@ -171,9 +171,9 @@ class IPCBridge {
                 return
             }
 
-            Log.w(TAG, "Unrecognized message format: ${line.take(120)}")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse JSON line: ${line.take(120)}", e)
+            ZMLog.warning(TAG) { "Unrecognized IPC frame skipped" }
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Malformed IPC frame skipped" }
         }
     }
 
@@ -204,8 +204,8 @@ class IPCBridge {
             for (handler in eventHandlers) {
                 try {
                     handler(type, payload)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Event handler error for '$type'", e)
+                } catch (_: Exception) {
+                    ZMLog.error(TAG) { "IPC event handler failed" }
                 }
             }
         }
@@ -344,7 +344,7 @@ class IPCBridge {
                 "Protocol version mismatch: client=$CLIENT_PROTOCOL_VERSION server=$serverVersion"
             )
         }
-        Log.i(TAG, "Protocol negotiated: v${result["protocolVersion"]?.jsonPrimitive?.contentOrNull}")
+        ZMLog.debug(TAG) { "IPC protocol negotiated" }
         return result
     }
 

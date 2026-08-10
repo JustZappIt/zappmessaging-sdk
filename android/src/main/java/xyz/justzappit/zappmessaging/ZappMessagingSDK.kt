@@ -2,7 +2,6 @@ package xyz.justzappit.zappmessaging
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -186,12 +185,12 @@ class ZappMessagingSDK {
                     ipcBridge.negotiateProtocol()
                     workletReady = true
                     break
-                } catch (e: Exception) {
-                    Log.w(TAG, "Worklet probe attempt $attempt failed: ${e.message}")
+                } catch (_: Exception) {
+                    ZMLog.warning(TAG) { "Worklet readiness probe $attempt failed" }
                 }
             }
             if (!workletReady) {
-                Log.e(TAG, "Worklet failed to start after $WORKLET_STARTUP_MAX_RETRIES attempts")
+                ZMLog.error(TAG) { "Worklet readiness probes exhausted" }
                 throw ZMError.NotInitialized()
             }
 
@@ -199,8 +198,8 @@ class ZappMessagingSDK {
             try {
                 val response = ipcBridge.sendRequest("identity.get")
                 _identity.value = ipcBridge.parseIdentity(response)
-            } catch (e: Exception) {
-                Log.w(TAG, "No existing identity on init: ${e.message}")
+            } catch (_: Exception) {
+                ZMLog.debug(TAG) { "No existing identity available during initialization" }
             }
 
             // Load initial data if identity exists
@@ -209,13 +208,13 @@ class ZappMessagingSDK {
                     refreshConversations()
                     refreshContacts()
                     getConnectionStatus()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to load initial data: ${e.message}")
+                } catch (_: Exception) {
+                    ZMLog.warning(TAG) { "Initial data refresh failed" }
                 }
             }
 
             isInitialized = true
-            Log.i(TAG, "SDK initialized")
+            ZMLog.debug(TAG) { "SDK initialized" }
         } catch (error: Throwable) {
             ipcBridge.cancelAllPendingRequests()
             workletManager.stop()
@@ -236,7 +235,7 @@ class ZappMessagingSDK {
         hostScope = null
         applicationContext = null
         isInitialized = false
-        Log.i(TAG, "SDK shut down")
+        ZMLog.debug(TAG) { "SDK shut down" }
     }
 
     // ── Identity Management ─────────────────────────────────────────────
@@ -314,8 +313,8 @@ class ZappMessagingSDK {
         try {
             refreshConversations()
             refreshContacts()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to reload data after restore: ${e.message}")
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Post-restore data refresh failed" }
         }
 
         return restoredIdentity
@@ -559,8 +558,8 @@ class ZappMessagingSDK {
             }
             val response = ipcBridge.sendRequest("message.get_thumbnail", payload)
             response["thumbnailData"]?.jsonPrimitive?.contentOrNull
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to fetch thumbnail for $messageId: ${e.message}")
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Thumbnail fetch failed" }
             null
         }
     }
@@ -907,8 +906,8 @@ class ZappMessagingSDK {
         kotlinx.coroutines.GlobalScope.launch {
             try {
                 getConnectionStatus()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to refresh connection status on resume: ${e.message}")
+            } catch (_: Exception) {
+                ZMLog.warning(TAG) { "Connection refresh after resume failed" }
             }
         }
     }
@@ -934,7 +933,7 @@ class ZappMessagingSDK {
                 }
 
                 "push.notification_failed" -> {
-                    Log.w(TAG, "Advisory blind-push request failed")
+                    ZMLog.warning(TAG) { "Advisory blind-push request failed" }
                 }
 
                 "conversation.invite_received" -> {
@@ -1052,13 +1051,11 @@ class ZappMessagingSDK {
                 }
 
                 "ipc.error" -> {
-                    val code = payload["code"]?.jsonPrimitive?.contentOrNull ?: "UNKNOWN"
-                    val message = payload["message"]?.jsonPrimitive?.contentOrNull ?: "IPC error"
-                    Log.e(TAG, "IPC error from worklet: code=$code message=$message")
+                    ZMLog.error(TAG) { "Worklet reported an IPC error" }
                 }
 
                 else -> {
-                    Log.d(TAG, "Unhandled event: $eventType")
+                    ZMLog.debug(TAG) { "Unhandled event type received" }
                 }
             }
         }
@@ -1089,7 +1086,7 @@ class ZappMessagingSDK {
                     timeoutMs = PLATFORM_HTTP_RESPONSE_TIMEOUT_MS,
                 )
             }.onFailure {
-                Log.w(TAG, "Failed to return platform HTTPS response: ${it.message}")
+                ZMLog.warning(TAG) { "Platform HTTPS response delivery failed" }
             }
         }
     }

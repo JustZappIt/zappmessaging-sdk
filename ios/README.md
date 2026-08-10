@@ -76,6 +76,12 @@ let sdk = ZappMessagingSDK(
 try await sdk.initialize()
 ```
 
+Native and JavaScript diagnostics are disabled by default. A host may set
+`logLevel: "debug"` in `ZappMessagingConfig` for short-lived local
+troubleshooting. Native diagnostics contain only lifecycle and structural
+events: raw IPC frames, identifiers, addresses, paths, argv, keys, and error
+descriptions are never logged. Do not enable debug diagnostics in production.
+
 ### Create Identity
 
 ```swift

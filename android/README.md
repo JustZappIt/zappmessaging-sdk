@@ -31,6 +31,15 @@ If the Keystore is unusable on the device, no key is supplied and the core keeps
 (the OS reset the keystore), a fresh data key is minted, the existing encrypted identity
 file can no longer be read, and the user recovers from the 24-word phrase.
 
+## Diagnostics
+
+Native and JavaScript diagnostics are disabled by default. For short-lived local
+troubleshooting, set `ZAPP_MESSAGING_LOG_LEVEL=debug` in the consuming app's
+uncommitted `local.properties`. Native diagnostics contain only lifecycle and
+structural events: raw IPC frames, identifiers, addresses, paths, argv, keys, and
+exception messages are never logged. Do not ship production builds with debug
+diagnostics enabled.
+
 ## Requirements
 
 - Android 10+ (API 29)

@@ -2,12 +2,12 @@ package xyz.justzappit.zappmessaging.core
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import to.holepunch.bare.kit.IPC
 import to.holepunch.bare.kit.Worklet
 import xyz.justzappit.zappmessaging.BuildConfig
+import xyz.justzappit.zappmessaging.ZMLog
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
@@ -45,7 +45,7 @@ class BareWorkletManager {
     fun start(context: Context, ipcBridge: IPCBridge) {
         synchronized(lifecycleLock) {
             if (isRunning) {
-                Log.w(TAG, "Worklet already running")
+                ZMLog.warning(TAG) { "Worklet already running" }
                 return
             }
 
@@ -64,7 +64,7 @@ class BareWorkletManager {
                         input.copyTo(output)
                     }
                 }
-                Log.i(TAG, "Extracted worklet.bundle to ${bundleFile.absolutePath}")
+                ZMLog.debug(TAG) { "Worklet bundle extracted" }
             }
 
             // Create worklet with 64MB memory limit, assets pointing to bundle directory
@@ -101,7 +101,7 @@ class BareWorkletManager {
             val gatewayIp = getGatewayIp(context)
             if (gatewayIp != null) {
                 argv += "--local-gateway=$gatewayIp"
-                Log.i(TAG, "Local gateway detected: $gatewayIp")
+                ZMLog.debug(TAG) { "Local gateway detected" }
             }
             if (BuildConfig.ZAPP_MESSAGING_LOG_LEVEL.isNotEmpty()) {
                 argv += "--log-level=${BuildConfig.ZAPP_MESSAGING_LOG_LEVEL}"
@@ -131,22 +131,22 @@ class BareWorkletManager {
                         hasData = true
                         val bytes = ByteArray(data.remaining())
                         data.get(bytes)
-                        Log.d(TAG, "IPC data received from worklet: ${bytes.size} bytes")
+                        ZMLog.debug(TAG) { "IPC data received" }
                         bridge.handleIncomingData(bytes)
                     }
                     if (!hasData) {
-                        Log.d(TAG, "IPC readable callback fired but no data available")
+                        ZMLog.debug(TAG) { "IPC callback had no available data" }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     if (!shuttingDown.get()) {
-                        Log.e(TAG, "IPC read failed", e)
+                        ZMLog.error(TAG) { "IPC read failed" }
                     }
                 }
                 Unit
             }
 
             isRunning = true
-            Log.i(TAG, "Worklet started successfully")
+            ZMLog.debug(TAG) { "Worklet started" }
         } // synchronized(lifecycleLock)
     }
 
@@ -163,8 +163,8 @@ class BareWorkletManager {
 
             try {
                 ipc?.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "IPC close error (ignored)", e)
+            } catch (_: Exception) {
+                ZMLog.warning(TAG) { "IPC close failed during shutdown" }
             }
             ipc = null
             ipcBridge = null
@@ -181,13 +181,13 @@ class BareWorkletManager {
 
             try {
                 worklet?.terminate()
-            } catch (e: Exception) {
-                Log.w(TAG, "Worklet terminate error (ignored)", e)
+            } catch (_: Exception) {
+                ZMLog.warning(TAG) { "Worklet termination failed during shutdown" }
             }
             worklet = null
 
             isRunning = false
-            Log.i(TAG, "Worklet stopped")
+            ZMLog.debug(TAG) { "Worklet stopped" }
         } // synchronized(lifecycleLock)
     }
 
@@ -198,9 +198,9 @@ class BareWorkletManager {
         if (!isRunning || shuttingDown.get()) return
         try {
             worklet?.suspend()
-            Log.i(TAG, "Worklet suspended")
-        } catch (e: Exception) {
-            Log.w(TAG, "Worklet suspend failed", e)
+            ZMLog.debug(TAG) { "Worklet suspended" }
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Worklet suspension failed" }
         }
     }
 
@@ -213,9 +213,9 @@ class BareWorkletManager {
         if (!isRunning || shuttingDown.get()) return
         try {
             worklet?.suspend(lingerMs)
-            Log.i(TAG, "Worklet suspended with linger: ${lingerMs}ms")
-        } catch (e: Exception) {
-            Log.w(TAG, "Worklet suspend(linger) failed", e)
+            ZMLog.debug(TAG) { "Worklet suspended with linger" }
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Worklet linger suspension failed" }
         }
     }
 
@@ -226,9 +226,9 @@ class BareWorkletManager {
         if (!isRunning || shuttingDown.get()) return
         try {
             worklet?.resume()
-            Log.i(TAG, "Worklet resumed")
-        } catch (e: Exception) {
-            Log.w(TAG, "Worklet resume failed", e)
+            ZMLog.debug(TAG) { "Worklet resumed" }
+        } catch (_: Exception) {
+            ZMLog.warning(TAG) { "Worklet resume failed" }
         }
     }
 
@@ -246,7 +246,7 @@ class BareWorkletManager {
         val ipcChannel = ipc ?: throw IllegalStateException("IPC not available — worklet not started")
         val buffer = ByteBuffer.wrap(data)
 
-        Log.d(TAG, "Sending ${data.size} bytes to worklet via IPC")
+        ZMLog.debug(TAG) { "Sending IPC data" }
         
         try {
             while (buffer.hasRemaining()) {
@@ -255,7 +255,7 @@ class BareWorkletManager {
                     // Non-blocking write returned 0 — use async fallback
                     val remaining = ByteArray(buffer.remaining())
                     buffer.get(remaining)
-                    Log.d(TAG, "Using async write for remaining ${remaining.size} bytes")
+                    ZMLog.debug(TAG) { "Continuing IPC write asynchronously" }
                     suspendCoroutine<Unit> { continuation ->
                         try {
                             ipcChannel.write(ByteBuffer.wrap(remaining)) { exception ->
@@ -269,11 +269,11 @@ class BareWorkletManager {
                             continuation.resumeWithException(error)
                         }
                     }
-                    Log.d(TAG, "Async write completed successfully")
+                    ZMLog.debug(TAG) { "Asynchronous IPC write completed" }
                     return@withLock
                 }
             }
-            Log.d(TAG, "Synchronous write completed successfully")
+            ZMLog.debug(TAG) { "Synchronous IPC write completed" }
         } catch (e: Exception) {
             if (shuttingDown.get()) {
                 throw IllegalStateException("IPC closed during write — worklet is shutting down", e)
@@ -304,8 +304,8 @@ class BareWorkletManager {
                 .mapNotNull { it.gateway?.hostAddress }
                 // IPv4 only: skip IPv6 link-local (fe80::) and loopback
                 .firstOrNull { addr -> addr.contains('.') && !addr.startsWith("169.254") }
-        } catch (e: Exception) {
-            Log.d(TAG, "Gateway detection failed (non-fatal): ${e.message}")
+        } catch (_: Exception) {
+            ZMLog.debug(TAG) { "Gateway detection unavailable" }
             null
         }
     }
