@@ -4,13 +4,13 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import android.util.Log
 import java.security.KeyStore
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import xyz.justzappit.zappmessaging.ZMLog
 
 /**
  * Supplies the 32-byte key the worklet uses to encrypt identity.json (the
@@ -51,14 +51,14 @@ object IdentityFileKeyProvider {
 
             prefs.getString(PREF_WRAPPED, null)?.let { stored ->
                 unwrap(stored, wrapKey)?.let { return it.toHex() }
-                Log.w(TAG, "Stored identity key failed to unwrap; rotating (seed-phrase restore required)")
+                ZMLog.warning(TAG) { "Stored identity key could not be unwrapped; rotating" }
             }
 
             val dataKey = ByteArray(DATA_KEY_BYTES).also { SecureRandom().nextBytes(it) }
             prefs.edit().putString(PREF_WRAPPED, wrap(dataKey, wrapKey)).apply()
             dataKey.toHex()
-        } catch (e: Exception) {
-            Log.e(TAG, "Keystore unavailable; identity file stays plaintext: ${e.message}")
+        } catch (_: Exception) {
+            ZMLog.error(TAG) { "Keystore unavailable; identity encryption disabled" }
             null
         }
     }

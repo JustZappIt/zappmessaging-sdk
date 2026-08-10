@@ -1282,7 +1282,9 @@ practice.
 - **Corestore**: `<dataDir>/zappmessaging/corestore/`
 - **Remote core index**: `<dataDir>/zappmessaging/corekeys.json`
 - **Debug diagnostics**: disabled by default; `--log-level=debug` writes a bounded
-  `<dataDir>/zappmessaging/debug.log` for local troubleshooting
+  `<dataDir>/zappmessaging/debug.log` for local troubleshooting. It also enables
+  privacy-sanitized native wrapper diagnostics. Native logs never include raw IPC
+  frames, identifiers, addresses, filesystem paths, argv, keys, or error descriptions.
 
 Deleting `<dataDir>/zappmessaging/` wipes all chat state.
 

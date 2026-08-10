@@ -47,7 +47,7 @@ enum IdentityFileKeyStore {
             // Raced with a concurrent caller; the stored item wins.
             return hex(existing)
         }
-        print("[IdentityFileKeyStore] Keychain add failed (\(addStatus)); identity file stays plaintext")
+        ZMLog.error("IdentityFileKeyStore", "Keychain unavailable; identity encryption disabled")
         return nil
     }
 
