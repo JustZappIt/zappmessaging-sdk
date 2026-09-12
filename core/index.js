@@ -21,6 +21,8 @@ if (typeof Bare !== 'undefined') {
 
 diag('ZappMessaging worklet starting...')
 
+const { createPeerReceiver, serveAuthorizedMedia, acceptAuthorizedMediaChunk } = require('./lib/peer-receiver')
+
 const { runBounded } = require('./lib/async-pool')
 const { STARTUP_JOIN_CONCURRENCY } = require('./lib/config')
 const { isMediaId, isPeerId } = require('./lib/media-id')
@@ -131,6 +133,7 @@ if (!P2PManager) {
     async joinConversation() { return false }
     async joinGroupConversation() { return false }
     async joinPersonalTopic() {}
+    setPeerRecordSink() {}
     sendToConversation() { return false }
     getConversationFramedSockets() { return [] }
     requestMedia() { return false }
@@ -169,8 +172,8 @@ function requestMediaForMessage (conversationId, message, peerId) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) return
     if (!message || message.isFromMe || !isMediaId(message.mediaId)) return
     if (!mediaStore || !p2pManager) return
-    if (mediaStore.hasMedia(message.mediaId)) {
-      _mediaRequests.delete(message.mediaId)
+    if (mediaStore.hasMedia(message.mediaId) && chatStore &&
+        chatStore.hasAuthorizedMediaReference(conversationId, message.mediaId)) {
       return
     }
 
@@ -179,8 +182,8 @@ function requestMediaForMessage (conversationId, message, peerId) {
     const senderId = peerIdOrNull(peerId) || peerIdOrNull(message.senderId)
     const entry = _mediaRequests.get(mediaId) ||
       { conversationId, senderId, attempts: 0, lastAt: 0 }
-    entry.conversationId = conversationId
-    if (senderId) entry.senderId = senderId
+    // A transfer's authorization scope cannot move when another conversation
+    // references the same hash. Its chunks prove possession only in this scope.
 
     if (!_mediaRequests.has(mediaId) && _mediaRequests.size >= MAX_PENDING_MEDIA_REQUESTS) {
       const oldestMediaId = _mediaRequests.keys().next().value
@@ -192,7 +195,7 @@ function requestMediaForMessage (conversationId, message, peerId) {
     if (entry.attempts >= MEDIA_REQUEST_MAX_ATTEMPTS) return
     if (entry.lastAt && (now - entry.lastAt) < MEDIA_REQUEST_COOLDOWN_MS) return
 
-    const sent = p2pManager.requestMedia(conversationId, mediaId, entry.senderId)
+    const sent = p2pManager.requestMedia(entry.conversationId, mediaId, entry.senderId)
     if (sent) {
       entry.attempts += 1
       entry.lastAt = now
@@ -208,7 +211,8 @@ async function requestMissingMediaForConversation (conversationId, peerId) {
     if (!chatStore || !mediaStore) return
     const messages = await chatStore.getMessages(conversationId, 50)
     for (const m of messages) {
-      if (m && isMediaId(m.mediaId) && !m.isFromMe && !mediaStore.hasMedia(m.mediaId)) {
+      if (m && isMediaId(m.mediaId) && !m.isFromMe &&
+          (!mediaStore.hasMedia(m.mediaId) || !chatStore.hasAuthorizedMediaReference(conversationId, m.mediaId))) {
         const entry = _mediaRequests.get(m.mediaId)
         const onlinePeerId = peerIdOrNull(peerId)
         // A fresh author connection is a meaningful new opportunity. Reset a
@@ -225,23 +229,6 @@ async function requestMissingMediaForConversation (conversationId, peerId) {
   }
 }
 
-// Per-conversation recovery lock to prevent race conditions (H4)
-const _recoveryLocks = new Map()
-async function withRecoveryLock (conversationId, fn) {
-  while (_recoveryLocks.has(conversationId)) {
-    await _recoveryLocks.get(conversationId)
-  }
-  let resolve
-  const lock = new Promise(r => { resolve = r })
-  _recoveryLocks.set(conversationId, lock)
-  try {
-    return await fn()
-  } finally {
-    _recoveryLocks.delete(conversationId)
-    resolve()
-  }
-}
-
 // Global instances
 let identity = null
 let chatStore = null
@@ -253,6 +240,15 @@ let ipcHandler = null
 let hypercoreManager = null
 let blindMirror = null
 let blindMirrorInitPromise = null
+
+const receivePeerRecord = createPeerReceiver(() => ({
+  chatStore, p2pManager, ipcHandler, identity, processReceipt,
+  onMessage: (conversationId, stored, record, peer) => {
+    if (stored) coldStartMilestone('first_authentic_message_persisted')
+    requestMediaForMessage(conversationId, record, peer)
+    if (stored && ipcHandler) ipcHandler.pushEvent('message.received', { conversationId, message: stored })
+  }
+}))
 
 async function processReceipt (conversationId, receipt) {
   if (!receipt || !receipt.upTo) return
@@ -402,50 +398,8 @@ async function initialize() {
         // the block is durably stored before it is marked processed. A throw
         // means "not ingested" — the cursor stays and bounded retry begins
         // immediately (addMessage dedups any replay by id).
-        hypercoreManager.setRemoteMessageSink(async (conversationId, peerKeyHex, message, index) => {
-          if (!message) return
-          // Control records (e.g. read receipts) replicate on the same core as
-          // chat messages. Route them by type before addMessage so they never
-          // become phantom rows.
-          if (message.type === '__receipt') {
-            await processReceipt(conversationId, message)
-            return
-          }
-          // Stamp authentic sender from the core's owner; never trust the
-          // payload field. Cores are keyed per-peer so this is reliable.
-          message.senderId = peerKeyHex
-          message.isFromMe = false
-          // A conversation the user left, or one that never existed locally,
-          // is unstorable — treat as permanently handled so the cursor can
-          // advance past it rather than wedging every later block.
-          if (!chatStore || chatStore.hasLeftConversation(conversationId)) return
-          let stored
-          try {
-            stored = await chatStore.addMessage(conversationId, message)
-          } catch (err) {
-            if ((err.message || '').includes('Conversation not found')) {
-              diag('Dropping remote block for unknown conversation ' +
-                conversationId.substring(0, 12) + ' (idx ' + index + ')')
-              return
-            }
-            throw err // transient/unknown — do not advance the cursor
-          }
-          if (stored) coldStartMilestone('first_authentic_message_persisted')
-          // Media bytes don't ride the hypercore — pull them from the peer.
-          // This also runs on a deduplicated replay in case the row was stored
-          // before its media bytes were fetched.
-          requestMediaForMessage(conversationId, message, peerKeyHex)
-          if (stored && ipcHandler) {
-            ipcHandler.pushEvent('message.received', { conversationId, message })
-          }
-
-          // Delivery receipts are cumulative watermarks. The manager coalesces
-          // every message in this drain batch to the newest one, durably queues
-          // that single receipt, and only then commits the cursor.
-          return message.id
-            ? { deliveryReceipt: { messageId: message.id, senderId: message.senderId } }
-            : null
-        })
+        hypercoreManager.setRemoteMessageSink((conversationId, peer, message) =>
+          receivePeerRecord(conversationId, peer, message, { replicated: true }))
 
         hypercoreManager.setRemoteDrainCompleteSink(async (conversationId, peerKeyHex, result) => {
           const senderId = result.senderId || peerKeyHex
@@ -511,14 +465,11 @@ async function initialize() {
         ipcHandler.pushEvent('platform.http_request', request)
         return true
       },
-      isParticipant: (conversationId, peerKeyHex) => {
-        if (!chatStore) return false
-        const conv = chatStore.conversations.get(conversationId)
-        if (!conv) return false
-        const peer = (peerKeyHex || '').toLowerCase()
-        if ((conv.creatorKey || '').toLowerCase() === peer) return true
-        return (conv.participantIds || []).some(k => (k || '').toLowerCase() === peer)
-      }
+      resolveGroupTopic: topic => chatStore && chatStore.conversationForGroupTopic(topic),
+      mayServeMedia: (hash, peer) => !!chatStore && b4a.isBuffer(hash) && hash.length === 32 &&
+        chatStore.canServeMedia(b4a.toString(hash, 'hex'), peer),
+      getConversation: id => chatStore && !chatStore.hasLeftConversation(id) && chatStore.conversations.get(id),
+      isParticipant: (id, peer) => !!chatStore && chatStore.isPeerAuthorized(id, peer)
     })
 
     // Begin blind-mirror bring-up as soon as the swarm/DHT object exists — in
@@ -650,87 +601,7 @@ async function initialize() {
       }
     })
 
-    // Set up P2P event handlers for incoming messages
-    p2pManager.on('message', async (conversationId, message) => {
-      try {
-        // Messages from P2P are never from the local user
-        message.isFromMe = false
-        // Store incoming message; null return means it was a duplicate
-        // already on disk (e.g., the hypercore replication path delivered
-        // it first), so we skip the IPC event to avoid a duplicate row in
-        // the UI.
-        const stored = chatStore ? await chatStore.addMessage(conversationId, message) : null
-        if (p2pManager && message.id) {
-          p2pManager.sendDeliveryReceipt(conversationId, message.id, message.senderId)
-        }
-        // Media bytes aren't carried in the message JSON — pull them from the
-        // peer. Runs even for a de-duplicated message (stored === null) since a
-        // prior delivery may have persisted the row without the media file.
-        requestMediaForMessage(conversationId, message, message.senderId)
-        if (!stored) return
-
-        // Notify UI via IPC
-        if (ipcHandler) {
-          ipcHandler.pushEvent('message.received', {
-            conversationId,
-            message
-          })
-        }
-      } catch (err) {
-        const errorMessage = err && err.message ? err.message : ''
-        const isConversationMissing = errorMessage.includes('Conversation not found')
-
-        // Do not recreate a conversation the user explicitly left
-        if (isConversationMissing && chatStore && chatStore.hasLeftConversation(conversationId)) {
-          diag('Ignoring message for left conversation: ' + conversationId.substring(0, 12))
-          return
-        }
-
-        if (isConversationMissing && chatStore && message && message.senderId && !message.groupTopicHex) {
-          try {
-            // Serialize recovery per conversation to prevent race conditions (H4)
-            await withRecoveryLock(conversationId, async () => {
-              // Re-check after acquiring lock — another message may have already recovered it
-              if (await chatStore.getConversation(conversationId)) {
-                await chatStore.addMessage(conversationId, message)
-                if (p2pManager && message.id) {
-                  p2pManager.sendDeliveryReceipt(conversationId, message.id, message.senderId)
-                }
-                if (ipcHandler) {
-                  ipcHandler.pushEvent('message.received', { conversationId, message })
-                }
-                return
-              }
-              const normalizedSenderId = (message.senderId || '').toLowerCase().replace(/^0x/, '')
-              const recoveredConversation = await chatStore.createConversationWithId(
-                conversationId,
-                'direct',
-                [normalizedSenderId],
-                {}
-              )
-              await p2pManager.joinConversation(conversationId, message.senderId)
-              await chatStore.addMessage(conversationId, message)
-              if (message.id) p2pManager.sendDeliveryReceipt(conversationId, message.id, message.senderId)
-
-              if (ipcHandler) {
-                ipcHandler.pushEvent('conversation.invite_received', {
-                  conversation: recoveredConversation
-                })
-                ipcHandler.pushEvent('message.received', {
-                  conversationId,
-                  message
-                })
-              }
-            })
-            requestMediaForMessage(conversationId, message, message.senderId)
-            return
-          } catch (recoveryError) {
-            diag('Failed to recover missing conversation: ' + (recoveryError.message || recoveryError))
-          }
-        }
-        diag('Failed to handle incoming message: ' + (err.message || err))
-      }
-    })
+    p2pManager.setPeerRecordSink(receivePeerRecord)
 
     // Set up media transfer event handlers
     if (mediaTransfer) {
@@ -744,6 +615,8 @@ async function initialize() {
 
       mediaTransfer.on('complete', (hashHex, fullData) => {
         try {
+          const request = _mediaRequests.get(hashHex)
+          if (!request) return
           // Determine extension from first bytes (magic number detection)
           let ext = 'jpg'
           if (fullData.length >= 4) {
@@ -753,6 +626,9 @@ async function initialize() {
           }
 
           const filePath = mediaStore.saveMediaWithHash(fullData, hashHex, ext)
+          // Completion is emitted only after hash verification. Never grant
+          // other conversations merely because their peer named the same hash.
+          if (chatStore) chatStore.authorizeReceivedMedia(request.conversationId, hashHex)
           diag('Media transfer complete: ' + hashHex.substring(0, 12) + ' (' + fullData.length + ' bytes) -> ' + ext)
 
           // Downloaded — stop tracking it as a pending fetch.
@@ -797,7 +673,7 @@ async function initialize() {
     // Handle media requests from peers
     p2pManager.on('media_request', async (hashBuf, peerId, framedSocket) => {
       try {
-        if (mediaTransfer) await mediaTransfer.handleRequest(hashBuf, framedSocket)
+        await serveAuthorizedMedia(chatStore, mediaTransfer, hashBuf, peerId, framedSocket)
       } catch (err) {
         diag('Failed to handle media request:', err)
         diag('Failed to handle media request: ' + (err.message || err))
@@ -807,12 +683,8 @@ async function initialize() {
     // Handle media chunks from peers
     p2pManager.on('media_chunk', (hashBuf, chunkIndex, totalChunks, chunkData, peerId) => {
       try {
-        if (!mediaTransfer || !b4a.isBuffer(hashBuf) || hashBuf.length !== 32) return
-        const hashHex = b4a.toString(hashBuf, 'hex')
-        // Ignore unsolicited blobs. A peer must first deliver a valid message
-        // referencing this exact hash, otherwise it could fill local storage.
-        if (!_mediaRequests.has(hashHex)) return
-        mediaTransfer.onChunkReceived(hashBuf, chunkIndex, totalChunks, chunkData)
+        acceptAuthorizedMediaChunk(chatStore, mediaTransfer, _mediaRequests,
+          hashBuf, chunkIndex, totalChunks, chunkData, peerId)
       } catch (err) {
         diag('Failed to handle media chunk:', err)
         diag('Failed to handle media chunk: ' + (err.message || err))

@@ -327,7 +327,11 @@ class HypercoreManager extends EventEmitter {
     const current = perConv.get(key)
     if (current && current.fork === fork && current.nextIndex >= nextIndex) return
     perConv.set(key, { nextIndex, fork })
-    this.saveCoreKeyIndex()
+    try { this.saveCoreKeyIndex({ strict: true }) } catch (err) {
+      if (current) perConv.set(key, current)
+      else perConv.delete(key)
+      throw err
+    }
   }
 
   _deleteProcessedCursor (conversationId, coreKeyHex) {
@@ -441,8 +445,13 @@ class HypercoreManager extends EventEmitter {
       if (state.cancelled || this._closed) throw new Error('remote drain cancelled')
       if (message) {
         if (!this._remoteMessageSink) throw new Error('remote message sink unavailable')
-        const result = await this._remoteMessageSink(conversationId, peerKeyHex, message, i)
-        if (result && result.deliveryReceipt) deliveryReceipt = result.deliveryReceipt
+        try {
+          const result = await this._remoteMessageSink(conversationId, peerKeyHex, message, i)
+          if (result && result.deliveryReceipt) deliveryReceipt = result.deliveryReceipt
+        } catch (err) {
+          if (err.code !== 'INVALID_PEER_RECORD') throw err
+          diag('Skipping invalid remote record at index ' + i)
+        }
       }
       i++
     }
@@ -471,12 +480,14 @@ class HypercoreManager extends EventEmitter {
     if (state.appendHandler && typeof core.off === 'function') core.off('append', state.appendHandler)
   }
 
-  async _closeRemoteCore (core) {
+  async _closeRemoteCore (core, { waitForDrain = true } = {}) {
     if (!core) return
     this._cancelRemoteDrain(core)
     try { await core.close() } catch (_) {}
     const chain = this._drainChains.get(core)
-    if (chain) await chain
+    // A control sink can revoke the writer whose drain is awaiting that sink.
+    // Cancellation prevents further commits; waiting there would await ourselves.
+    if (chain && waitForDrain) await chain
     this._drainChains.delete(core)
     this._drainStates.delete(core)
   }
@@ -508,7 +519,7 @@ class HypercoreManager extends EventEmitter {
   }
 
   /** Remove all local lifecycle state for a conversation and notify native. */
-  async removeConversation (conversationId) {
+  async removeConversation (conversationId, options = {}) {
     const local = this.localCores.get(conversationId)
     if (local) {
       try { await local.close() } catch (_) {}
@@ -517,7 +528,7 @@ class HypercoreManager extends EventEmitter {
     const remotes = this.remoteCores.get(conversationId)
     if (remotes) {
       for (const core of remotes.values()) {
-        await this._closeRemoteCore(core)
+        await this._closeRemoteCore(core, options)
       }
       this.remoteCores.delete(conversationId)
     }
@@ -530,14 +541,14 @@ class HypercoreManager extends EventEmitter {
   }
 
   /** Close and forget one departed peer's remote writer immediately. */
-  async removeRemoteCore (conversationId, peerKeyHex) {
+  async removeRemoteCore (conversationId, peerKeyHex, options = {}) {
     const peer = (peerKeyHex || '').toLowerCase()
     const remotes = this.remoteCores.get(conversationId)
     let removed = false
     if (remotes) {
       for (const [storedPeer, core] of remotes) {
         if ((storedPeer || '').toLowerCase() !== peer) continue
-        await this._closeRemoteCore(core)
+        await this._closeRemoteCore(core, options)
         remotes.delete(storedPeer)
         removed = true
       }
@@ -637,7 +648,7 @@ class HypercoreManager extends EventEmitter {
   /**
    * Persist core key index to disk so remote cores can be reopened on restart.
    */
-  saveCoreKeyIndex () {
+  saveCoreKeyIndex ({ strict = false } = {}) {
     try {
       const remotes = {}
       for (const [convId, keyMap] of this._coreKeyIndex) {
@@ -670,6 +681,7 @@ class HypercoreManager extends EventEmitter {
       diag('Saved core key index: ' + Object.keys(remotes).length + ' conversation(s)')
     } catch (err) {
       diag('Failed to save core key index: ' + (err.message || err))
+      if (strict) throw err
     }
   }
 

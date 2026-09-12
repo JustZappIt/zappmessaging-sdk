@@ -238,10 +238,10 @@ test('legitimate group invite is accepted and the sender core is opened', async 
 function groupFixture () {
   return makeHarness({
     conversations: {
-      g1: { id: 'g1', type: 'group', groupId: 'ab'.repeat(32), participantIds: [PEER], creatorKey: OTHER, displayName: 'Trip' },
+      g1: { id: 'g1', type: 'group', groupId: 'ab'.repeat(32), participantIds: [PEER, OTHER], creatorKey: OTHER, displayName: 'Trip' },
       dm1: { id: 'dm1', type: 'direct', participantIds: [PEER], displayName: 'Peer' }
     },
-    groupTopics: { topic1: 'g1' }
+    groupTopics: { ['aa'.repeat(32)]: 'g1' }
   })
 }
 
@@ -249,7 +249,7 @@ test('group_member_added from a non-participant is rejected', async () => {
   const { handler, calls } = groupFixture()
   const STRANGER = keyHex(9)
   await handler._handleGroupMemberAdded(
-    { groupTopicHex: 'topic1', newMemberKey: STRANGER, updatedParticipants: [MY, STRANGER] },
+    { groupTopicHex: 'aa'.repeat(32), newMemberKey: STRANGER, updatedParticipants: [MY, STRANGER] },
     STRANGER
   )
   assert.strictEqual(calls.updated.length, 0, 'Membership must not change on a non-participant announcement')
@@ -259,7 +259,7 @@ test('group_member_added from a non-owner participant is rejected', async () => 
   const { handler, calls } = groupFixture()
   const NEW = keyHex(8)
   await handler._handleGroupMemberAdded(
-    { groupTopicHex: 'topic1', newMemberKey: NEW, updatedParticipants: [MY, PEER, NEW] },
+    { groupTopicHex: 'aa'.repeat(32), newMemberKey: NEW, updatedParticipants: [MY, PEER, NEW] },
     PEER
   )
   assert.strictEqual(calls.updated.length, 0)
@@ -278,7 +278,7 @@ test('group_member_added merges additively — it can never evict existing membe
   const NEW = keyHex(8)
   await handler._handleGroupMemberAdded(
     // A replace-style payload that omits PEER entirely
-    { groupTopicHex: 'topic1', newMemberKey: NEW, updatedParticipants: [MY, NEW] },
+    { groupTopicHex: 'aa'.repeat(32), newMemberKey: NEW, updatedParticipants: [MY, NEW] },
     OTHER
   )
   assert.strictEqual(calls.updated.length, 1)
@@ -291,22 +291,22 @@ test('group_member_added merges additively — it can never evict existing membe
 test('group_leave removes and fully revokes only the authenticated sender', async () => {
   const { handler, chatStore, calls } = groupFixture()
   chatStore.conversations.get('g1').participantIds = [PEER, OTHER]
-  await handler._handleGroupLeave({ groupTopicHex: 'topic1', leaverKey: OTHER }, PEER)
+  await handler._handleGroupLeave({ groupTopicHex: 'aa'.repeat(32), leaverKey: OTHER }, PEER)
   const participants = chatStore.conversations.get('g1').participantIds
   assert.ok(!participants.includes(PEER), 'Authenticated sender is removed')
   assert.ok(participants.includes(OTHER), 'Wire-named victim must NOT be removed')
   assert.deepStrictEqual(calls.runtimeRevoked, [['g1', PEER]])
-  assert.deepStrictEqual(calls.coreRevoked, [['g1', PEER]])
+  assert.deepStrictEqual(calls.coreRevoked, [['g1', PEER, {}]])
   assert.deepStrictEqual(calls.mirrorRevoked, [['g1', PEER]])
 })
 
 test('group_deleted is honored only from the group owner', async () => {
   const { handler, calls, chatStore } = groupFixture()
-  await handler._handleGroupDeleted({ groupTopicHex: 'topic1' }, PEER)
+  await handler._handleGroupDeleted({ groupTopicHex: 'aa'.repeat(32) }, PEER)
   assert.strictEqual(calls.deleted.length, 0, 'Non-owner delete must be rejected')
   assert.ok(chatStore.conversations.has('g1'))
 
-  await handler._handleGroupDeleted({ groupTopicHex: 'topic1' }, OTHER)
+  await handler._handleGroupDeleted({ groupTopicHex: 'aa'.repeat(32) }, OTHER)
   assert.deepStrictEqual(calls.deleted, ['g1'], 'Owner delete goes through')
 })
 
@@ -318,11 +318,11 @@ test('group_renamed cannot target arbitrary conversations via a wire conversatio
 
   // Non-participant rename of the group is rejected
   const STRANGER = keyHex(9)
-  await handler._handleGroupRenamed({ groupTopicHex: 'topic1', newName: 'pwned' }, STRANGER)
+  await handler._handleGroupRenamed({ groupTopicHex: 'aa'.repeat(32), newName: 'pwned' }, STRANGER)
   assert.strictEqual(chatStore.conversations.get('g1').displayName, 'Trip', 'Non-participant rename rejected')
 
   // A participant rename via the topic is accepted
-  await handler._handleGroupRenamed({ groupTopicHex: 'topic1', newName: 'Roadtrip' }, PEER)
+  await handler._handleGroupRenamed({ groupTopicHex: 'aa'.repeat(32), newName: 'Roadtrip' }, PEER)
   assert.strictEqual(chatStore.conversations.get('g1').displayName, 'Roadtrip', 'Participant rename via topic accepted')
 })
 
