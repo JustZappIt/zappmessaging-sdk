@@ -180,12 +180,13 @@ test('duplicate requests cannot start concurrent uploads of the same blob', asyn
   const framed = { writeChunk () {} }
 
   let release
-  transfer.sendMedia = () => new Promise((resolve) => { release = resolve })
+  transfer._upload = () => new Promise((resolve) => { release = resolve })
   const first = transfer.handleRequest(hashBuf, framed)
   await Promise.resolve()
 
-  assert.strictEqual(await transfer.handleRequest(hashBuf, framed), false)
+  const duplicate = transfer.handleRequest(hashBuf, framed)
   release()
+  assert.strictEqual(await duplicate, true)
   assert.strictEqual(await first, true)
   store.deleteMedia(hashHex)
 })
@@ -203,7 +204,7 @@ test('media uploads use a bounded queue', async () => {
   let active = 0
   let maxActive = 0
 
-  transfer.sendMedia = async () => {
+  transfer._upload = async () => {
     active++
     maxActive = Math.max(maxActive, active)
     await new Promise((resolve) => releases.push(resolve))

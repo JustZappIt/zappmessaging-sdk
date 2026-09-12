@@ -80,6 +80,10 @@ function normalizePeerRecord (input, peer) {
       if (typeof input.hidden !== 'boolean') throw new InvalidPeerRecord('hidden')
       record.hidden = input.hidden
     } else if (input.type === 'direct_invite' || input.type === 'group_invite') {
+      if (input.bootstrapReply != null) {
+        if (typeof input.bootstrapReply !== 'boolean') throw new InvalidPeerRecord('bootstrapReply')
+        record.bootstrapReply = input.bootstrapReply
+      }
       record.senderKey = key(input.senderKey, 'senderKey', true)
       if (record.senderKey !== peer) throw new InvalidPeerRecord('invite sender')
       if (input.localCoreKey != null) record.localCoreKey = key(input.localCoreKey, 'localCoreKey', true)

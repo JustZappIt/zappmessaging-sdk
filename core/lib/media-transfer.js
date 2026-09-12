@@ -15,6 +15,7 @@ const DEFAULT_MAX_ACTIVE_TRANSFERS = 4
 const DEFAULT_TRANSFER_TIMEOUT_MS = 60000
 const DEFAULT_MAX_CONCURRENT_SENDS = 2
 const DEFAULT_MAX_QUEUED_SENDS = 64
+const { mediaTiming } = require('./media-timing')
 
 function diag (...args) { /* no-op; media-transfer errors are non-fatal */ }
 
@@ -29,9 +30,14 @@ function positiveIntegerOption (value, fallback, name) {
 class MediaTransfer extends EventEmitter {
   constructor (mediaStore, opts = {}) {
     super()
+    this._generation = 0
     this.mediaStore = mediaStore
     this.activeTransfers = new Map() // hashHex -> { chunks, received, receivedBytes, totalChunks, timer }
-    this._pendingSends = new WeakMap() // framedSocket -> Set<hashHex>, queued or active
+    this._pendingSends = new Map() // authenticated recipient -> Map<hash, job>
+    this._activeRecipients = new Set()
+    this._mediaResults = new Map()
+    this._completedProactive = new Map() // bounded, single-use first-request credits
+    this._sendData = new Map() // active uploads only; shared read per hash
     this._sendQueue = []
     this._activeSendCount = 0
     this._activeBytes = 0
@@ -45,6 +51,19 @@ class MediaTransfer extends EventEmitter {
       opts.maxConcurrentSends, DEFAULT_MAX_CONCURRENT_SENDS, 'maxConcurrentSends')
     this._maxQueuedSends = positiveIntegerOption(
       opts.maxQueuedSends, DEFAULT_MAX_QUEUED_SENDS, 'maxQueuedSends')
+  }
+
+  resetIdentity () {
+    this._generation++
+    this._resetting = true
+    for (const [hash, transfer] of this.activeTransfers) this._dropTransfer(hash, transfer)
+    const jobs = [...this._pendingSends.values()].flatMap(pending => [...pending.values()])
+    for (const job of jobs) job.cancel.emit('cancel')
+    for (const key of this._completedProactive.keys()) this._forgetProactive(key)
+    this._mediaResults.clear()
+    this._sendData.clear()
+    this._resetting = false
+    return Promise.allSettled(jobs.map(job => job.promise))
   }
 
   /**
@@ -86,95 +105,161 @@ class MediaTransfer extends EventEmitter {
   }
 
   _drainSendQueue () {
-    while (this._activeSendCount < this._maxConcurrentSends && this._sendQueue.length > 0) {
-      const job = this._sendQueue.shift()
+    if (this._resetting) return
+    while (this._activeSendCount < this._maxConcurrentSends) {
+      // One active upload per recipient: another socket cannot bypass fairness.
+      const index = this._sendQueue.findIndex(job => !this._activeRecipients.has(job.recipient))
+      if (index < 0) return
+      const job = this._sendQueue.splice(index, 1)[0]
+      job.active = true
       this._activeSendCount++
-
-      Promise.resolve()
-        .then(() => this.sendMedia(job.framedSocket, job.hashHex))
-        .then(
-          () => this._finishSend(job, null),
-          (err) => this._finishSend(job, err)
-        )
+      this._activeRecipients.add(job.recipient)
+      Promise.resolve().then(() => this._upload(job)).then(
+        () => this._finishSend(job, null), err => this._finishSend(job, err))
     }
   }
 
+  _uploadState (hash, state) {
+    if (state === 'failed') {
+      if (!this._mediaResults.has(hash) && this._mediaResults.size >= 512) {
+        this._mediaResults.delete(this._mediaResults.keys().next().value)
+      }
+      this._mediaResults.set(hash, true)
+    }
+    const pending = [...this._pendingSends.values()].map(jobs => jobs.get(hash)).filter(Boolean)
+    const aggregate = this._mediaResults.get(hash) ? 'failed'
+      : pending.some(job => job.active) ? 'sending'
+        : pending.length ? 'queued' : state
+    this.emit('upload_state', hash, aggregate)
+  }
+
   _finishSend (job, err) {
-    job.pending.delete(job.hashHex)
-    this._activeSendCount--
+    if (job.finished) return
+    job.finished = true
+    if (job.socket.socket && job.socket.socket.removeListener) {
+      job.socket.socket.removeListener('close', job.onClose)
+    }
+    job.cancel.removeAllListeners()
+    if (job.active) {
+      this._activeSendCount--
+      this._activeRecipients.delete(job.recipient)
+    } else {
+      const index = this._sendQueue.indexOf(job)
+      if (index >= 0) this._sendQueue.splice(index, 1)
+    }
+    const pending = this._pendingSends.get(job.recipient)
+    if (pending) {
+      pending.delete(job.hashHex)
+      if (!pending.size) this._pendingSends.delete(job.recipient)
+    }
+    if (!err) this._rememberProactive(job)
+    this._uploadState(job.hashHex, err ? 'failed' : 'queued_socket')
     if (err) job.reject(err)
     else job.resolve(true)
     this._drainSendQueue()
   }
 
-  /**
-   * Send a media file to a single framed socket
-   * @param {FramedSocket} framedSocket - Target socket
-   * @param {string} mediaHashHex - Media hash (hex)
-   */
-  async sendMedia(framedSocket, mediaHashHex) {
-    const data = this.mediaStore.getMedia(mediaHashHex)
-    if (!data) {
-      throw new Error('Media not found: ' + mediaHashHex)
+  _forgetProactive (key) {
+    const entry = this._completedProactive.get(key)
+    if (!entry) return
+    if (entry.socket.socket && entry.socket.socket.removeListener) {
+      entry.socket.socket.removeListener('close', entry.onClose)
     }
-    if (data.length < 1 || data.length > this._maxMediaBytes) {
-      throw new Error('Media size is outside the transferable range')
-    }
-
-    const hashBuf = b4a.from(mediaHashHex, 'hex')
-    const totalChunks = Math.ceil(data.length / CHUNK_SIZE)
-
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE
-      const end = Math.min(start + CHUNK_SIZE, data.length)
-      const chunk = data.subarray(start, end)
-      framedSocket.writeChunk(hashBuf, i, totalChunks, chunk)
-
-      // Yield to event loop every 4 chunks to avoid blocking
-      if (i > 0 && i % 4 === 0) {
-        await new Promise(r => setTimeout(r, 1))
-      }
-    }
-
-    this.emit('sent', mediaHashHex, totalChunks)
+    this._completedProactive.delete(key)
   }
 
-  /**
-   * Send media to multiple framed sockets (all peers in a conversation)
-   * @param {Array<FramedSocket>} framedSockets - Target sockets
-   * @param {string} mediaHashHex - Media hash (hex)
-   */
-  async sendMediaToAll(framedSockets, mediaHashHex) {
-    const data = this.mediaStore.getMedia(mediaHashHex)
-    if (!data) {
-      throw new Error('Media not found: ' + mediaHashHex)
+  _rememberProactive (job) {
+    if (!job.proactive || job.requestObserved || !job.socket.peerId) return
+    const key = job.socket.peerId + ':' + job.hashHex
+    this._forgetProactive(key)
+    if (this._completedProactive.size >= 512) this._forgetProactive(this._completedProactive.keys().next().value)
+    const entry = { socket: job.socket, onClose: () => this._forgetProactive(key) }
+    this._completedProactive.set(key, entry)
+    if (job.socket.socket && job.socket.socket.on) job.socket.socket.on('close', entry.onClose)
+  }
+
+  sendMedia (socket, hashHex, proactive = false) {
+    // Production FramedSockets are bound to the Noise identity by P2PManager.
+    // Object fallback supports embedders without allowing two known peers to merge.
+    const recipient = socket.peerId || socket
+    let pending = this._pendingSends.get(recipient)
+    if (pending && pending.has(hashHex)) return pending.get(hashHex).promise
+    if (socket.peerId) this._forgetProactive(socket.peerId + ':' + hashHex)
+    if (this._sendQueue.length >= this._maxQueuedSends) {
+      this._uploadState(hashHex, 'failed')
+      return Promise.resolve(false)
     }
-    if (data.length < 1 || data.length > this._maxMediaBytes) {
-      throw new Error('Media size is outside the transferable range')
+    if (![...this._pendingSends.values()].some(jobs => jobs.has(hashHex))) {
+      this._mediaResults.delete(hashHex)
+      if (this._mediaResults.size >= 512) this._mediaResults.delete(this._mediaResults.keys().next().value)
+      this._mediaResults.set(hashHex, false)
     }
+    if (!pending) this._pendingSends.set(recipient, pending = new Map())
+    const job = { socket, hashHex, recipient, proactive, requestObserved: false, active: false, finished: false,
+      cancelled: false, generation: this._generation, cancel: new EventEmitter() }
+    job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject })
+    job.onClose = () => job.cancel.emit('cancel')
+    job.cancel.on('cancel', () => {
+      job.cancelled = true
+      if (!job.active) this._finishSend(job, new Error('Media transfer cancelled'))
+    })
+    if (socket.socket && socket.socket.on) socket.socket.on('close', job.onClose)
+    pending.set(hashHex, job)
+    this._sendQueue.push(job)
+    this._uploadState(hashHex, 'queued')
+    this._drainSendQueue()
+    return job.promise
+  }
 
-    const hashBuf = b4a.from(mediaHashHex, 'hex')
-    const totalChunks = Math.ceil(data.length / CHUNK_SIZE)
-
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * CHUNK_SIZE
-      const end = Math.min(start + CHUNK_SIZE, data.length)
-      const chunk = data.subarray(start, end)
-
-      for (const framed of framedSockets) {
-        try {
-          framed.writeChunk(hashBuf, i, totalChunks, chunk)
-        } catch (err) {
-          diag('Failed to send chunk to peer:', err)
+  async _upload (job) {
+    const check = () => {
+      if (job.generation !== this._generation) throw new Error('Media identity changed')
+      if (job.cancelled) throw new Error('Media transfer cancelled')
+      if (job.socket._destroyed || (job.socket.socket &&
+          (job.socket.socket.destroyed || job.socket.socket.writable === false))) throw new Error('Media socket closed')
+    }
+    check()
+    const timing = mediaTiming()
+    let cached = this._sendData.get(job.hashHex)
+    if (!cached) {
+      const data = this.mediaStore.getMedia(job.hashHex)
+      if (!data) throw new Error('Media not found')
+      if (data.length < 1 || data.length > this._maxMediaBytes) throw new Error('Media size is outside the transferable range')
+      cached = { data, users: 0 }
+      this._sendData.set(job.hashHex, cached)
+    }
+    cached.users++
+    const data = cached.data
+    timing('file_read', data.length)
+    try {
+      const hash = b4a.from(job.hashHex, 'hex')
+      const count = Math.ceil(data.length / CHUNK_SIZE)
+      this._uploadState(job.hashHex, 'sending')
+      for (let index = 0; index < count; index++) {
+        check()
+        const chunk = data.subarray(index * CHUNK_SIZE, Math.min((index + 1) * CHUNK_SIZE, data.length))
+        if (job.socket.writeChunkAsync) {
+          await job.socket.writeChunkAsync(hash, index, count, chunk, job.cancel, this._transferTimeoutMs, () => {
+            if (index === 0) timing('first_byte_queued', chunk.length)
+            if (index === count - 1) timing('last_byte_queued', data.length)
+          })
+        } else if (job.socket.writeChunk(hash, index, count, chunk) === false) {
+          throw new Error('Media socket rejected chunk')
         }
+        // Yield even on sockets with a large high-water mark.
+        if (index % 4 === 3) await new Promise(resolve => setTimeout(resolve, 0))
       }
-
-      if (i > 0 && i % 4 === 0) {
-        await new Promise(r => setTimeout(r, 1))
-      }
+      check()
+      // This is socket acceptance only. No remote verification is implied.
+      this.emit('sent', job.hashHex, count)
+    } finally {
+      if (--cached.users === 0 && this._sendData.get(job.hashHex) === cached) this._sendData.delete(job.hashHex)
     }
+  }
 
-    this.emit('sent', mediaHashHex, totalChunks)
+  async sendMediaToAll (sockets, hashHex) {
+    const results = await Promise.allSettled(sockets.map(socket => this.sendMedia(socket, hashHex, true)))
+    return results.every(result => result.status === 'fulfilled' && result.value === true)
   }
 
   /**
@@ -229,6 +314,7 @@ class MediaTransfer extends EventEmitter {
       this._dropTransfer(hashHex, transfer)
 
       // Verify integrity: reassembled data must match the claimed hash
+      const verificationTiming = mediaTiming()
       const actualHash = this.mediaStore.hash(fullData)
       const actualHashHex = b4a.toString(actualHash, 'hex')
       if (actualHashHex !== hashHex) {
@@ -237,6 +323,7 @@ class MediaTransfer extends EventEmitter {
         return false
       }
 
+      verificationTiming('receiver_verified', fullData.length)
       this.emit('complete', hashHex, fullData)
     }
     return true
@@ -247,7 +334,7 @@ class MediaTransfer extends EventEmitter {
    * @param {Buffer} hashBuf - Media hash (32 bytes)
    * @param {FramedSocket} framedSocket - Requesting peer's socket
    */
-  async handleRequest (hashBuf, framedSocket) {
+  async handleRequest (hashBuf, framedSocket, attempt = 0) {
     if (!b4a.isBuffer(hashBuf) || hashBuf.length !== 32) return false
     if (!framedSocket || typeof framedSocket.writeChunk !== 'function') return false
     const hashHex = b4a.toString(hashBuf, 'hex')
@@ -256,18 +343,17 @@ class MediaTransfer extends EventEmitter {
       return false
     }
 
-    let pending = this._pendingSends.get(framedSocket)
-    if (!pending) {
-      pending = new Set()
-      this._pendingSends.set(framedSocket, pending)
-    }
-    if (pending.has(hashHex) || this._sendQueue.length >= this._maxQueuedSends) return false
-
-    pending.add(hashHex)
-    return new Promise((resolve, reject) => {
-      this._sendQueue.push({ framedSocket, hashHex, pending, resolve, reject })
-      this._drainSendQueue()
-    })
+    const pending = this._pendingSends.get(framedSocket.peerId || framedSocket)
+    const active = pending && pending.get(hashHex)
+    if (active) { active.requestObserved = true; return active.promise }
+    const key = framedSocket.peerId + ':' + hashHex
+    const completed = this._completedProactive.has(key)
+    this._forgetProactive(key)
+    // A first request can cross the already-completed proactive write in flight.
+    // Consume one credit, not a time-based ban. Explicit retries and legacy
+    // requests always start fresh; close/cancel/identity change erase credits.
+    if (attempt === 1 && completed) return true
+    return this.sendMedia(framedSocket, hashHex)
   }
 
   /**
@@ -275,6 +361,17 @@ class MediaTransfer extends EventEmitter {
    * @param {string} mediaHashHex - Media hash (hex)
    */
   cancelTransfer (mediaHashHex) {
+    for (const key of this._completedProactive.keys()) {
+      if (key.endsWith(':' + mediaHashHex)) this._forgetProactive(key)
+    }
+    for (const pending of this._pendingSends.values()) {
+      const job = pending.get(mediaHashHex)
+      if (job) job.cancel.emit('cancel')
+    }
+    this.cancelDownload(mediaHashHex)
+  }
+
+  cancelDownload (mediaHashHex) {
     const transfer = this.activeTransfers.get(mediaHashHex)
     if (transfer) {
       this._dropTransfer(mediaHashHex, transfer)

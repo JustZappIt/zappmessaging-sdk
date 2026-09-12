@@ -9,6 +9,9 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 enum class MediaTransferState {
+    @SerialName("queued") QUEUED,
+    @SerialName("queued_socket") QUEUED_SOCKET,
+    @SerialName("downloading") DOWNLOADING,
     @SerialName("sending") SENDING,
     @SerialName("sent") SENT,
     @SerialName("receiving") RECEIVING,
@@ -17,6 +20,9 @@ enum class MediaTransferState {
 
     companion object {
         fun fromRaw(value: String): MediaTransferState? = when (value) {
+            "queued" -> QUEUED
+            "queued_socket" -> QUEUED_SOCKET
+            "downloading" -> DOWNLOADING
             "sending" -> SENDING
             "sent" -> SENT
             "receiving" -> RECEIVING

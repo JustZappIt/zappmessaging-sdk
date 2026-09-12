@@ -23,6 +23,8 @@ const config = require('./config')
 const { registerPushEndpoint: registerPushEndpointRpc } = require('./push-register')
 const { putInvite, drainInvites, throughDht, throughHttps } = require('./invite-mailbox')
 const { ChatStore } = require('./chat-store')
+const { runBounded } = require('./async-pool')
+const { TaskScope } = require('./task-scope')
 const { isMediaId, isPeerId } = require('./media-id')
 const { createDiagnosticLogger } = require('./diagnostics')
 
@@ -69,12 +71,19 @@ const PLATFORM_HTTP_TIMEOUT_MS = 15 * 1000
 class P2PManager extends EventEmitter {
   constructor (opts = {}) {
     super()
+    this._tasks = new TaskScope()
+    this._generation = 0
+    this._stopping = false
+    this._stopPromise = null
+    this._startPromise = null
     this.swarm = null
     this.keyPair = null
     this.isOnline = false
     this.peerCount = 0
     this._createSwarm = opts.createSwarm || (swarmOptions => new Hyperswarm(swarmOptions))
     this._blindPeerKeys = opts.blindPeerKeys || config.BLIND_PEER_KEYS
+    this._mailboxStores = opts.mailboxStores || null
+    this._mailboxTransports = opts.mailboxTransports || { throughDht, throughHttps }
 
     // Optional collaborators for blind-peer offline delivery. Both are nullable
     // so the swarm-only path keeps working in tests/stub setups.
@@ -360,7 +369,23 @@ class P2PManager extends EventEmitter {
    * Start the P2P manager with the user's keypair
    * @param {Object} keyPair - Ed25519 keypair from Identity
    */
-  async start(keyPair) {
+  runTask (fn) { return this._tasks.run(fn) }
+
+  async start (keyPair) {
+    if (this._stopPromise) await this._stopPromise
+    if (this._startPromise) return this._startPromise
+    if (this._tasks.closed) this._tasks = new TaskScope()
+    this._stopping = false
+    const operation = this.runTask(() => this._start(keyPair))
+    this._startPromise = operation
+    try { return await operation } finally {
+      if (this._startPromise === operation) this._startPromise = null
+    }
+  }
+
+  async _start(keyPair) {
+    const generation = this._generation
+    const current = () => !this._stopping && generation === this._generation
     if (this.swarm) {
       diag('P2P Manager already started')
       return
@@ -428,6 +453,7 @@ class P2PManager extends EventEmitter {
 
       // Connection handler with capped peer discovery
       this.swarm.on('connection', (socket, peerInfo) => {
+        if (!current()) { socket.destroy(); return }
         this.handleConnection(socket, peerInfo)
 
         // Tier 3: track peer-discovered nodes (capped)
@@ -452,6 +478,7 @@ class P2PManager extends EventEmitter {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
           try {
             await this.swarm.dht.ready()
+            if (!current()) return
             dhtReady = true
             diag('DHT ready (attempt ' + attempt + ')')
             // Consumers such as blind-peer replication can begin as soon as
@@ -460,10 +487,12 @@ class P2PManager extends EventEmitter {
             this.emit('dht_ready')
             break
           } catch (error) {
+            if (!current()) return
             if (attempt < maxRetries) {
               const delay = baseDelay * Math.pow(2, attempt - 1)
               diag('DHT ready failed (attempt ' + attempt + '): ' + error.message + ', retrying in ' + delay + 'ms')
               await new Promise(resolve => setTimeout(resolve, delay))
+              if (!current()) return
             } else {
               diag('DHT ready failed after ' + maxRetries + ' attempts')
               diag('[P2P] DHT may not be fully connected')
@@ -509,7 +538,7 @@ class P2PManager extends EventEmitter {
           const gatewayNode = { host: config.LOCAL_GATEWAY_IP, port: 49737 }
           diag('LAN probe: checking configured gateway')
           this.swarm.dht.ping(gatewayNode).then(() => {
-            if (!this.swarm || !this.swarm.dht) return
+            if (!current() || !this.swarm || !this.swarm.dht) return
             this.swarm.dht.addNode(gatewayNode)
             diag('LAN seed: configured gateway is a Zapp DHT node — seeded routing table')
           }).catch(() => {
@@ -523,10 +552,12 @@ class P2PManager extends EventEmitter {
       this.emit('status', { online: true, peerCount: 0 })
       diag('Joining personal topic...')
       await this.joinPersonalTopic()
+      if (!current()) return
 
       // Wire health monitor to the live swarm (no temp instances)
       this.healthMonitor.setSwarm(this.swarm)
       await this.healthMonitor.startMonitoring()
+      if (!current()) return
       diag('Health monitoring started (2 min interval)')
 
       // Start heartbeat to detect dead sockets
@@ -787,7 +818,7 @@ class P2PManager extends EventEmitter {
    * @param {string} peerPublicKeyHex - Peer's public key (hex)
    * @returns {boolean} Success status
    */
-  async joinConversation(conversationId, peerPublicKeyHex) {
+  async joinConversation(conversationId, peerPublicKeyHex, { waitForDiscovery = true } = {}) {
     if (!this.swarm) {
       diag('joinConversation: swarm not started!')
       return false
@@ -844,7 +875,8 @@ class P2PManager extends EventEmitter {
         diag('Backfilled', peerEntry.connections.length, 'existing connection(s) for direct conversation', conversationId.substring(0, 12))
       }
 
-      await discovery.flushed()
+      if (waitForDiscovery) await discovery.flushed()
+      else discovery.flushed().catch(() => {})
       diag('Topic announced to DHT')
 
       return true
@@ -861,7 +893,7 @@ class P2PManager extends EventEmitter {
    * @param {Array<string>} allParticipantKeyHexes - All participant public keys
    * @returns {boolean} Success status
    */
-  async joinGroupConversation(conversationId, groupId, allParticipantKeyHexes) {
+  async joinGroupConversation(conversationId, groupId, allParticipantKeyHexes, { waitForDiscovery = true } = {}) {
     if (!this._getConversation && !this._isParticipant) return false
     if (this._getConversation) {
       const stored = this._getConversation(conversationId)
@@ -926,7 +958,8 @@ class P2PManager extends EventEmitter {
         }
       }
 
-      await discovery.flushed()
+      if (waitForDiscovery) await discovery.flushed()
+      else discovery.flushed().catch(() => {})
       diag('Group topic announced to DHT')
       this._announceGroupCoreKeys(conversationId)
 
@@ -1079,6 +1112,9 @@ class P2PManager extends EventEmitter {
    * @param {Object} peerInfo - Peer information from Hyperswarm
    */
   handleConnection(socket, peerInfo) {
+    if (this._stopping) { socket.destroy(); return }
+    const generation = this._generation
+    const current = () => !this._stopping && generation === this._generation
     const peerId = peerInfo.publicKey ? b4a.toString(peerInfo.publicKey, 'hex') : 'unknown'
     diag('New peer connection:', peerId.substring(0, 12))
 
@@ -1090,10 +1126,12 @@ class P2PManager extends EventEmitter {
 
     // Wrap raw socket in FramedSocket for proper message boundaries
     const framed = new FramedSocket(socket)
+    framed.peerId = peerId
     this.framedSockets.set(socket, framed)
+    framed.canWriteChunk = hash => !this._mayServeMedia || this._mayServeMedia(hash, peerId)
     const writeChunk = framed.writeChunk.bind(framed)
     framed.writeChunk = (...args) => {
-      if (this._mayServeMedia && !this._mayServeMedia(args[0], peerId)) return false
+      if (!framed.canWriteChunk(args[0])) return false
       return writeChunk(...args)
     }
 
@@ -1183,11 +1221,20 @@ class P2PManager extends EventEmitter {
     }
 
     // Handle incoming JSON messages via framed socket
-    framed.onMessage = async (message) => {
+    const onMessage = async (message) => {
       try {
         // Rate limit check (H10)
-        if (this._isRateLimited(peerId)) {
-          return // silently drop; diag already logged
+        while (this._isRateLimited(peerId)) {
+          // FramedSocket pauses reads while this handler awaits. Throttle live
+          // catch-up instead of acknowledging/dropping legitimate records.
+          await new Promise(resolve => {
+            const done = () => { clearTimeout(timer); socket.removeListener('close', done); resolve() }
+            const entry = this._peerMessageCounts.get(peerId)
+            const remaining = entry ? this._peerRateWindowMs - (Date.now() - entry.windowStart) + 1 : 1
+            const timer = setTimeout(done, Math.max(1, remaining))
+            socket.on('close', done)
+          })
+          if (!current() || socket.destroyed) return
         }
         message = normalizePeerRecord(message, peerId)
         // Core-key exchange: peer is announcing the public keys of its local
@@ -1339,16 +1386,21 @@ class P2PManager extends EventEmitter {
         diag('Failed to handle peer message:', error)
       }
     }
+    framed.onMessage = message => current()
+      ? this.runTask(() => onMessage(message))
+      : Promise.resolve()
 
     // Handle incoming media chunks
     framed.onChunk = (hashBuf, chunkIndex, totalChunks, chunkData) => {
+      if (!current()) return
       this.emit('media_chunk', hashBuf, chunkIndex, totalChunks, chunkData, peerId)
     }
 
     // Handle media requests from peer
-    framed.onRequest = (hashBuf) => {
+    framed.onRequest = (hashBuf, attempt) => {
+      if (!current()) return
       if (this._isMediaRequestRateLimited(peerId)) return
-      this.emit('media_request', hashBuf, peerId, framed)
+      this.emit('media_request', hashBuf, peerId, framed, attempt)
     }
 
     framed.onError = (error) => {
@@ -1360,6 +1412,7 @@ class P2PManager extends EventEmitter {
     })
 
     socket.on('close', () => {
+      if (!current()) return
       diag('Peer disconnected:', peerId.substring(0, 12))
 
       // Announces the loss and resyncs peerCount, once the last socket is gone.
@@ -1531,6 +1584,7 @@ class P2PManager extends EventEmitter {
    * @returns {boolean} true if written to a live peer socket, false otherwise
    */
   sendToConversation(conversationId, message, { notificationEligible = false } = {}) {
+    if (this._stopping) throw new Error('Messaging lifecycle stopped')
     const outboundMessage = this._outgoingRecord(conversationId, message)
     if (outboundMessage !== message) delete outboundMessage.status
 
@@ -1576,6 +1630,7 @@ class P2PManager extends EventEmitter {
    * without overstating the durability boundary.
    */
   async sendToConversationDurably (conversationId, message, { notificationEligible = false } = {}) {
+    if (this._stopping) throw new Error('Messaging lifecycle stopped')
     const outboundMessage = this._outgoingRecord(conversationId, message)
     if (outboundMessage !== message) delete outboundMessage.status
 
@@ -1625,7 +1680,7 @@ class P2PManager extends EventEmitter {
     // an unreachable mailbox is retried on every single send.
     this._mailboxBootstrapAt.set(conversationId, Date.now())
 
-    const operation = (async () => {
+    const operation = this.runTask(async () => {
       const conversation = this.conversations.get(conversationId)
       const peerKeyHex = conversation && conversation.peers
         ? conversation.peers.keys().next().value
@@ -1643,7 +1698,7 @@ class P2PManager extends EventEmitter {
       if (stored) {
         diag('Mailbox bootstrapped unreachable conversation ' + conversationId.substring(0, 12))
       }
-    })()
+    })
 
     this._mailboxBootstrapInFlight.set(conversationId, operation)
     operation
@@ -1675,22 +1730,23 @@ class P2PManager extends EventEmitter {
       return { appended: !!appended, relay: this.blindMirror ? 'not_requested' : 'unavailable' }
     }
 
-    try {
-      await this.blindMirror.sendNotification(appended.core, appended.index)
-      diag('Blind relay request acknowledged conv=' + conversationId.substring(0, 12) +
-        ' index=' + appended.index)
-      return { appended: true, relay: 'request_acknowledged' }
-    } catch (err) {
-      // A doorbell is advisory. The encrypted block is already persisted and
-      // remains available for normal direct/blind-peer synchronization.
-      diag('Blind push request failed: ' + (err && err.code ? err.code : 'unavailable'))
-      this.emit('push_notification_failed', {
-        conversationId,
-        messageId: message.id,
-        error: err && err.code ? err.code : (err && err.message ? err.message : 'unavailable')
-      })
-      return { appended: true, relay: 'pending' }
-    }
+    const generation = this._generation
+    // Attach both outcomes immediately. Nothing after the append can turn a
+    // notification failure into a failed durable send, or delay its live path.
+    Promise.resolve().then(() => {
+      if (this._stopping || generation !== this._generation) return
+      return this.blindMirror.sendNotification(appended.core, appended.index)
+    }).catch(err => {
+      if (this._stopping || generation !== this._generation) return
+      try {
+        this.emit('push_notification_failed', {
+          conversationId,
+          messageId: message.id,
+          error: err && err.code ? err.code : 'unavailable'
+        })
+      } catch (_) { /* IPC may already be unavailable; the append is durable. */ }
+    })
+    return { appended: true, relay: 'pending' }
   }
 
   restorePendingMessages(conversationId, messages) {
@@ -1739,10 +1795,11 @@ class P2PManager extends EventEmitter {
    * @param {string} upToMessageId - Newest of the sender's messages we've read
    */
   sendReadReceipt(conversationId, upToMessageId) {
+    if (this._stopping) return false
     const receipt = this._outgoingRecord(conversationId, { type: '__receipt', kind: 'read', conversationId, upTo: upToMessageId })
 
     if (this.hypercoreManager) {
-      this.hypercoreManager.appendMessage(conversationId, receipt).catch((err) => {
+      this.runTask(() => this.hypercoreManager.appendMessage(conversationId, receipt)).catch((err) => {
         diag('Receipt append failed conv=' + conversationId.substring(0, 12) + ': ' + (err.message || err))
       })
     }
@@ -1756,7 +1813,7 @@ class P2PManager extends EventEmitter {
     const requireDurable = opts.requireDurable === true
 
     if (this.hypercoreManager) {
-      const append = this.hypercoreManager.appendMessage(conversationId, receipt)
+      const append = this.runTask(() => this.hypercoreManager.appendMessage(conversationId, receipt))
       if (requireDurable) {
         try {
           await append
@@ -1929,7 +1986,7 @@ class P2PManager extends EventEmitter {
    * @param {string|null} preferredPeerId - author's identity key, tried first
    * @returns {boolean}
    */
-  requestMedia (conversationId, mediaIdHex, preferredPeerId = null) {
+  requestMedia (conversationId, mediaIdHex, preferredPeerId = null, attempt = 1) {
     if (typeof conversationId !== 'string' || conversationId.length === 0) return false
     if (!isMediaId(mediaIdHex)) return false
     if (preferredPeerId !== null && !isPeerId(preferredPeerId)) return false
@@ -1940,26 +1997,28 @@ class P2PManager extends EventEmitter {
       if (!framed || seen.has(framed) || typeof framed.writeRequest !== 'function') return false
       seen.add(framed)
       try {
-        return framed.writeRequest(hashBuf) === true
+        return framed.writeRequest(hashBuf, attempt) === true
       } catch (err) {
         diag('media request write failed: ' + (err.message || err))
         return false
       }
     }
 
-    // Ask one author socket first. Only fall back to another participant when
-    // the author is unavailable; broadcasting creates duplicate full uploads.
+    // First attempt prefers the author. Subsequent attempts rotate through
+    // reachable recipients/sockets: an author can be online but lack the file.
+    const candidates = []
     if (preferredPeerId) {
-      const conns = this.allPeerConnections.get(preferredPeerId)
-      if (conns) {
-        for (const socket of conns) {
-          if (requestFrom(this._liveFramed(socket))) return true
-        }
+      for (const socket of this.allPeerConnections.get(preferredPeerId) || []) {
+        const framed = this._liveFramed(socket)
+        if (framed) candidates.push(framed)
       }
     }
-
     for (const framed of this.getConversationFramedSockets(conversationId)) {
-      if (requestFrom(framed)) return true
+      if (!candidates.includes(framed)) candidates.push(framed)
+    }
+    const offset = Number.isSafeInteger(attempt) && attempt > 0 ? (attempt - 1) % Math.max(1, candidates.length) : 0
+    for (let index = 0; index < candidates.length; index++) {
+      if (requestFrom(candidates[(index + offset) % candidates.length])) return true
     }
     return false
   }
@@ -2051,35 +2110,52 @@ class P2PManager extends EventEmitter {
    * @param {Function} operation (request) => Promise<any>
    * @returns {Promise<{ok: boolean, value?: any}>} ok is false when no transport answered
    */
-  async _throughMailbox (operation) {
-    if (!this.keyPair) return { ok: false }
-
+  _configuredMailboxStores () {
+    if (this._mailboxStores) return this._mailboxStores
+    const stores = [...new Set(this._blindPeerKeys || [])].map(key => ({ key }))
     if (config.INVITE_MAILBOX_URL) {
+      // A URL alone does not prove which Noise identity owns its store. Only
+      // collapse transports when the deployment explicitly supplies that link.
+      const same = stores.find(store => store.key === config.INVITE_MAILBOX_PEER_KEY)
+      if (same) same.url = config.INVITE_MAILBOX_URL
+      else stores.unshift({ url: config.INVITE_MAILBOX_URL })
+    }
+    return stores
+  }
+
+  async _throughMailboxStore (store, operation) {
+    const keyPair = this.keyPair
+    const generation = this._generation
+    if (!keyPair || this._stopping) return { ok: false }
+    const guarded = request => operation(async (method, body) => {
+      if (this._stopping || generation !== this._generation) throw new Error('mailbox stopped')
+      const result = await request(method, body)
+      if (this._stopping || generation !== this._generation) throw new Error('mailbox stopped')
+      return result
+    })
+    if (store.url) {
       try {
-        const value = await throughHttps(config.INVITE_MAILBOX_URL, this.keyPair, operation, {
+        const value = await this._mailboxTransports.throughHttps(store.url, keyPair, guarded, {
           postJson: (url, body) => this._platformPostJson(url, body)
         })
         return { ok: true, value }
-      } catch (e) {
-        diag('HTTPS invite mailbox unavailable: ' + (e.message || e))
-      }
+      } catch (e) { diag('HTTPS invite mailbox unavailable: ' + e.message) }
     }
-
-    if (!this.swarm || !this.swarm.dht) return { ok: false }
-    for (const key of this._blindPeerKeys || []) {
+    if (store.key && this.swarm && this.swarm.dht && !this._stopping) {
       try {
-        const value = await throughDht(
-          this.swarm.dht,
-          this.keyPair,
-          key,
-          config.BLIND_PEER_ADDRESS,
-          operation
-        )
+        const value = await this._mailboxTransports.throughDht(
+          this.swarm.dht, keyPair, store.key, store.address || config.BLIND_PEER_ADDRESS, guarded)
         return { ok: true, value }
-      } catch (e) {
-        diag('Blind mailbox unavailable at ' + String(key).substring(0, 12) +
-          ': ' + (e.message || e))
-      }
+      } catch (e) { diag('DHT invite mailbox unavailable: ' + e.message) }
+    }
+    return { ok: false }
+  }
+
+  // Deposits need acceptance from one store. Reads must visit every store.
+  async _throughMailbox (operation) {
+    for (const store of this._configuredMailboxStores()) {
+      const result = await this._throughMailboxStore(store, operation)
+      if (result.ok) return result
     }
     return { ok: false }
   }
@@ -2105,12 +2181,16 @@ class P2PManager extends EventEmitter {
 
   async _drainInviteMailboxesOnce () {
     let delivered = 0
-    const seenInvites = new Set()
+    const seenInvites = new Map()
+    const applicationChains = new Map()
+    const keyPair = this.keyPair
+    if (!keyPair) return 0
 
     // Runs before the entry is acknowledged, and its answer decides whether the
     // server-side copy may be deleted. Returning true for a rejected invite is
     // deliberate: it is finished with, and retrying it would starve real ones.
     const deliver = async (entry) => {
+      if (this._stopping) return false
       const invite = entry.invite
       const sender = entry.senderKeyHex
       if (!invite || (invite.type !== 'direct_invite' && invite.type !== 'group_invite')) {
@@ -2126,22 +2206,28 @@ class P2PManager extends EventEmitter {
       // invite more than once. Process it once per drain so we do not create
       // duplicate cores, joins, or core-key replies.
       const inviteKey = sender + '\n' + JSON.stringify(invite)
-      if (seenInvites.has(inviteKey)) {
-        diag('Discarded duplicate blind mailbox invite from ' + sender.substring(0, 12))
-        return true
-      }
-
-      diag('Received ' + invite.type + ' from blind mailbox sender=' + sender.substring(0, 12))
-      if (!await this._deliverInvite(invite, sender)) {
-        diag('Mailbox invite not applied; leaving it for the next drain')
+      if (seenInvites.has(inviteKey)) return seenInvites.get(inviteKey)
+      const scope = invite.groupId || sender
+      const previous = applicationChains.get(scope) || Promise.resolve()
+      const applying = previous.catch(() => {}).then(() => {
+        if (this._stopping) return false
+        return this._deliverInvite(invite, sender)
+      })
+      applicationChains.set(scope, applying)
+      seenInvites.set(inviteKey, applying)
+      try {
+        const finished = await applying
+        if (finished) delivered++
+        else seenInvites.delete(inviteKey)
+        return finished
+      } catch (error) {
+        seenInvites.delete(inviteKey)
         return false
       }
-      seenInvites.add(inviteKey)
-      delivered++
-      return true
     }
 
-    await this._throughMailbox(request => drainInvites(request, this.keyPair, deliver))
+    await runBounded(this._configuredMailboxStores(), 3, store =>
+      this._throughMailboxStore(store, request => drainInvites(request, keyPair, deliver)))
     if (delivered > 0) diag('Invite mailbox delivered ' + delivered + ' invite(s)')
     return delivered
   }
@@ -2247,6 +2333,7 @@ class P2PManager extends EventEmitter {
    * Suspend P2P manager (for mobile background)
    */
   suspend() {
+    if (this.blindMirror && this.blindMirror.cancelNotifications) this.blindMirror.cancelNotifications()
     this._stopHeartbeat()
     if (this.swarm && typeof this.swarm.suspend === 'function') {
       this.swarm.suspend()
@@ -2287,54 +2374,60 @@ class P2PManager extends EventEmitter {
    * Stop the P2P manager and cleanup all connections
    * Includes Phase 2: DHT health monitoring cleanup
    */
-  async stop() {
-    if (this.swarm) {
-      this._stopHeartbeat()
+  async stop () {
+    if (this._stopPromise) return this._stopPromise
+    const operation = this._stop()
+    this._stopPromise = operation
+    try { return await operation } finally { this._stopPromise = null }
+  }
+
+  async _stop () {
+    this._stopping = true
+    this._generation++
+    this._tasks.closed = true
+    this._stopHeartbeat()
+    this.healthMonitor.stopMonitoring()
+    clearInterval(this._swarmDumpInterval)
+    clearTimeout(this._nodeCacheSaveTimer)
+    this._swarmDumpInterval = null
+    this._nodeCacheSaveTimer = null
+    if (this.blindMirror && this.blindMirror.cancelNotifications) this.blindMirror.cancelNotifications()
+    for (const pending of this._platformHttpRequests.values()) {
+      clearTimeout(pending.timeout)
+      pending.reject(new Error('P2P manager stopped'))
+    }
+    this._platformHttpRequests.clear()
+    this._saveDhtNodeCache()
+    const swarm = this.swarm
+    this.swarm = null
+    try {
+      if (swarm) await swarm.destroy()
+    } finally {
+      await this._tasks.drain()
       this.healthMonitor.stopMonitoring()
-      if (this._swarmDumpInterval) {
-        clearInterval(this._swarmDumpInterval)
-        this._swarmDumpInterval = null
-      }
-      if (this._nodeCacheSaveTimer) {
-        clearTimeout(this._nodeCacheSaveTimer)
-        this._nodeCacheSaveTimer = null
-      }
-      diag('Stopping P2P Manager')
-
-      // Persist the routing table one last time so the next launch starts warm.
-      this._saveDhtNodeCache()
-
-      await this.swarm.destroy()
-      this.swarm = null
-      this.conversations.clear()
-      this.peerToConversation.clear()
-      this.groupConversations.clear()
-      this.groupTopicToConversation.clear()
-      this.allPeerConnections.clear()
-      this.pendingInvites.clear()
-      this.pendingMessages.clear()
-      this._mailboxBootstrapInFlight.clear()
-      this._mailboxBootstrapAt.clear()
-      for (const pending of this._platformHttpRequests.values()) {
-        clearTimeout(pending.timeout)
-        pending.reject(new Error('P2P manager stopped'))
-      }
-      this._platformHttpRequests.clear()
-      this._peerMessageCounts.clear()
-      this._peerMediaRequestCounts.clear()
-      this._inviteTopics.clear()
+      this.healthMonitor.setSwarm(null)
+      for (const map of [this.conversations, this.peerToConversation,
+        this.groupConversations, this.groupTopicToConversation, this.allPeerConnections,
+        this.pendingInvites, this.pendingMessages, this._mailboxBootstrapInFlight,
+        this._mailboxBootstrapAt, this._peerMessageCounts, this._peerMediaRequestCounts,
+        this._inviteTopics, this._seenMessageIds]) map.clear()
+      this._mailboxDrainInFlight = null
+      this.framedSockets = new WeakMap()
       this.personalDiscovery = null
+      this.keyPair = null
       this.isOnline = false
       this.peerCount = 0
-      // Return the honor-system presence flag to its default so a new identity in
-      // this process never inherits the previous user's setting; native re-pushes
-      // the real value via set_presence_visible on startup.
       this.presenceVisible = true
       this.emit('status', { online: false, peerCount: 0 })
-      // Remove all listeners to prevent memory leaks
-      this.removeAllListeners()
-      diag('P2P Manager stopped')
     }
+  }
+
+  // Network stop preserves application handlers. Only final disposal removes
+  // them; restart never installs another copy of an existing handler.
+  async dispose () {
+    await this.stop()
+    this.removeAllListeners()
+    this.healthMonitor.removeAllListeners()
   }
 
   /**
@@ -2411,6 +2504,33 @@ class P2PManager extends EventEmitter {
       relaySuccesses: relaying && Number.isSafeInteger(relaying.successes) ? relaying.successes : 0,
       relayAborts: relaying && Number.isSafeInteger(relaying.aborts) ? relaying.aborts : 0
     }
+  }
+}
+
+// Track asynchronous network operations so stop() can quiesce them before
+// identity storage is changed. Internal calls share the same admission barrier.
+for (const name of [
+  'checkBootstrapHealth',
+  '_ensureLocalCore',
+  'openRemoteCore',
+  'registerPushEndpoint',
+  'joinPersonalTopic',
+  'joinConversation',
+  'joinGroupConversation',
+  'sendToConversationDurably',
+  '_persistOutgoing',
+  'sendDeliveryReceipt',
+  'sendInvite',
+  '_throughMailboxStore',
+  '_throughMailbox',
+  '_putInviteMailbox',
+  '_drainInviteMailboxes',
+  '_drainInviteMailboxesOnce',
+  'leaveConversation'
+]) {
+  const method = P2PManager.prototype[name]
+  P2PManager.prototype[name] = function (...args) {
+    return this.runTask(() => method.apply(this, args))
   }
 }
 

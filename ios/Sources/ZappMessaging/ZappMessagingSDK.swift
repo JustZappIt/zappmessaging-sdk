@@ -181,6 +181,7 @@ public final class ZappMessagingSDK: ObservableObject {
 
     /// Shutdown the SDK
     public func shutdown() async {
+        mediaTransferStates = [:]
         conversationRefreshTask?.cancel()
         conversationRefreshTask = nil
         conversationRefreshNeedsFollowup = false
@@ -210,6 +211,7 @@ public final class ZappMessagingSDK: ObservableObject {
         guard let persistedDisplayName = response["displayName"] as? String else {
             throw ZMError.invalidData("Invalid identity update response")
         }
+        mediaTransferStates = [:]
         identity = ZMIdentity(
             publicKey: currentIdentity.publicKey,
             displayName: persistedDisplayName,
@@ -241,6 +243,7 @@ public final class ZappMessagingSDK: ObservableObject {
         }
 
         let restoredIdentity = ZMIdentity(publicKey: publicKey, displayName: displayName)
+        if self.identity?.publicKey != restoredIdentity.publicKey { mediaTransferStates = [:] }
         self.identity = restoredIdentity
 
         do {
@@ -365,8 +368,8 @@ public final class ZappMessagingSDK: ObservableObject {
 
     /// Send a text message.
     ///
-    /// Joins the swarm topic first — without that the message persists locally and
-    /// never leaves the device.
+    /// Returns after the local durable append; notifications run independently.
+    /// Recipient receipts confirm delivery through `messageStatus`.
     public func sendMessage(
         conversationId: String,
         content: String,
@@ -408,6 +411,19 @@ public final class ZappMessagingSDK: ObservableObject {
         try await ipcBridge.setPresenceVisible(visible)
     }
     
+    /// Local transfer evidence; queued_socket is not recipient verification.
+    @Published public private(set) var mediaTransferStates: [String: String] = [:]
+    public let mediaDiagnostics = PassthroughSubject<ZMMediaDiagnostic, Never>()
+
+    public func retryMedia(conversationId: String, messageId: String) async throws {
+        _ = try await ipcBridge.sendRequest(type: "connection.connect", payload: ["conversationId": conversationId, "forMedia": true])
+        _ = try await ipcBridge.sendRequest(type: "media.retry", payload: ["conversationId": conversationId, "messageId": messageId])
+    }
+
+    public func cancelMedia(conversationId: String, messageId: String) async throws {
+        _ = try await ipcBridge.sendRequest(type: "media.cancel", payload: ["conversationId": conversationId, "messageId": messageId])
+    }
+
     /// Send a media message
     public func sendMediaMessage(
         conversationId: String,
@@ -415,13 +431,14 @@ public final class ZappMessagingSDK: ObservableObject {
         contentType: String,
         caption: String = "",
         thumbnailData: String? = nil,
-        replyTo: ZMReplyContext? = nil
+        replyTo: ZMReplyContext? = nil,
+        clientMessageId: String? = nil
     ) async throws -> ZMMessage {
         guard identity != nil else {
             throw ZMError.identityNotFound
         }
 
-        try await ipcBridge.ensureConversationConnected(conversationId: conversationId)
+        _ = try await ipcBridge.sendRequest(type: "connection.connect", payload: ["conversationId": conversationId, "forMedia": true])
 
         // Prepare media (hash and store)
         let preparePayload: [String: Any] = [
@@ -444,6 +461,7 @@ public final class ZappMessagingSDK: ObservableObject {
             "mediaSize": mediaSize,
             "mediaLocalPath": mediaLocalPath
         ]
+        sendPayload["clientMessageId"] = clientMessageId
         sendPayload["thumbnailData"] = thumbnailData
         if let replyTo {
             sendPayload["replyToId"] = replyTo.id
@@ -739,9 +757,23 @@ public final class ZappMessagingSDK: ObservableObject {
         // distinguishes them by `mediaLocalPath`: present means a download landed.
         // There is no `media.download_complete` event — listening for one is why
         // received media never surfaced.
+        case "media.transfer_state":
+            if let mediaId = payload["mediaId"] as? String, let state = payload["state"] as? String,
+               let direction = payload["direction"] as? String, ["upload", "download"].contains(direction) {
+                if mediaTransferStates.count >= 512, let first = mediaTransferStates.keys.first { mediaTransferStates.removeValue(forKey: first) }
+                mediaTransferStates["\(direction):\(mediaId)"] = state
+            }
+        case "media.diagnostic":
+            if let id = payload["id"] as? String, id.range(of: "^[0-9a-f]{16}$", options: .regularExpression) != nil,
+               let stage = payload["stage"] as? String, stage.range(of: "^[a-z_]{1,32}$", options: .regularExpression) != nil,
+               let duration = zmDouble(payload["durationMs"]), let elapsed = zmDouble(payload["elapsedMs"]),
+               let bytes = zmInt(payload["bytes"]) {
+                mediaDiagnostics.send(ZMMediaDiagnostic(id: id, stage: stage, durationMs: duration, elapsedMs: elapsed, bytes: bytes))
+            }
         case "media.transfer_complete":
             guard let mediaId = payload["mediaId"] as? String else { break }
             mediaTransferComplete.send(mediaId)
+            mediaTransferStates["download:\(mediaId)"] = "complete"
             if let localPath = payload["mediaLocalPath"] as? String {
                 mediaDownloadComplete.send((mediaId: mediaId, filePath: localPath))
             }
@@ -928,4 +960,13 @@ public enum PaymentMessageType {
         case .walletAddress: return "message.send_wallet_address"
         }
     }
+}
+
+/// Opt-in numeric timing event, containing no stable identity, message ID, content or path.
+public struct ZMMediaDiagnostic: Sendable {
+    public let id: String
+    public let stage: String
+    public let durationMs: Double
+    public let elapsedMs: Double
+    public let bytes: Int
 }

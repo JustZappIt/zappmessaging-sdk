@@ -2,6 +2,7 @@ package xyz.justzappit.zappmessaging
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -82,6 +83,25 @@ class ZappMessagingSDK {
     private val _dhtHealth = MutableStateFlow("healthy")
     /** DHT health status: "healthy", "degraded", or "critical" */
     val dhtHealth: StateFlow<String> = _dhtHealth.asStateFlow()
+
+    /** Local transfer evidence, keyed by upload:<hash> or download:<hash>. queued_socket never means recipient verification. */
+    private val _mediaTransferStates = MutableStateFlow<Map<String, String>>(emptyMap())
+    val mediaTransferStates: StateFlow<Map<String, String>> = _mediaTransferStates.asStateFlow()
+
+    suspend fun retryMedia(conversationId: String, messageId: String) {
+        ensureConversationConnected(conversationId, forMedia = true)
+        ipcBridge.sendRequest("media.retry", buildJsonObject {
+            put("conversationId", conversationId)
+            put("messageId", messageId)
+        })
+    }
+
+    suspend fun cancelMedia(conversationId: String, messageId: String) {
+        ipcBridge.sendRequest("media.cancel", buildJsonObject {
+            put("conversationId", conversationId)
+            put("messageId", messageId)
+        })
+    }
 
     // ── Event Flows ─────────────────────────────────────────────────────
 
@@ -228,6 +248,7 @@ class ZappMessagingSDK {
      * Shutdown the SDK and release all resources.
      */
     fun shutdown() {
+        _mediaTransferStates.value = emptyMap()
         ipcBridge.cancelAllPendingRequests()
         workletManager.stop()
         ipcBridge.clearEventHandlers()
@@ -256,6 +277,7 @@ class ZappMessagingSDK {
         val seedPhrase = response["seedPhrase"]?.jsonPrimitive?.contentOrNull
             ?: throw ZMError.InvalidData("identity.create response missing seedPhrase")
 
+        if (_identity.value?.publicKey != newIdentity.publicKey) _mediaTransferStates.value = emptyMap()
         _identity.value = newIdentity
         return ZMIdentityWithSeed(identity = newIdentity, seedPhrase = seedPhrase)
     }
@@ -307,6 +329,7 @@ class ZappMessagingSDK {
         val restoredName = response["displayName"]?.jsonPrimitive?.contentOrNull ?: displayName
 
         val restoredIdentity = ZMIdentity(publicKey = publicKey, displayName = restoredName)
+        if (_identity.value?.publicKey != restoredIdentity.publicKey) _mediaTransferStates.value = emptyMap()
         _identity.value = restoredIdentity
 
         // Reload data
@@ -438,7 +461,7 @@ class ZappMessagingSDK {
      * @param conversationId Target conversation
      * @param content Message text
      * @param contentType MIME type (default "text/plain")
-     * @return The sent message
+     * @return The locally durable message. Delivery is confirmed separately by recipient receipts.
      */
     suspend fun sendMessage(
         conversationId: String,
@@ -581,10 +604,11 @@ class ZappMessagingSDK {
         thumbnailData: String? = null,
         replyToId: String? = null,
         replyToSenderName: String? = null,
-        replyToContent: String? = null
+        replyToContent: String? = null,
+        clientMessageId: String? = null
     ): ZMMessage {
         requireIdentity()
-        ensureConversationConnected(conversationId)
+        ensureConversationConnected(conversationId, forMedia = true)
 
         // Step 1: Prepare media (hash and store)
         val extension = contentType.substringAfterLast("/", "jpg")
@@ -604,6 +628,7 @@ class ZappMessagingSDK {
         // Step 2: Send media message
         val sendPayload = buildJsonObject {
             put("conversationId", conversationId)
+            clientMessageId?.let { put("clientMessageId", it) }
             put("content", caption)
             put("contentType", contentType)
             put("mediaId", mediaId)
@@ -618,14 +643,8 @@ class ZappMessagingSDK {
         val response = ipcBridge.sendRequest("media.send_message", sendPayload)
         val msgData = response["message"]?.jsonObject
 
-        // Parse response or construct message from known data
-        return if (msgData != null) {
-            ipcBridge.parseMessage(msgData) ?: buildMediaMessage(
-                conversationId, caption, contentType, mediaId, mediaSize, mediaLocalPath
-            )
-        } else {
-            buildMediaMessage(conversationId, caption, contentType, mediaId, mediaSize, mediaLocalPath)
-        }
+        return msgData?.let(ipcBridge::parseMessage)
+            ?: throw ZMError.InvalidData("Missing accepted media message")
     }
 
     private fun buildMediaMessage(
@@ -820,8 +839,11 @@ class ZappMessagingSDK {
         val relaysTotal: Int
     )
 
-    private suspend fun ensureConversationConnected(conversationId: String) {
-        val payload = buildJsonObject { put("conversationId", conversationId) }
+    private suspend fun ensureConversationConnected(conversationId: String, forMedia: Boolean = false) {
+        val payload = buildJsonObject {
+            put("conversationId", conversationId)
+            put("forMedia", forMedia)
+        }
         ipcBridge.sendRequest("connection.connect", payload)
     }
 
@@ -1026,11 +1048,35 @@ class ZappMessagingSDK {
                     }
                 }
 
+                "media.transfer_state" -> {
+                    val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
+                    val state = payload["state"]?.jsonPrimitive?.contentOrNull
+                    val direction = payload["direction"]?.jsonPrimitive?.contentOrNull
+                    if (mediaId != null && state != null && direction in setOf("upload", "download")) {
+                        val key = "$direction:$mediaId"
+                        _mediaTransferStates.value = (_mediaTransferStates.value - key + (key to state))
+                            .entries.toList().takeLast(512).associate { it.toPair() }
+                    }
+                }
+
+                "media.diagnostic" -> {
+                    // Explicit opt-in only. Core sends an allowlisted numeric schema, never payload data.
+                    val stage = payload["stage"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val id = payload["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val ms = payload["durationMs"]?.jsonPrimitive?.longOrNull ?: 0
+                    val bytes = payload["bytes"]?.jsonPrimitive?.longOrNull ?: 0
+                    if (Log.isLoggable("ZappMediaTiming", Log.DEBUG) &&
+                        id.matches(Regex("[0-9a-f]{16}")) && stage.matches(Regex("[a-z_]{1,32}"))) {
+                        Log.d("ZappMediaTiming", "$id $stage durationMs=$ms bytes=$bytes")
+                    }
+                }
+
                 "media.transfer_complete" -> {
                     val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
                     val mediaLocalPath = payload["mediaLocalPath"]?.jsonPrimitive?.contentOrNull
                     if (mediaId != null) {
                         _mediaTransferComplete.tryEmit(mediaId)
+                        _mediaTransferStates.value = _mediaTransferStates.value + ("download:$mediaId" to "complete")
                         // When mediaLocalPath is present, this is a received media download completion
                         if (mediaLocalPath != null) {
                             _mediaDownloadComplete.tryEmit(Pair(mediaId, mediaLocalPath))

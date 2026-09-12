@@ -24,6 +24,7 @@ const Corestore = require('corestore')
 const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const path = require('bare-path')
+const fs = require('bare-fs')
 const EventEmitter = require('bare-events')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { getInboundPushTopics } = require('./push-topics')
@@ -44,8 +45,9 @@ function coreFork (core) {
 }
 
 class HypercoreManager extends EventEmitter {
-  constructor () {
+  constructor (opts = {}) {
     super()
+    this._dataDir = opts.dataDir || getDataDir()
     this.store = null
     this.localCores = new Map()    // conversationId → Hypercore (writable)
     this.remoteCores = new Map()   // conversationId → Map<peerKeyHex, Hypercore>
@@ -104,12 +106,13 @@ class HypercoreManager extends EventEmitter {
 
   async initialize () {
     if (this._ready) return
-    const dataDir = getDataDir()
+    const dataDir = this._dataDir
     const storePath = path.join(dataDir, 'corestore')
     ensureDir(storePath)
     this.store = new Corestore(storePath)
     await this.store.ready()
     this._ready = true
+    this._closed = false
     diag('Corestore ready')
   }
 
@@ -676,7 +679,7 @@ class HypercoreManager extends EventEmitter {
         }
       }
       const data = { version: 3, remotes, localReferrers, remoteReferrers, cursors }
-      const dataDir = getDataDir()
+      const dataDir = this._dataDir
       writeJSON(path.join(dataDir, 'corekeys.json'), data)
       diag('Saved core key index: ' + Object.keys(remotes).length + ' conversation(s)')
     } catch (err) {
@@ -703,7 +706,7 @@ class HypercoreManager extends EventEmitter {
   async _loadCoreKeyIndex () {
     let hydrated = false
     try {
-      const dataDir = getDataDir()
+      const dataDir = this._dataDir
       const indexPath = path.join(dataDir, 'corekeys.json')
       const data = readJSON(indexPath)
       if (!data && fileExists(indexPath)) {
@@ -769,6 +772,17 @@ class HypercoreManager extends EventEmitter {
       // restored subscriptions until this flag becomes true.
       this.emit('push-topics-changed')
     }
+  }
+
+  // Called only for a different identity, after network/IPC work quiesces.
+  // Reusing named writable cores would retain the previous account's log/key.
+  async resetIdentity () {
+    await this.close()
+    fs.rmSync(path.join(this._dataDir, 'corestore'), { recursive: true, force: true })
+    fs.rmSync(path.join(this._dataDir, 'corekeys.json'), { force: true })
+    this._coreKeyIndexHydrated = false
+    this._coreKeyIndexLoadPromise = null
+    await this.initialize()
   }
 
   async close () {

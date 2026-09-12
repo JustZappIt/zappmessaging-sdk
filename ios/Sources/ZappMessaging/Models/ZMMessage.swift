@@ -139,6 +139,9 @@ public extension ZMMessage {
 
 /// Media transfer state
 public enum MediaTransferState: String, Codable, Equatable, Sendable {
+    case queued
+    case queuedSocket = "queued_socket"
+    case downloading
     case sending
     case sent
     case receiving

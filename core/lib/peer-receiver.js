@@ -81,16 +81,16 @@ function createPeerReceiver (getDependencies) {
   }
 }
 
-async function serveAuthorizedMedia (chatStore, mediaTransfer, hash, peer, socket) {
+async function serveAuthorizedMedia (chatStore, mediaTransfer, hash, peer, socket, attempt = 0) {
   if (!mediaTransfer || !b4a.isBuffer(hash) || hash.length !== 32) return false
   if (!chatStore || !chatStore.canServeMedia(b4a.toString(hash, 'hex'), peer)) return false
-  await mediaTransfer.handleRequest(hash, socket)
+  await mediaTransfer.handleRequest(hash, socket, attempt)
   return true
 }
 function acceptAuthorizedMediaChunk(chatStore, mediaTransfer, requests, hash, chunkIndex, totalChunks, chunkData, peer) {
   if (!mediaTransfer || !b4a.isBuffer(hash) || hash.length !== 32) return false
   const request = requests.get(b4a.toString(hash, 'hex'))
-  if (!request || !chatStore || !chatStore.isPeerAuthorized(request.conversationId, peer)) return false
+  if (!request || request.failed || request.active === false || !chatStore || !chatStore.isPeerAuthorized(request.conversationId, peer)) return false
   return mediaTransfer.onChunkReceived(hash, chunkIndex, totalChunks, chunkData)
 }
 module.exports = { createPeerReceiver, serveAuthorizedMedia, acceptAuthorizedMediaChunk }

@@ -7,7 +7,7 @@
  * Types:
  *   0x01 - JSON message (chat messages, control messages)
  *   0x02 - Media chunk [32B hash][4B chunkIdx][4B totalChunks][chunk data]
- *   0x03 - Media request [32B hash]
+ *   0x03 - Media request [32B hash][optional 4B attempt; legacy readers ignore it]
  *   0x04 - Ping (heartbeat)
  *   0x05 - Pong (heartbeat response)
  *
@@ -28,6 +28,7 @@ class FramedSocket {
     this.socket = rawSocket
     this._recvBuf = b4a.alloc(0)
     this._destroyed = false
+    this._processing = false
     this._legacyMode = false
     this._legacyBuf = ''
 
@@ -60,6 +61,12 @@ class FramedSocket {
       return
     }
 
+    // Bound data retained while an asynchronous metadata handler owns the read.
+    if (this._recvBuf.length + data.length > 2 * 1024 * 1024) {
+      this.destroy()
+      if (this.socket.destroy) this.socket.destroy(new Error('Receive queue exceeded'))
+      return
+    }
     this._recvBuf = b4a.concat([this._recvBuf, data])
     this._drainFrames()
   }
@@ -100,6 +107,7 @@ class FramedSocket {
   }
 
   _drainFrames() {
+    if (this._processing || this._destroyed) return
     while (this._recvBuf.length >= 4) {
       const len = this._recvBuf.readUInt32BE(0)
 
@@ -114,7 +122,20 @@ class FramedSocket {
 
       const payload = this._recvBuf.subarray(4, 4 + len)
       this._recvBuf = this._recvBuf.subarray(4 + len)
-      this._processFrame(payload)
+      const result = this._processFrame(payload)
+      if (result && typeof result.then === 'function') {
+        this._processing = true
+        if (this.socket.pause) this.socket.pause()
+        Promise.resolve(result).catch(error => {
+          if (this.onError) this.onError(error)
+        }).finally(() => {
+          this._processing = false
+          if (this._destroyed) return
+          this._drainFrames()
+          if (!this._processing && this.socket.resume) this.socket.resume()
+        })
+        return
+      }
     }
   }
 
@@ -128,7 +149,7 @@ class FramedSocket {
       case MSG_TYPE_JSON: {
         try {
           const msg = JSON.parse(b4a.toString(body))
-          if (this.onMessage) this.onMessage(msg)
+          if (this.onMessage) return this.onMessage(msg)
         } catch (e) {
           if (this.onError) this.onError(e)
         }
@@ -148,7 +169,7 @@ class FramedSocket {
       case MSG_TYPE_REQUEST: {
         if (body.length < 32) return
         const hash = body.subarray(0, 32)
-        if (this.onRequest) this.onRequest(hash)
+        if (this.onRequest) this.onRequest(hash, body.length >= 36 ? body.readUInt32BE(32) : 0)
         break
       }
 
@@ -205,7 +226,7 @@ class FramedSocket {
    * Send a media chunk (type 0x02)
    */
   writeChunk(hashBuf, chunkIndex, totalChunks, data) {
-    if (this._destroyed) return false
+    if (this._destroyed || this.socket.destroyed || this.socket.writable === false) throw new Error('Media socket closed')
     const payloadLen = 1 + 32 + 4 + 4 + data.length
     const frame = b4a.alloc(4 + payloadLen)
     frame.writeUInt32BE(payloadLen, 0)
@@ -214,19 +235,51 @@ class FramedSocket {
     frame.writeUInt32BE(chunkIndex, 37)
     frame.writeUInt32BE(totalChunks, 41)
     data.copy(frame, 45)
-    this.socket.write(frame)
-    return true
+    return this.socket.write(frame)
+  }
+
+  // streamx NoiseSecretStream.write(false) means accepted, but stop until drain.
+  // Register before writing to cover synchronous mocks/streams; never resend that frame.
+  writeChunkAsync (hash, index, count, data, cancellation, timeoutMs, onQueued = () => {}) {
+    if (this.canWriteChunk && !this.canWriteChunk(hash)) return Promise.reject(new Error('Media authorization revoked'))
+    return new Promise((resolve, reject) => {
+      let timer
+      const finish = error => {
+        clearTimeout(timer)
+        this.socket.removeListener('drain', drained)
+        this.socket.removeListener('close', closed)
+        this.socket.removeListener('error', closed)
+        cancellation.removeListener('cancel', cancelled)
+        if (error) reject(error)
+        else resolve()
+      }
+      const drained = () => finish()
+      const closed = () => finish(new Error('Media socket closed'))
+      const cancelled = () => finish(new Error('Media transfer cancelled'))
+      this.socket.on('drain', drained)
+      this.socket.on('close', closed)
+      this.socket.on('error', closed)
+      cancellation.on('cancel', cancelled)
+      timer = setTimeout(() => finish(new Error('Media socket stalled')), timeoutMs)
+      try {
+        const ready = this.writeChunk(hash, index, count, data)
+        onQueued()
+        if (ready !== false) finish()
+      } catch (error) { finish(error) }
+    })
   }
 
   /**
    * Send a media request (type 0x03)
    */
-  writeRequest(hashBuf) {
+  writeRequest(hashBuf, attempt = 0) {
     if (this._destroyed) return false
-    const frame = b4a.alloc(4 + 1 + 32)
-    frame.writeUInt32BE(33, 0)
+    const extended = Number.isSafeInteger(attempt) && attempt > 0 && attempt <= 0xffffffff
+    const frame = b4a.alloc(4 + 1 + 32 + (extended ? 4 : 0))
+    frame.writeUInt32BE(frame.length - 4, 0)
     frame[4] = MSG_TYPE_REQUEST
     hashBuf.copy(frame, 5)
+    if (extended) frame.writeUInt32BE(attempt, 37)
     this.socket.write(frame)
     return true
   }
