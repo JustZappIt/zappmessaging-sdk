@@ -3,8 +3,8 @@
  * real blind-peering client the phones ship, over in-memory Noise streams.
  * Only the DHT is faked.
  *
- * blind-peer resolves from server/, the package that is deployed; run
- * `cd server && npm ci` once to enable this file locally.
+ * blind-peer resolves from server/, the package that is deployed; this file
+ * fails rather than skips without it, since `npm test` is the only gate.
  */
 
 const { test } = require('node:test')
@@ -19,14 +19,15 @@ const Corestore = require('corestore')
 const BlindPeering = require('blind-peering')
 const NoiseSecretStream = require('@hyperswarm/secret-stream')
 const { Duplex } = require('streamx')
-const { attachMediaRetention, DEFAULTS } = require('../../server/media-retention')
+const { attachMediaRetention, DEFAULTS, MESSAGE_CORE_PRIORITY } = require('../../server/media-retention')
 
 const SERVER_DIR = path.join(__dirname, '../../server')
-let BlindPeer = null
+let BlindPeer
 try {
   BlindPeer = require(require.resolve('blind-peer', { paths: [SERVER_DIR] }))
-} catch (_) {}
-const skip = BlindPeer ? false : 'server dependencies are not installed (cd server && npm ci)'
+} catch (_) {
+  throw new Error('media-retention tests need the server dependencies: cd server && npm ci')
+}
 
 const DAY = 24 * 60 * 60 * 1000
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -113,8 +114,30 @@ async function age (blindPeer, core, ms) {
   await tx.flush()
 }
 
-async function fixture (t) {
+// The relay's records are shared by everyone who registers a core, so the
+// same three cores stand in for every client generation:
+//   stale      an image core nobody has added to for a week
+//   fresh      an image core added to today
+//   messages   a message log; its owner registers it the way every release
+//              has, announce requested, and here at the priority an old
+//              build sends
+// With retention attached, it is attached before any core exists, the way
+// the launcher attaches it before listen(); runPass() then drives a sweep.
+async function fixture (t, { retention = true } = {}) {
   const blindPeer = await relay(t)
+  const stateFile = path.join(temporary(t), 'state.json')
+  const lines = []
+  const clock = { now: Date.now() }
+  const attach = () => attachMediaRetention(blindPeer, { stateFile, now: () => clock.now, log: line => lines.push(line) })
+  const handle = retention ? await attach() : null
+  if (handle) t.after(() => handle.close())
+  const runPass = async () => {
+    const before = passes(lines).length
+    clock.now += DEFAULTS.minIntervalMs
+    blindPeer.emit('core-activity')
+    await until(() => passes(lines).length === before + 1)
+    return passes(lines)[before]
+  }
   const store = new Corestore(temporary(t))
   t.after(() => store.close())
   const peering = client(t, blindPeer, store)
@@ -129,18 +152,20 @@ async function fixture (t) {
   await cores.messages.append({ id: 'm1', content: 'hello' })
   await peering.addCore(cores.stale, { priority: 0, announce: false })
   await peering.addCore(cores.fresh, { priority: 0, announce: false })
-  await peering.addCore(cores.messages, { priority: 1, announce: false })
+  await peering.addCore(cores.messages, { priority: 0, announce: true })
   for (const core of Object.values(cores)) await mirrored(blindPeer, core)
   await age(blindPeer, cores.stale, 8 * DAY)
-  return { blindPeer, store, peering, cores }
+  await age(blindPeer, cores.messages, 8 * DAY)
+  return { blindPeer, store, peering, cores, stateFile, lines, clock, attach, runPass }
 }
 
-test('a media core silent for a week is cleared; fresh media and message history are not', { skip }, async t => {
-  const { blindPeer, cores } = await fixture(t)
-  const passes = []
-  const retention = attachMediaRetention(blindPeer, { log: line => passes.push(line) })
-  t.after(() => retention.close())
-  await until(() => passes.length === 1)
+function passes (lines) {
+  return lines.filter(line => line.startsWith('media retention pass'))
+}
+
+test('a media core silent for a week is cleared; fresh media and message history are not', async t => {
+  const { blindPeer, cores, runPass } = await fixture(t)
+  const pass = await runPass()
 
   const stale = await record(blindPeer, cores.stale)
   assert.equal(stale.blocksCleared, cores.stale.length)
@@ -154,18 +179,49 @@ test('a media core silent for a week is cleared; fresh media and message history
   assert.equal(fresh.blocksCleared, 0)
   assert.ok(fresh.bytesAllocated > 0)
   const messages = await record(blindPeer, cores.messages)
-  assert.equal(messages.priority, 1)
+  assert.equal(messages.priority, MESSAGE_CORE_PRIORITY, 'an old build\'s message core was promoted when its owner registered it')
   assert.equal(messages.blocksCleared, 0)
   assert.ok(messages.bytesAllocated > 0)
-  assert.match(passes[0], /cleared 1 core\(s\), \d+ byte\(s\)/)
+  assert.match(pass, /cleared 1 core\(s\), \d+ byte\(s\)/)
   assert.equal(blindPeer.digest.bytesAllocated, fresh.bytesAllocated + messages.bytesAllocated)
 })
 
-test('re-registering a cleared core pulls nothing old, while a block appended later is mirrored', { skip }, async t => {
-  const { blindPeer, store, peering, cores } = await fixture(t)
-  const retention = attachMediaRetention(blindPeer, {})
-  t.after(() => retention.close())
-  await until(async () => (await record(blindPeer, cores.stale)).bytesAllocated === 0)
+test('records that predate the module are protected once, and only once', async t => {
+  const { blindPeer, store, peering, cores, stateFile, lines, attach, runPass } = await fixture(t, { retention: false })
+  for (const core of Object.values(cores)) assert.equal((await record(blindPeer, core)).priority, 0)
+
+  const first = await attach()
+  assert.match(lines[0], /protected 3 existing core\(s\)/)
+  await until(() => passes(lines).length === 1)
+  assert.match(passes(lines)[0], /cleared 0 core\(s\)/)
+  for (const core of Object.values(cores)) {
+    const r = await record(blindPeer, core)
+    assert.equal(r.priority, MESSAGE_CORE_PRIORITY)
+    assert.equal(r.blocksCleared, 0)
+    assert.ok(r.bytesAllocated > 0)
+  }
+  assert.ok(JSON.parse(fs.readFileSync(stateFile, 'utf8')).promotedAt)
+  await first.close()
+
+  // An image registered after the marker is not swept up by a later restart.
+  const image = store.get({ name: 'zapp-media-later', encryptionKey: b4a.alloc(32, 7), valueEncoding: 'binary' })
+  await image.append(crypto.randomBytes(1000))
+  await peering.addCore(image, { priority: 0, announce: false })
+  await mirrored(blindPeer, image)
+  await age(blindPeer, image, 8 * DAY)
+  const again = await attach()
+  t.after(() => again.close())
+  await until(() => passes(lines).length === 2)
+  assert.equal(lines.filter(line => line.includes('protected')).length, 1, 'the promotion ran once')
+  assert.match(passes(lines)[1], /cleared 1 core\(s\)/)
+  assert.equal((await record(blindPeer, image)).bytesAllocated, 0)
+  assert.ok((await record(blindPeer, cores.stale)).bytesAllocated > 0, 'protected history stays')
+})
+
+test('re-registering a cleared core pulls nothing old, while a block appended later is mirrored', async t => {
+  const { blindPeer, store, peering, cores, runPass } = await fixture(t)
+  await runPass()
+  assert.equal((await record(blindPeer, cores.stale)).bytesAllocated, 0)
 
   await peering.close()
   const reconnected = client(t, blindPeer, store)
@@ -183,32 +239,34 @@ test('re-registering a cleared core pulls nothing old, while a block appended la
   assert.ok(pulled.bytesAllocated >= 500 && pulled.bytesAllocated < 1000, 'only the new block is stored')
 })
 
-test('a pass runs on traffic at most once per interval, and never after close', { skip }, async t => {
+test('a pass runs on traffic at most once per interval, and never after close', async t => {
   const blindPeer = await relay(t)
   let now = Date.now()
-  const passes = []
-  const retention = attachMediaRetention(blindPeer, { now: () => now, log: line => passes.push(line) })
-  await until(() => passes.length === 1)
+  const lines = []
+  const retention = await attachMediaRetention(blindPeer, { stateFile: path.join(temporary(t), 'state.json'), now: () => now, log: line => lines.push(line) })
+  await until(() => passes(lines).length === 1)
 
   for (let i = 0; i < 20; i++) blindPeer.emit('core-activity')
   await sleep(50)
-  assert.equal(passes.length, 1)
+  assert.equal(passes(lines).length, 1)
 
   now += DEFAULTS.minIntervalMs
   blindPeer.emit('core-activity')
-  await until(() => passes.length === 2)
+  await until(() => passes(lines).length === 2)
   blindPeer.emit('core-activity')
   await sleep(50)
-  assert.equal(passes.length, 2)
+  assert.equal(passes(lines).length, 2)
 
   await retention.close()
   now += DEFAULTS.minIntervalMs
   blindPeer.emit('core-activity')
   await sleep(50)
-  assert.equal(passes.length, 2)
-  assert.equal(blindPeer.listenerCount('core-activity'), 0)
+  assert.equal(passes(lines).length, 2)
+  for (const event of ['core-activity', 'add-cores-downgrade-announce', 'downgrade-announce']) {
+    assert.equal(blindPeer.listenerCount(event), 0, event)
+  }
 })
 
-test('attaching before the relay is ready is refused', () => {
-  assert.throws(() => attachMediaRetention({ opened: false }), /ready blind peer/)
+test('attaching before the relay is ready is refused', async () => {
+  await assert.rejects(attachMediaRetention({ opened: false }), /ready blind peer/)
 })

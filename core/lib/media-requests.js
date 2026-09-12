@@ -11,8 +11,10 @@
  *
  * Both sources retry when a peer (re)connects, when the mirror comes up, or
  * when an in-flight transfer stalls, each under its own attempt cap and
- * cooldown. Mirror fetches are single-flight per mediaId and bounded in
- * number; a phone never keeps ciphertext it has decoded or given up on.
+ * cooldown; the mirror path also retries by itself once its cooldown passes.
+ * Mirror fetches are single-flight per mediaId and bounded in number, and
+ * every fetch ends on one path that clears the range it pulled and closes its
+ * session, whether it completed, failed or was cancelled.
  */
 
 const b4a = require('b4a')
@@ -43,7 +45,11 @@ function descriptorOf (message) {
     n: message.mediaBlockLength,
     byteLength: Number.isSafeInteger(message.mediaSize) && message.mediaSize > 0 ? message.mediaSize : null
   }
-  return mediaBlobs.isValidRange(range) ? range : null
+  if (mediaBlobs.isValidRange(range)) return range
+  diag('Ignoring media descriptor that cannot describe the image media=' +
+    String(message.mediaId).substring(0, 12) + ' size=' + message.mediaSize +
+    ' blocks=' + message.mediaBlockLength)
+  return null
 }
 
 function rejected (message) {
@@ -62,7 +68,9 @@ class MediaRequests {
   constructor (getDependencies, opts = {}) {
     this._deps = getDependencies
     this._requests = new Map() // mediaId -> { conversationId, senderId, attempts, lastAt, descriptor, mirrorAttempts, mirrorFailedAt }
-    this._fetches = new Map() // mediaId -> { core, cancelled } while a mirror fetch is in flight
+    this._fetches = new Map() // mediaId -> { core, cancel, cancelled, settled } while a mirror fetch is in flight
+    this._cooldownTimer = null
+    this._paused = false // between cancelFetches() and the next mirror coming up
     this._maxAttempts = opts.maxAttempts || DEFAULTS.maxAttempts
     this._cooldownMs = opts.cooldownMs || DEFAULTS.cooldownMs
     this._maxPending = opts.maxPending || DEFAULTS.maxPending
@@ -153,14 +161,24 @@ class MediaRequests {
     }
   }
 
-  /** Re-request everything every conversation is still missing. */
+  /**
+   * The mirror just came up: re-request everything every conversation is
+   * still missing, and let images the mirror could not serve before have
+   * their full run of attempts again.
+   */
   async requestMissingEverywhere () {
     try {
+      this._paused = false
+      for (const entry of this._requests.values()) {
+        entry.mirrorAttempts = 0
+        entry.mirrorFailedAt = 0
+      }
       const { chatStore } = this._deps()
       if (!chatStore) return
       for (const conv of await chatStore.listConversations()) {
         await this.requestMissing(conv.id)
       }
+      this._pumpFetches()
     } catch (err) {
       diag('requestMissingEverywhere failed: ' + (err.message || err))
     }
@@ -180,12 +198,13 @@ class MediaRequests {
   /**
    * The one completion path for image bytes, whether a peer streamed them or
    * the blind peer served them: hash verified by the caller, saved once,
-   * authorized only for the conversation that asked.
+   * authorized only for the conversation that asked. Returns false when the
+   * bytes could not be kept; the request then stays pending.
    */
   complete (hashHex, fullData) {
+    const request = this._requests.get(hashHex)
+    if (!request) return false
     try {
-      const request = this._requests.get(hashHex)
-      if (!request) return
       const { chatStore, mediaStore, mediaTransfer } = this._deps()
       // Determine extension from first bytes (magic number detection)
       let ext = 'jpg'
@@ -215,36 +234,69 @@ class MediaRequests {
         mediaLocalPath: filePath,
         mediaSize: fullData.length
       })
+      return true
     } catch (err) {
       diag('Failed to save received media: ' + (err.message || err))
+      return false
     }
   }
 
-  /** Stop every mirror fetch; pending requests stay and restart on the next trigger. */
+  /**
+   * Stop every mirror fetch and start no more until the mirror comes up
+   * again; pending requests stay. Resolves once each fetch has cleared and
+   * closed its session.
+   */
   cancelFetches () {
-    for (const mediaId of [...this._fetches.keys()]) this._cancelFetch(mediaId)
+    this._paused = true
+    const settled = []
+    for (const mediaId of [...this._fetches.keys()]) settled.push(this._cancelFetch(mediaId))
+    if (this._cooldownTimer) {
+      clearTimeout(this._cooldownTimer)
+      this._cooldownTimer = null
+    }
+    return Promise.all(settled)
   }
 
   // Start mirror fetches for pending requests that carry a descriptor, oldest
-  // first, up to the concurrency cap.
+  // first, up to the concurrency cap. Requests waiting out a cooldown get one
+  // timer for the earliest expiry, so a retry does not depend on an unrelated
+  // event arriving.
   _pumpFetches () {
+    if (this._paused) return
     const { hypercoreManager, mediaStore, blindMirror } = this._deps()
     if (!hypercoreManager || !mediaStore || !blindMirror || !blindMirror.enabled) return
     const now = Date.now()
+    let nextRetryAt = Infinity
     for (const [mediaId, entry] of this._requests) {
       if (this._fetches.size >= this._fetchConcurrency) return
       if (!entry.descriptor || this._fetches.has(mediaId)) continue
       if (entry.mirrorAttempts >= this._maxAttempts) continue
-      if (entry.mirrorFailedAt && (now - entry.mirrorFailedAt) < this._cooldownMs) continue
+      const retryAt = entry.mirrorFailedAt ? entry.mirrorFailedAt + this._cooldownMs : 0
+      if (retryAt > now) {
+        nextRetryAt = Math.min(nextRetryAt, retryAt)
+        continue
+      }
       this._startFetch(mediaId, entry)
     }
+    if (nextRetryAt !== Infinity) this._scheduleRetry(nextRetryAt - now)
+  }
+
+  _scheduleRetry (delayMs) {
+    if (this._cooldownTimer) clearTimeout(this._cooldownTimer)
+    this._cooldownTimer = setTimeout(() => {
+      this._cooldownTimer = null
+      this._pumpFetches()
+    }, Math.max(delayMs, 0))
+    if (typeof this._cooldownTimer.unref === 'function') this._cooldownTimer.unref()
   }
 
   _startFetch (mediaId, entry) {
-    const fetch = { core: null, cancelled: false }
+    const fetch = { core: null, cancel: null, cancelled: false, settled: null }
     this._fetches.set(mediaId, fetch)
-    this._fetch(mediaId, entry, fetch)
-      .then((bytes) => { if (bytes) this.complete(mediaId, bytes) })
+    fetch.settled = this._fetch(mediaId, entry, fetch)
+      .then((bytes) => {
+        if (bytes && !this.complete(mediaId, bytes)) this._recordFetchFailure(mediaId, entry, 'bytes could not be saved')
+      })
       .catch((err) => diag('Mirror fetch failed unexpectedly: ' + (err.message || err)))
       .finally(() => {
         if (this._fetches.get(mediaId) === fetch) this._fetches.delete(mediaId)
@@ -253,7 +305,7 @@ class MediaRequests {
   }
 
   // Resolves with verified bytes, or null after logging and bookkeeping. The
-  // session is closed and its range cleared either way.
+  // range is cleared and the session closed on the way out in every case.
   async _fetch (mediaId, entry, fetch) {
     const { conversationId, senderId, descriptor } = entry
     const { p2pManager, mediaStore } = this._deps()
@@ -264,13 +316,16 @@ class MediaRequests {
       if (fetch.cancelled) return null
       fetch.core = core
       let downloaded = 0
-      const bytes = await mediaBlobs.fetch(core, descriptor, {
+      const download = mediaBlobs.download(core, descriptor, {
         timeoutMs: this._fetchTimeoutMs,
         onBlock: () => {
           downloaded++
           this._pushEvent('media.transfer_progress', { mediaId, progress: downloaded / descriptor.n })
         }
       })
+      fetch.cancel = download.cancel
+      const bytes = await download.bytes
+      if (fetch.cancelled) return null
       if (b4a.toString(mediaStore.hash(bytes), 'hex') !== mediaId) throw rejected('media core bytes do not hash to mediaId')
       return bytes
     } catch (err) {
@@ -281,26 +336,31 @@ class MediaRequests {
         entry.descriptor = null
         diag('Mirror fetch rejected media=' + mediaId.substring(0, 12) + ': ' + (err.message || err))
       } else {
-        entry.mirrorAttempts += 1
-        entry.mirrorFailedAt = Date.now()
-        diag('Mirror fetch failed media=' + mediaId.substring(0, 12) +
-          ' attempt=' + entry.mirrorAttempts + ': ' + (err.code || err.message || err))
+        this._recordFetchFailure(mediaId, entry, err.code || err.message || err)
       }
       return null
     } finally {
       if (core) {
-        if (!fetch.cancelled) await core.clear(descriptor.offset, descriptor.offset + descriptor.n).catch(() => {})
+        await core.clear(descriptor.offset, descriptor.offset + descriptor.n).catch(() => {})
         await core.close().catch(() => {})
       }
     }
   }
 
+  _recordFetchFailure (mediaId, entry, reason) {
+    entry.mirrorAttempts += 1
+    entry.mirrorFailedAt = Date.now()
+    diag('Mirror fetch failed media=' + mediaId.substring(0, 12) +
+      ' attempt=' + entry.mirrorAttempts + ': ' + reason)
+  }
+
   _cancelFetch (mediaId) {
     const fetch = this._fetches.get(mediaId)
-    if (!fetch) return
+    if (!fetch) return Promise.resolve()
     fetch.cancelled = true
     this._fetches.delete(mediaId)
-    if (fetch.core) fetch.core.close().catch(() => {})
+    if (fetch.cancel) fetch.cancel()
+    return fetch.settled || Promise.resolve()
   }
 
   _pushEvent (type, payload) {

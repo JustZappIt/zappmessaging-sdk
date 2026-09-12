@@ -11,6 +11,13 @@ put a first invite, which is what the mailbox is for. Image bytes ride the
 mirror in per-conversation media cores; `media-retention.js` clears those a
 week after their last new block, so the mirror holds images only long enough
 to deliver them while message history stays until storage pressure evicts it.
+The relay records a priority only for cores it has never seen, so the module
+protects history two ways: message cores are promoted to priority 1 as their
+owners register them (the announce request every build sends), and on the
+first start after an upgrade every record already on the relay is promoted
+once, recorded in `media-retention.json` inside the storage directory. Upgrade
+the relay before shipping clients that send images; media cores registered
+before the marker exists become permanent.
 
 ```bash
 cd server

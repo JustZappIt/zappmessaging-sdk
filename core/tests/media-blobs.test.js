@@ -67,7 +67,7 @@ test('put then fetch round-trips images of every block-boundary size', async t =
   assert.equal(core.length, 1 + ranges.reduce((sum, r) => sum + r.range.n, 0))
 
   for (const { bytes, range } of ranges) {
-    const fetched = await mediaBlobs.fetch(core, range)
+    const fetched = await mediaBlobs.download(core, range).bytes
     assert.ok(b4a.equals(fetched, bytes))
   }
 })
@@ -82,7 +82,7 @@ test('put rejects empty and oversized media', async t => {
   assert.equal(core.length, 0)
 })
 
-test('fetch rejects ranges that cannot describe an image before touching the network', async t => {
+test('download rejects ranges that cannot describe an image before touching the network', async t => {
   const store = new Corestore(temporary(t, 'zapp-blobs-'))
   t.after(() => store.close())
   const core = store.get({ name: 'media', valueEncoding: 'binary' })
@@ -98,13 +98,13 @@ test('fetch rejects ranges that cannot describe an image before touching the net
     { offset, n: 2, byteLength: 10 }
   ]) {
     assert.equal(mediaBlobs.isValidRange(range), false)
-    await assert.rejects(mediaBlobs.fetch(core, range), { code: 'MEDIA_RANGE_INVALID' })
+    await assert.rejects(mediaBlobs.download(core, range).bytes, { code: 'MEDIA_RANGE_INVALID' })
   }
-  await assert.rejects(mediaBlobs.fetch(core, { offset, n, byteLength: 11 }), { code: 'MEDIA_RANGE_INVALID' },
+  await assert.rejects(mediaBlobs.download(core, { offset, n, byteLength: 11 }).bytes, { code: 'MEDIA_RANGE_INVALID' },
     'bytes on disk must add up to the descriptor')
 })
 
-test('fetch times out when no peer supplies the blocks and cancels when the session closes', async t => {
+test('download times out when no peer supplies the blocks, and cancels on cancel() or session close', async t => {
   const store = new Corestore(temporary(t, 'zapp-blobs-'))
   t.after(() => store.close())
   const core = store.get({ key: crypto.keyPair().publicKey, valueEncoding: 'binary' })
@@ -115,12 +115,17 @@ test('fetch times out when no peer supplies the blocks and cancels when the sess
   const keepAlive = setInterval(() => {}, 1000)
   t.after(() => clearInterval(keepAlive))
   const started = Date.now()
-  await assert.rejects(mediaBlobs.fetch(core, { offset: 0, n: 2 }, { timeoutMs: 50 }), { code: 'MEDIA_FETCH_TIMEOUT' })
+  await assert.rejects(mediaBlobs.download(core, { offset: 0, n: 2 }, { timeoutMs: 50 }).bytes, { code: 'MEDIA_FETCH_TIMEOUT' })
   assert.ok(Date.now() - started < 5000)
 
-  const pending = mediaBlobs.fetch(core, { offset: 0, n: 2 }, { timeoutMs: 60000 })
+  const cancelled = mediaBlobs.download(core, { offset: 0, n: 2 }, { timeoutMs: 60000 })
+  cancelled.cancel()
+  await assert.rejects(cancelled.bytes, { code: 'MEDIA_FETCH_CANCELLED' })
+  assert.equal(core.closed, false, 'cancelling leaves the session to its owner')
+
+  const orphaned = mediaBlobs.download(core, { offset: 0, n: 2 }, { timeoutMs: 60000 })
   await core.close()
-  await assert.rejects(pending, { code: 'MEDIA_FETCH_CANCELLED' })
+  await assert.rejects(orphaned.bytes, { code: 'MEDIA_FETCH_CANCELLED' })
 })
 
 test('an image reaches a receiver through a blind mirror after the sender has gone', async t => {
@@ -150,7 +155,7 @@ test('an image reaches a receiver through a blind mirror after the sender has go
   assert.equal(receiverCore.writable, false)
   const unlinkReceiver = link(mirror, receiver.store)
   const blocks = []
-  const fetched = await mediaBlobs.fetch(receiverCore, descriptor, { onBlock: index => blocks.push(index) })
+  const fetched = await mediaBlobs.download(receiverCore, descriptor, { onBlock: index => blocks.push(index) }).bytes
   assert.ok(b4a.equals(fetched, image))
   assert.equal(mediaId(fetched), mediaId(image))
   assert.deepEqual(blocks.sort((a, b) => a - b), [1, 2, 3, 4, 5], 'one progress callback per block in the range')
@@ -162,7 +167,7 @@ test('an image reaches a receiver through a blind mirror after the sender has go
   await receiverCore.close()
 })
 
-test('openRemoteMediaCore refuses non-participants, malformed keys and our own writer', async t => {
+test('openRemoteMediaCore refuses non-participants, malformed keys, our own writers and replicated message logs', async t => {
   const m = await manager(t, alice, bob)
   const own = await m.getOrCreateLocalMediaCore(CONV)
   const ownKey = b4a.toString(own.key, 'hex')
@@ -170,4 +175,12 @@ test('openRemoteMediaCore refuses non-participants, malformed keys and our own w
   await assert.rejects(m.openRemoteMediaCore(CONV, hex(bob), 'not-a-key'), /invalid key/)
   await assert.rejects(m.openRemoteMediaCore(CONV, hex(bob), ownKey), /local writer/)
   assert.equal(own.closed, false, 'rejecting a session must not close the writer it belongs to')
+
+  const ownLog = await m.getOrCreateLocalCore(CONV)
+  await assert.rejects(m.openRemoteMediaCore(CONV, hex(bob), b4a.toString(ownLog.key, 'hex')), /message core/)
+  const bobLog = crypto.keyPair()
+  m.setRemoteMessageSink(async () => {})
+  await m.openRemoteCore(CONV, hex(bob), b4a.toString(bobLog.publicKey, 'hex'))
+  await assert.rejects(m.openRemoteMediaCore(CONV, hex(bob), b4a.toString(bobLog.publicKey, 'hex').toUpperCase()), /message core/,
+    'a descriptor cannot point a fetch, and its clear, at a peer log we replicate')
 })

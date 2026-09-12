@@ -1,7 +1,7 @@
 /**
  * Media bytes as consecutive blocks of a conversation's media Hypercore.
  *
- * put() appends one image and returns where it landed; fetch() pulls that
+ * put() appends one image and returns where it landed; download() pulls that
  * range back out of a core the blind peer replicated. Both are plain
  * functions over a core session: authorization, key derivation and mirror
  * registration stay in hypercore-manager / p2p-manager.
@@ -56,25 +56,32 @@ async function put (core, bytes) {
 /**
  * Download blocks [offset, offset + n) and return them as one buffer.
  *
- * Rejects with code MEDIA_RANGE_INVALID when the range or the bytes behind it
- * cannot be an image (never retried), MEDIA_FETCH_TIMEOUT when no block
- * arrives for timeoutMs, and MEDIA_FETCH_CANCELLED when the session is closed
- * underneath it — closing the session is how a caller cancels.
+ * Returns `bytes`, which rejects with code MEDIA_RANGE_INVALID when the range
+ * or the bytes behind it cannot be an image (never retried),
+ * MEDIA_FETCH_TIMEOUT when no block arrives for timeoutMs, and
+ * MEDIA_FETCH_CANCELLED after `cancel()` or when the session closes
+ * underneath it. The session stays open in every case, so the caller can
+ * clear whatever landed and close it on one path.
  */
-async function fetch (core, range, { onBlock = null, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS } = {}) {
-  if (!isValidRange(range)) throw mediaError('MEDIA_RANGE_INVALID', 'invalid media block range')
+function download (core, range, { onBlock = null, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS } = {}) {
+  if (!isValidRange(range)) {
+    const bytes = Promise.reject(mediaError('MEDIA_RANGE_INVALID', 'invalid media block range'))
+    bytes.catch(() => {})
+    return { bytes, cancel () {} }
+  }
   const { offset, n, byteLength } = range
   const end = offset + n
 
-  const download = core.download({ start: offset, end })
+  const pending = core.download({ start: offset, end })
   let timer = null
   let timedOut = false
   let oversized = false
+  let cancelled = false
   const arm = () => {
     if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
       timedOut = true
-      download.destroy()
+      pending.destroy()
     }, timeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
   }
@@ -82,37 +89,47 @@ async function fetch (core, range, { onBlock = null, timeoutMs = DEFAULT_FETCH_T
     if (index < offset || index >= end) return
     if (blockBytes > MEDIA_BLOCK_SIZE) {
       oversized = true
-      download.destroy()
+      pending.destroy()
       return
     }
     arm()
-    if (onBlock) onBlock(index)
+    if (onBlock && !cancelled) onBlock(index)
   }
 
-  core.on('download', onDownload)
-  arm()
-  let complete
-  try {
-    complete = await download.done()
-  } finally {
-    clearTimeout(timer)
-    core.off('download', onDownload)
-  }
+  const bytes = (async () => {
+    core.on('download', onDownload)
+    arm()
+    let complete
+    try {
+      complete = await pending.done()
+    } finally {
+      clearTimeout(timer)
+      core.off('download', onDownload)
+    }
 
-  if (oversized) throw mediaError('MEDIA_RANGE_INVALID', 'media block larger than MEDIA_BLOCK_SIZE')
-  if (!complete) {
-    if (timedOut) throw mediaError('MEDIA_FETCH_TIMEOUT', 'no media block arrived for ' + timeoutMs + 'ms')
-    throw mediaError('MEDIA_FETCH_CANCELLED', 'media fetch cancelled')
-  }
-  if (end > core.length) throw mediaError('MEDIA_RANGE_INVALID', 'media block range past the end of the core')
+    if (oversized) throw mediaError('MEDIA_RANGE_INVALID', 'media block larger than MEDIA_BLOCK_SIZE')
+    if (!complete) {
+      if (timedOut) throw mediaError('MEDIA_FETCH_TIMEOUT', 'no media block arrived for ' + timeoutMs + 'ms')
+      throw mediaError('MEDIA_FETCH_CANCELLED', 'media fetch cancelled')
+    }
+    if (end > core.length) throw mediaError('MEDIA_RANGE_INVALID', 'media block range past the end of the core')
 
-  const blocks = []
-  for (let index = offset; index < end; index++) blocks.push(await core.get(index))
-  const bytes = b4a.concat(blocks)
-  if (bytes.length > config.MEDIA_MAX_BYTES || (byteLength != null && bytes.length !== byteLength)) {
-    throw mediaError('MEDIA_RANGE_INVALID', 'media bytes do not match the descriptor')
+    const blocks = []
+    for (let index = offset; index < end; index++) blocks.push(await core.get(index))
+    const assembled = b4a.concat(blocks)
+    if (assembled.length > config.MEDIA_MAX_BYTES || (byteLength != null && assembled.length !== byteLength)) {
+      throw mediaError('MEDIA_RANGE_INVALID', 'media bytes do not match the descriptor')
+    }
+    return assembled
+  })()
+
+  return {
+    bytes,
+    cancel () {
+      cancelled = true
+      pending.destroy()
+    }
   }
-  return bytes
 }
 
-module.exports = { MEDIA_BLOCK_SIZE, MAX_MEDIA_BLOCKS, isValidRange, put, fetch }
+module.exports = { MEDIA_BLOCK_SIZE, MAX_MEDIA_BLOCKS, isValidRange, put, download }

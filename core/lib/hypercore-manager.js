@@ -279,21 +279,35 @@ class HypercoreManager extends EventEmitter {
     if (!this._ready) throw new Error('HypercoreManager not initialized')
     this._assertRemoteCoreAuthorized(conversationId, peerKeyHex)
     if (!/^[0-9a-f]{64}$/i.test(coreKeyHex || '')) throw new Error('remote media core rejected: invalid key')
+    const normalizedCoreKey = coreKeyHex.toLowerCase()
+    // A fetch clears its range afterwards, so a descriptor must never name a
+    // message core: neither one of our writers nor a peer's log we replicate.
+    if (this._isMessageCoreKey(normalizedCoreKey)) throw new Error('remote media core rejected: message core')
 
     const encKey = this.deriveEncryptionKey(conversationId)
     const core = this.store.get({
-      key: b4a.from(coreKeyHex.toLowerCase(), 'hex'),
+      key: b4a.from(normalizedCoreKey, 'hex'),
       encryptionKey: encKey,
       valueEncoding: 'binary'
     })
     await core.ready()
-    // A descriptor naming one of our own writers would let a peer make us
-    // clear our own blocks after the fetch.
     if (core.writable) {
       await core.close()
       throw new Error('remote media core rejected: local writer')
     }
     return core
+  }
+
+  _isMessageCoreKey (coreKeyHex) {
+    for (const core of this.localCores.values()) {
+      if (b4a.toString(core.key, 'hex') === coreKeyHex) return true
+    }
+    for (const keyMap of this._coreKeyIndex.values()) {
+      for (const remoteKey of keyMap.values()) {
+        if ((remoteKey || '').toLowerCase() === coreKeyHex) return true
+      }
+    }
+    return false
   }
 
   /**
