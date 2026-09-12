@@ -5,6 +5,9 @@
  * byte stream. Each message is a single JSON object followed by '\n'.
  */
 
+const { deriveGroupChatTopic } = require('./rooms')
+const { normalizePeerRecord } = require('./peer-record')
+
 const fs = require('bare-fs')
 const bareIpc = require('bare-ipc')
 const crypto = require('hypercore-crypto')
@@ -81,6 +84,27 @@ class IPCHandler {
     this.p2pManager.on('group_member_added', (data, senderPeerId) => {
       this._handleGroupMemberAdded(data, senderPeerId)
     })
+  }
+
+  _conversationForGroupTopic(topic) {
+    if (!topic) return null
+    // Restore can drain a core before its swarm topic has been joined.
+    for (const conv of this.chatStore.conversations.values()) {
+      if (conv.type === 'group' && conv.groupId &&
+          b4a.toString(deriveGroupChatTopic(conv.groupId), 'hex') === topic) return conv.id
+    }
+    return this.p2pManager.groupTopicToConversation.get(topic) || null
+  }
+
+  async handlePeerControl(record, peer) {
+    const handlers = {
+      direct_invite: '_handleDirectInvite', group_invite: '_handleGroupInvite',
+      group_leave: '_handleGroupLeave', group_deleted: '_handleGroupDeleted',
+      group_renamed: '_handleGroupRenamed', group_member_added: '_handleGroupMemberAdded'
+    }
+    const method = handlers[record.type]
+    if (!method) return
+    if (await this[method](record, peer, { waitForDrain: false }) === false) throw new Error('Peer control persistence failed')
   }
 
   setupMessageHandler() {
@@ -618,6 +642,7 @@ class IPCHandler {
    */
   _enrichConversation(conversation) {
     const enriched = { ...conversation }
+    delete enriched.appliedControls
     if (enriched.type === 'group') {
       enriched.isOwner = enriched.creatorKey === this.identity.publicKeyHex
     }
@@ -698,6 +723,10 @@ class IPCHandler {
   async _handleDirectInvite(inviteData, senderPeerId) {
     let failed = false
     try {
+      try { inviteData = normalizePeerRecord({ ...inviteData, type: 'direct_invite' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { conversationId, senderDisplayName } = inviteData
       // Normalize senderKey: strip 0x prefix and lowercase for consistent hashing
       const senderKey = (inviteData.senderKey || '').toLowerCase().replace(/^0x/, '')
@@ -829,6 +858,10 @@ class IPCHandler {
   async _handleGroupInvite(inviteData, senderPeerId) {
     let failed = false
     try {
+      try { inviteData = normalizePeerRecord({ ...inviteData, type: 'group_invite' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { groupId, groupName, participants } = inviteData
       const myKey = this.identity.publicKeyHex
 
@@ -876,14 +909,31 @@ class IPCHandler {
         return true // rejected: terminal, nothing to retry
       }
 
+      const existing = [...this.chatStore.conversations.values()].find(conv =>
+        conv.type === 'group' && conv.groupId === groupId.toLowerCase())
+      if (existing && ((existing.creatorKey || '').toLowerCase() !== authenticatedPeer ||
+          !this._isConversationParticipant(existing, authenticatedPeer) ||
+          this.chatStore.hasLeftConversation(existing.id))) return true
+
       // Other participants (excluding self) become the conversation's participantIds
-      const otherParticipants = [...new Set(normalizedParticipants.filter(k => k !== myKey.toLowerCase()))]
+      const otherParticipants = [...new Set([...(existing ? existing.participantIds : []),
+        ...normalizedParticipants.filter(k => k !== myKey.toLowerCase())])]
+
+      const metadataChanged = !existing ||
+        otherParticipants.some(key => !existing.participantIds.includes(key)) ||
+        (groupName && groupName !== existing.displayName)
 
       // Create conversation (dedup by groupId prevents duplicates)
       const conversation = await this.chatStore.createConversation('group', otherParticipants, {
         groupId: groupId.toLowerCase(),
         creatorKey
       })
+
+      // Recheck after the await: another invite may have created this group.
+      if (conversation.creatorKey !== creatorKey) return true
+      if (existing) {
+        await this.chatStore.updateConversation(conversation.id, { participantIds: otherParticipants })
+      }
 
       // Set group name
       if (groupName) {
@@ -905,7 +955,7 @@ class IPCHandler {
       }
 
       // Notify Swift/Kotlin UI about the new group
-      this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
+      if (metadataChanged) this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
       diag('Accepted group invite with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
     } catch (error) {
@@ -1008,8 +1058,12 @@ class IPCHandler {
   /**
    * Handle a remote peer leaving a group
    */
-  async _handleGroupLeave(data, senderPeerId) {
+  async _handleGroupLeave(data, senderPeerId, closeOptions = {}) {
     try {
+      try { data = normalizePeerRecord({ ...data, type: 'group_leave' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { groupTopicHex } = data
       // A peer may only remove itself. The wire leaverKey field is ignored —
       // honoring it let any connected peer evict arbitrary members.
@@ -1019,7 +1073,7 @@ class IPCHandler {
       // Find the conversation by groupTopicHex
       let conversationId = null
       if (groupTopicHex) {
-        conversationId = this.p2pManager.groupTopicToConversation.get(groupTopicHex)
+        conversationId = this._conversationForGroupTopic(groupTopicHex)
       }
       if (!conversationId) return
 
@@ -1041,7 +1095,7 @@ class IPCHandler {
         this.p2pManager.removeGroupParticipant(conversationId, leaverHex)
       }
       if (this.hypercoreManager) {
-        await this.hypercoreManager.removeRemoteCore(conversationId, leaverHex)
+        await this.hypercoreManager.removeRemoteCore(conversationId, leaverHex, closeOptions)
       }
       if (this.blindMirror && typeof this.blindMirror.removeRemoteCore === 'function') {
         this.blindMirror.removeRemoteCore(conversationId, leaverHex)
@@ -1056,6 +1110,7 @@ class IPCHandler {
       diag('Peer ' + leaverHex.substring(0, 12) + ' left group ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group leave: ' + (error.stack || error.message || error))
+      return false
     }
   }
 
@@ -1064,15 +1119,19 @@ class IPCHandler {
    */
   async _handleGroupRenamed(data, senderPeerId) {
     try {
+      try { data = normalizePeerRecord({ ...data, type: 'group_renamed' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { groupTopicHex, conversationId: wireConversationId, newName } = data
       // Prefer the topic-derived id; a wire-supplied conversationId is only a
       // fallback and still has to pass the checks below (group + participant),
       // or any peer could rename arbitrary conversations, DMs included.
       let conversationId = null
       if (groupTopicHex) {
-        conversationId = this.p2pManager.groupTopicToConversation.get(groupTopicHex)
+        conversationId = this._conversationForGroupTopic(groupTopicHex)
       }
-      if (!conversationId) conversationId = wireConversationId
+      if (!groupTopicHex) conversationId = wireConversationId
       if (!conversationId || !newName) return
       const conversation = await this.chatStore.getConversation(conversationId)
       if (!conversation || conversation.type !== 'group') return
@@ -1080,11 +1139,13 @@ class IPCHandler {
         diag('Rejecting group_renamed from non-participant ' + (senderPeerId || '').substring(0, 12))
         return
       }
+      if (conversation.displayName === newName) return
       await this.chatStore.updateConversation(conversationId, { displayName: newName })
       this.pushEvent('conversation.group_renamed', { conversationId, newName })
       diag('Group renamed: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group renamed: ' + (error.stack || error.message || error))
+      return false
     }
   }
 
@@ -1097,7 +1158,6 @@ class IPCHandler {
   _isConversationParticipant(conversation, peerKeyHex) {
     const peer = (peerKeyHex || '').toLowerCase()
     if (!peer) return false
-    if ((conversation.creatorKey || '').toLowerCase() === peer) return true
     return (conversation.participantIds || []).some(k => (k || '').toLowerCase() === peer)
   }
 
@@ -1106,14 +1166,19 @@ class IPCHandler {
    */
   async _handleGroupMemberAdded(data, senderPeerId) {
     try {
+      try { data = normalizePeerRecord({ ...data, type: 'group_member_added' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { groupTopicHex, newMemberKey, newMemberName, updatedParticipants } = data
       const conversationId = groupTopicHex
-        ? this.p2pManager.groupTopicToConversation.get(groupTopicHex)
+        ? this._conversationForGroupTopic(groupTopicHex)
         : null
       if (!conversationId) return
       const conversation = await this.chatStore.getConversation(conversationId)
       if (!conversation) return
-      if ((conversation.creatorKey || '').toLowerCase() !== (senderPeerId || '').toLowerCase()) {
+      if (!this._isConversationParticipant(conversation, senderPeerId) ||
+          (conversation.creatorKey || '').toLowerCase() !== (senderPeerId || '').toLowerCase()) {
         diag('Rejecting group_member_added from non-owner ' + (senderPeerId || '').substring(0, 12))
         return
       }
@@ -1133,6 +1198,8 @@ class IPCHandler {
         if (key !== myKey.toLowerCase()) merged.add(key)
       }
       const others = [...merged]
+      if (others.length === conversation.participantIds.length &&
+          others.every(key => conversation.participantIds.includes(key))) return
       await this.chatStore.updateConversation(conversationId, { participantIds: others })
       if (updatedParticipants) {
         await this.p2pManager.joinGroupConversation(conversationId, conversation.groupId, [myKey, ...others])
@@ -1145,20 +1212,25 @@ class IPCHandler {
       diag('New member added to group: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group member added: ' + (error.stack || error.message || error))
+      return false
     }
   }
 
   /**
    * Handle a remote group deletion (owner deleted the group)
    */
-  async _handleGroupDeleted(data, senderPeerId) {
+  async _handleGroupDeleted(data, senderPeerId, closeOptions = {}) {
     try {
+      try { data = normalizePeerRecord({ ...data, type: 'group_deleted' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
       const { groupTopicHex } = data
 
       // Find the conversation by groupTopicHex
       let conversationId = null
       if (groupTopicHex) {
-        conversationId = this.p2pManager.groupTopicToConversation.get(groupTopicHex)
+        conversationId = this._conversationForGroupTopic(groupTopicHex)
       }
       if (!conversationId) return
 
@@ -1166,7 +1238,8 @@ class IPCHandler {
       if (!conversation) return
 
       // Only the group owner may delete the group for everyone.
-      if ((conversation.creatorKey || '').toLowerCase() !== (senderPeerId || '').toLowerCase()) {
+      if (!this._isConversationParticipant(conversation, senderPeerId) ||
+          (conversation.creatorKey || '').toLowerCase() !== (senderPeerId || '').toLowerCase()) {
         diag('Rejecting group_deleted from non-owner ' + (senderPeerId || '').substring(0, 12))
         return
       }
@@ -1174,9 +1247,9 @@ class IPCHandler {
       const displayName = conversation.displayName
 
       // Disconnect and delete locally
-      await this.p2pManager.leaveConversation(conversationId)
       await this.chatStore.deleteConversation(conversationId)
-      if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
+      await this.p2pManager.leaveConversation(conversationId)
+      if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId, closeOptions)
       if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
       // Notify Swift/Kotlin UI
@@ -1188,6 +1261,7 @@ class IPCHandler {
       diag('Group deleted by owner: ' + conversationId.substring(0, 12))
     } catch (error) {
       diag('Failed to handle group deleted: ' + (error.stack || error.message || error))
+      return false
     }
   }
 

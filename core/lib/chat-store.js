@@ -12,6 +12,8 @@ const b4a = require('b4a')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { createDiagnosticLogger } = require('./diagnostics')
 
+const { deriveGroupChatTopic } = require('./rooms')
+const { validateMessage } = require('./peer-record')
 const diag = createDiagnosticLogger('CHAT')
 
 const MAX_PLATFORM_INT = 0x7fffffff
@@ -82,23 +84,44 @@ function insertionIndex (messages, message) {
 // arrive before the app opens a room on an upgraded device, and binary insert,
 // positional receipt cutoffs and newest-message lookups all require the legacy
 // file to be ordered already.
-function readNormalizedMessages (messagesPath, { strict = false } = {}) {
+function readNormalizedMessages (messagesPath, { strict = true } = {}) {
   const stored = readJSON(messagesPath)
   if (strict && stored === null && fileExists(messagesPath)) {
     throw new Error('Message store is unreadable')
   }
+  if (stored !== null && !Array.isArray(stored)) throw new Error('Message store is not an array')
   const raw = stored || []
   const seen = new Set()
   const messages = []
   const receivedAt = Date.now()
   let healed = false
 
-  for (const message of raw) {
+  for (const rawMessage of raw) {
+    try {
+      validateMessage(rawMessage)
+    } catch (err) {
+      if (err.code !== 'INVALID_PEER_RECORD') throw err
+      healed = true
+      continue
+    }
+    // Normalize a copy so a repair backup retains the original field values.
+    const message = { ...rawMessage }
     if (message && message.id) {
       if (seen.has(message.id)) continue
       seen.add(message.id)
     }
     if (message) {
+      for (const field of ['mediaSize', 'mediaWidth', 'mediaHeight']) {
+        const normalized = normalizePeerInteger(message[field])
+        if (message[field] != null && normalized !== message[field]) {
+          message[field] = normalized
+          healed = true
+        }
+      }
+      if (message.thumbnailData != null) {
+        const thumbnail = normalizeThumbnailData(message.thumbnailData)
+        if (thumbnail !== message.thumbnailData) { message.thumbnailData = thumbnail; healed = true }
+      }
       const timestamp = normalizeMessageTimestamp(message.timestamp, receivedAt)
       if (timestamp !== message.timestamp) {
         message.timestamp = timestamp
@@ -113,7 +136,12 @@ function readNormalizedMessages (messagesPath, { strict = false } = {}) {
     messages.sort((a, b) => messageTime(a) - messageTime(b))
     healed = true
   }
-  if (healed) writeJSON(messagesPath, messages)
+  if (healed) {
+    // Keep the original history for recovery/inspection before removing poison.
+    const backup = messagesPath + '.pre-validation.bak'
+    if (!fileExists(backup)) writeJSON(backup, raw)
+    writeJSON(messagesPath, messages)
+  }
   return messages
 }
 
@@ -321,12 +349,15 @@ class ChatStore {
       createdAt: Date.now()
     }
 
-    this.conversations.set(conversationId, conversation)
-    this.saveConversationsIndex()
-
-    // Create message file
+    // Initialize history first; a failed index write must not leave an in-memory
+    // conversation that a retry mistakes for a durable creation.
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    writeJSON(messagesPath, [])
+    if (!fileExists(messagesPath)) writeJSON(messagesPath, [])
+    this.conversations.set(conversationId, conversation)
+    try { this.saveConversationsIndex() } catch (err) {
+      this.conversations.delete(conversationId)
+      throw err
+    }
 
     return conversation
   }
@@ -361,6 +392,7 @@ class ChatStore {
   async updateConversation(conversationId, updates) {
     const conv = this.conversations.get(conversationId)
     if (!conv) return null
+    const previous = { ...conv }
     // Allowlist: only permit known safe fields to be updated
     const allowedFields = ['displayName', 'lastMessage', 'lastMessageTimestamp', 'participantIds', 'groupId', 'creatorKey', 'localCoreKey', 'remoteCoreKeys']
     for (const key of allowedFields) {
@@ -368,7 +400,11 @@ class ChatStore {
         conv[key] = updates[key]
       }
     }
-    this.saveConversationsIndex()
+    try { this.saveConversationsIndex() } catch (err) {
+      Object.keys(conv).forEach(key => delete conv[key])
+      Object.assign(conv, previous)
+      throw err
+    }
     return conv
   }
 
@@ -382,7 +418,10 @@ class ChatStore {
     if (!conv) return false
 
     this.conversations.delete(conversationId)
-    this.saveConversationsIndex()
+    try { this.saveConversationsIndex() } catch (err) {
+      this.conversations.set(conversationId, conv)
+      throw err
+    }
 
     // Remove message file
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
@@ -405,6 +444,7 @@ class ChatStore {
    * @returns {Object} Created message
    */
   async addMessage(conversationId, messageData) {
+    validateMessage(messageData)
     const conversation = this.conversations.get(conversationId)
     if (!conversation) {
       throw new Error('Conversation not found')
@@ -424,6 +464,9 @@ class ChatStore {
       timestamp: normalizeMessageTimestamp(messageData.timestamp, receivedAt),
       isFromMe: messageData.isFromMe || false,
       mediaId: messageData.mediaId || null,
+      // Only this local send boundary or verified incoming bytes may grant
+      // sharing. A peer-authored hash reference is not proof of possession.
+      mediaAuthorized: !!(messageData.mediaId && messageData.isFromMe === true),
       // These values can originate on a remote peer. Keep the persisted wire
       // record inside the common Kotlin/Swift Int range so malformed media
       // metadata cannot poison every later message.list response.
@@ -444,13 +487,15 @@ class ChatStore {
 
     // Load existing messages
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    let messages = readNormalizedMessages(messagesPath)
+    let messages = readNormalizedMessages(messagesPath, { strict: true })
 
     // Dedup: same message can arrive via the live socket AND the per-peer
     // Hypercore (blind-peer replication). Returning null lets callers
     // suppress the duplicate IPC `message.received` event so the UI's
     // LazyColumn doesn't see two items with the same key.
     if (message.id && messages.some(m => m.id === message.id)) {
+      // A previous attempt may have committed the row but failed its index write.
+      this._saveMessagePreview(conversation, messages)
       return null
     }
 
@@ -484,10 +529,11 @@ class ChatStore {
       this._mediaIndex.get(message.mediaId).add(conversationId)
     }
 
-    // The preview reflects the chronologically newest message — not necessarily
-    // the one just inserted, when that one arrived late. Otherwise a catch-up
-    // insert overwrites the conversation-list row with stale content and drags
-    // its sort position backwards.
+    this._saveMessagePreview(conversation, messages)
+    return message
+  }
+
+  _saveMessagePreview(conversation, messages) {
     const newest = messages[messages.length - 1]
     const ct = newest.contentType || 'text/plain'
     if (ct.startsWith('image/gif')) {
@@ -501,8 +547,67 @@ class ChatStore {
     }
     conversation.lastMessageTimestamp = newest.timestamp
     this.saveConversationsIndex()
+  }
 
-    return message
+  conversationForGroupTopic(topic) {
+    for (const conv of this.conversations.values()) {
+      if (conv.type === 'group' && !this.hasLeftConversation(conv.id) &&
+          b4a.toString(deriveGroupChatTopic(conv.groupId), 'hex') === topic) return conv.id
+    }
+    return null
+  }
+
+  isPeerAuthorized(conversationId, peer) {
+    const conv = this.conversations.get(conversationId)
+    if (!conv || this.hasLeftConversation(conversationId)) return false
+    return (conv.participantIds || []).some(k => k.toLowerCase() === peer.toLowerCase())
+  }
+
+  canServeMedia(mediaId, peer) {
+    // Scan persisted references too: the runtime media index is only a cache.
+    for (const conv of this.conversations.values()) {
+      if (!this.isPeerAuthorized(conv.id, peer)) continue
+      const messages = readNormalizedMessages(path.join(this.storagePath, conv.id + '.json'), { strict: true })
+      if (messages.some(m => m.mediaId === mediaId && m.mediaAuthorized === true)) return true
+    }
+    return false
+  }
+
+  hasAuthorizedMediaReference(conversationId, mediaId) {
+    if (!this.conversations.has(conversationId) || this.hasLeftConversation(conversationId)) return false
+    const messages = readNormalizedMessages(path.join(this.storagePath, conversationId + '.json'), { strict: true })
+    return messages.some(m => m.mediaId === mediaId && m.mediaAuthorized === true)
+  }
+
+  authorizeReceivedMedia(conversationId, mediaId) {
+    if (!this.conversations.has(conversationId) || this.hasLeftConversation(conversationId)) return false
+    const messagesPath = path.join(this.storagePath, conversationId + '.json')
+    const messages = readNormalizedMessages(messagesPath, { strict: true })
+    let changed = false
+    for (const message of messages) {
+      if (message.mediaId === mediaId && message.mediaAuthorized !== true) {
+        message.mediaAuthorized = true
+        changed = true
+      }
+    }
+    if (changed) writeJSON(messagesPath, messages)
+    return changed
+  }
+
+  hasAppliedControl(conversationId, key) {
+    const conv = this.conversations.get(conversationId)
+    return !!(conv && (conv.appliedControls || []).includes(key))
+  }
+
+  markControlApplied(conversationId, key) {
+    const conv = this.conversations.get(conversationId)
+    if (!conv) return
+    const previous = conv.appliedControls
+    conv.appliedControls = [...new Set([...(previous || []), key])].slice(-5000)
+    try { this.saveConversationsIndex() } catch (err) {
+      conv.appliedControls = previous
+      throw err
+    }
   }
 
   /**
@@ -746,7 +851,7 @@ class ChatStore {
     if (!conversationId || !messageId) return null
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
     try {
-      const raw = readJSON(messagesPath) || []
+      const raw = readNormalizedMessages(messagesPath)
       for (const m of raw) {
         if (m && m.id === messageId) return m.thumbnailData || null
       }

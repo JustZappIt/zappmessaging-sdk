@@ -629,9 +629,9 @@ test('_peerMayAnnounceCore only allows verified participants', () => {
   assert.strictEqual(runtimeManager._peerMayAnnounceCore('conv-live', peer), true)
   assert.strictEqual(runtimeManager._peerMayAnnounceCore('conv-live', stranger), false)
 
-  // Via live group membership
+  // Group runtime caches alone cannot authorize membership
   runtimeManager.groupConversations.set('group-1', { participantKeys: [peer], connections: new Map() })
-  assert.strictEqual(runtimeManager._peerMayAnnounceCore('group-1', peer), true)
+  assert.strictEqual(runtimeManager._peerMayAnnounceCore('group-1', peer), false)
   assert.strictEqual(runtimeManager._peerMayAnnounceCore('group-1', stranger), false)
 
   const manager = new P2PManager({

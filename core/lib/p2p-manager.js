@@ -5,6 +5,8 @@
  * Supports direct chats and group chats.
  */
 
+const { normalizePeerRecord } = require('./peer-record')
+
 const Hyperswarm = require('hyperswarm')
 const crypto = require('hypercore-crypto')
 const HypercoreId = require('hypercore-id-encoding')
@@ -101,6 +103,10 @@ class P2PManager extends EventEmitter {
     // that exist on disk but have not been joined at runtime yet (cold
     // start). Null in stub setups — runtime maps still gate then.
     this._isParticipant = opts.isParticipant || null
+    this._getConversation = opts.getConversation || null
+    this._resolveGroupTopic = opts.resolveGroupTopic || null
+    this._peerRecordSink = null
+    this._mayServeMedia = opts.mayServeMedia || null
 
     // Direct conversations: conversationId -> { peers: Map<peerKeyHex, { topic, topicHex, discovery, connections: [socket] }> }
     this.conversations = new Map()
@@ -214,9 +220,39 @@ class P2PManager extends EventEmitter {
 
     const direct = this.peerToConversation.get(peerKeyHex)
     if (direct && direct.conversationId === conversationId) return true
-    const group = this.groupConversations.get(conversationId)
-    if (group && group.participantKeys.includes(peerKeyHex)) return true
+    // A group cache alone cannot authorize access.
     return false
+  }
+
+  setPeerRecordSink(fn) { this._peerRecordSink = fn }
+
+  groupTopic(conversationId) {
+    const conv = this._getConversation && this._getConversation(conversationId)
+    if (conv && conv.type === 'group') return b4a.toString(deriveGroupChatTopic(conv.groupId), 'hex')
+    return this.groupConversations.get(conversationId)?.groupTopicHex || null
+  }
+
+  resolveWireConversation(wireId) {
+    const byTopic = (this._resolveGroupTopic && this._resolveGroupTopic(wireId)) || this.groupTopicToConversation.get(wireId)
+    if (byTopic) return byTopic
+    return wireId
+  }
+
+  _outgoingRecord(conversationId, message) {
+    const topic = this.groupTopic(conversationId)
+    const result = { ...message }
+    delete result.status
+    delete result.mediaLocalPath
+    delete result.mediaTransferState
+    delete result.mediaAuthorized
+    if (topic) {
+      result.groupTopicHex = topic
+      result.conversationId = topic
+    }
+    if (result.type && result.type.startsWith('group_') && !result.id) {
+      result.id = b4a.toString(crypto.randomBytes(16), 'hex')
+    }
+    return result
   }
 
   _peerMayAnnounceCore (conversationId, peerKeyHex) {
@@ -654,8 +690,8 @@ class P2PManager extends EventEmitter {
     }
     // Group conversations this peer belongs to
     for (const [convId, entry] of this.groupConversations) {
-      if (entry.participantKeys.includes(peerKeyHex) && allKeys[convId]) {
-        relevant[convId] = allKeys[convId]
+      if (this._peerMayAccessConversation(convId, peerKeyHex) && allKeys[convId]) {
+        relevant[entry.groupTopicHex] = allKeys[convId]
       }
     }
     if (Object.keys(relevant).length === 0) return
@@ -764,6 +800,7 @@ class P2PManager extends EventEmitter {
 
     if (conv.peers.has(peerPublicKeyHex)) {
       diag('joinConversation: already joined peer', peerPublicKeyHex.substring(0, 12))
+      this._announceGroupCoreKeys(conversationId)
       return true
     }
 
@@ -825,24 +862,28 @@ class P2PManager extends EventEmitter {
    * @returns {boolean} Success status
    */
   async joinGroupConversation(conversationId, groupId, allParticipantKeyHexes) {
+    if (!this._getConversation && !this._isParticipant) return false
+    if (this._getConversation) {
+      const stored = this._getConversation(conversationId)
+      if (!stored || stored.type !== 'group' || stored.groupId !== groupId) return false
+      const self = this.keyPair ? b4a.toString(this.keyPair.publicKey, 'hex') : null
+      allParticipantKeyHexes = [...new Set([self, ...stored.participantIds].filter(Boolean))]
+    } else if (this._isParticipant) {
+      allParticipantKeyHexes = allParticipantKeyHexes.filter(key => this._peerMayAccessConversation(conversationId, key))
+    }
     if (!this.swarm) {
       diag('joinGroupConversation: swarm not started!')
       return false
     }
 
     if (this.groupConversations.has(conversationId)) {
-      // Update participant list in case new members were added
       const existing = this.groupConversations.get(conversationId)
-      let added = 0
-      for (const key of allParticipantKeyHexes) {
-        if (!existing.participantKeys.includes(key)) {
-          existing.participantKeys.push(key)
-          added++
-        }
+      if (existing.groupId !== groupId) return false
+      existing.participantKeys = [...allParticipantKeyHexes]
+      for (const peer of existing.connections.keys()) {
+        if (!allParticipantKeyHexes.includes(peer)) existing.connections.delete(peer)
       }
-      if (added > 0) {
-        diag('joinGroupConversation: updated', added, 'new participant(s) for', conversationId.substring(0, 12))
-      }
+      this._announceGroupCoreKeys(conversationId)
       return true
     }
 
@@ -887,6 +928,7 @@ class P2PManager extends EventEmitter {
 
       await discovery.flushed()
       diag('Group topic announced to DHT')
+      this._announceGroupCoreKeys(conversationId)
 
       return true
     } catch (error) {
@@ -900,6 +942,14 @@ class P2PManager extends EventEmitter {
    * Works for both direct and group conversations.
    * @private
    */
+  _announceGroupCoreKeys(conversationId) {
+    for (const [peer, sockets] of this.allPeerConnections) {
+      if (!this._peerMayAccessConversation(conversationId, peer)) continue
+      const framed = this._firstLiveFramed(sockets)
+      if (framed) this._sendCoreKeys(framed, peer)
+    }
+  }
+
   _flushPendingMessages(conversationId, sockets) {
     const pending = this.pendingMessages.get(conversationId)
     if (!pending || pending.length === 0 || !sockets || sockets.length === 0) {
@@ -913,11 +963,15 @@ class P2PManager extends EventEmitter {
 
     for (const { message } of pending) {
       const payload = groupTopicHex
-        ? { groupTopicHex, ...message, conversationId }
+        ? { ...message, groupTopicHex, conversationId: groupTopicHex }
         : { ...message, conversationId }
       let delivered = false
 
       for (const socket of sockets) {
+        if (groupConv) {
+          const peer = socket.remotePublicKey && b4a.toString(socket.remotePublicKey, 'hex')
+          if (!peer || !this._peerMayAccessConversation(conversationId, peer)) continue
+        }
         const framed = this._liveFramed(socket)
         if (!framed) continue
         try {
@@ -1037,6 +1091,11 @@ class P2PManager extends EventEmitter {
     // Wrap raw socket in FramedSocket for proper message boundaries
     const framed = new FramedSocket(socket)
     this.framedSockets.set(socket, framed)
+    const writeChunk = framed.writeChunk.bind(framed)
+    framed.writeChunk = (...args) => {
+      if (this._mayServeMedia && !this._mayServeMedia(args[0], peerId)) return false
+      return writeChunk(...args)
+    }
 
     // Send any pending invites to this peer
     const pending = this.pendingInvites.get(peerId)
@@ -1073,7 +1132,7 @@ class P2PManager extends EventEmitter {
     // Find group conversations this peer belongs to
     const groupConvIds = []
     for (const [convId, entry] of this.groupConversations) {
-      if (entry.participantKeys.includes(peerId)) {
+      if (this._peerMayAccessConversation(convId, peerId)) {
         if (!entry.connections.has(peerId)) {
           entry.connections.set(peerId, [])
         }
@@ -1124,12 +1183,13 @@ class P2PManager extends EventEmitter {
     }
 
     // Handle incoming JSON messages via framed socket
-    framed.onMessage = (message) => {
+    framed.onMessage = async (message) => {
       try {
         // Rate limit check (H10)
         if (this._isRateLimited(peerId)) {
           return // silently drop; diag already logged
         }
+        message = normalizePeerRecord(message, peerId)
         // Core-key exchange: peer is announcing the public keys of its local
         // Hypercores. The conversationId set is attacker-controlled, so open
         // a remote core only for conversations this authenticated peer is a
@@ -1137,7 +1197,8 @@ class P2PManager extends EventEmitter {
         // register a core (and inject authored rows) into any other chat
         // whose id it can compute.
         if (message.type === '__core_keys' && message.cores) {
-          for (const [convId, coreKeyHex] of Object.entries(message.cores)) {
+          for (const [wireId, coreKeyHex] of Object.entries(message.cores)) {
+            const convId = this.resolveWireConversation(wireId)
             if (!this._peerMayAnnounceCore(convId, peerId)) {
               diag('Rejected __core_keys for ' + String(convId).substring(0, 12) +
                 ' from non-participant ' + peerId.substring(0, 12))
@@ -1153,14 +1214,13 @@ class P2PManager extends EventEmitter {
         // Bind receipts to a conversation shared with the authenticated peer.
         if (message.type === '__receipt') {
           const receiptLookup = this.peerToConversation.get(peerId)
-          const groupReceiptId = groupConvIds.includes(message.conversationId) &&
-            this._peerMayAccessConversation(message.conversationId, peerId)
-            ? message.conversationId
-            : null
-          const receiptConvId =
-            groupReceiptId || (receiptLookup && receiptLookup.conversationId) || directConversationId
-          if (!receiptConvId) return
-          this.emit('receipt', receiptConvId, message, peerId)
+          const wireId = message.groupTopicHex || message.conversationId
+          const mapped = wireId && this.resolveWireConversation(wireId)
+          // An explicit but unknown group route must never fall back into a DM.
+          const receiptConvId = mapped || (receiptLookup && receiptLookup.conversationId) || directConversationId
+          if (!receiptConvId || !this._peerMayAccessConversation(receiptConvId, peerId)) return
+          if (this._peerRecordSink) await this._peerRecordSink(receiptConvId, peerId, message)
+          else this.emit('receipt', receiptConvId, message, peerId)
           return
         }
 
@@ -1182,6 +1242,13 @@ class P2PManager extends EventEmitter {
               this.emit(evt, convId, peerId)
             }
           }
+          return
+        }
+
+        if (message.type && this._peerRecordSink) {
+          const wireId = message.groupTopicHex || message.conversationId
+          const convId = wireId ? this.resolveWireConversation(wireId) : null
+          await this._peerRecordSink(convId, peerId, message)
           return
         }
 
@@ -1238,7 +1305,9 @@ class P2PManager extends EventEmitter {
           if (convId && this._peerMayAccessConversation(convId, peerId)) {
             // HIGH-02: Deduplicate by message ID to prevent the same message
             // appearing twice (e.g. flushed from pending queue + live delivery).
-            if (!this._isDuplicateOrReplayed(convId, message)) {
+            if (this._peerRecordSink) {
+              await this._peerRecordSink(convId, peerId, message)
+            } else if (!this._isDuplicateOrReplayed(convId, message)) {
               this.emit('message', convId, message)
             }
           } else if (convId) {
@@ -1260,7 +1329,9 @@ class P2PManager extends EventEmitter {
           this._acceptWireConversationId(message.conversationId, peerId)
         if (convId) {
           // HIGH-02: Deduplicate by message ID
-          if (!this._isDuplicateOrReplayed(convId, message)) {
+          if (this._peerRecordSink) {
+            await this._peerRecordSink(convId, peerId, message)
+          } else if (!this._isDuplicateOrReplayed(convId, message)) {
             this.emit('message', convId, message)
           }
         }
@@ -1460,7 +1531,7 @@ class P2PManager extends EventEmitter {
    * @returns {boolean} true if written to a live peer socket, false otherwise
    */
   sendToConversation(conversationId, message, { notificationEligible = false } = {}) {
-    const outboundMessage = message && message.id && !message.type ? { ...message } : message
+    const outboundMessage = this._outgoingRecord(conversationId, message)
     if (outboundMessage !== message) delete outboundMessage.status
 
     // Mirror message into the conversation's writable Hypercore. Visible user
@@ -1505,7 +1576,7 @@ class P2PManager extends EventEmitter {
    * without overstating the durability boundary.
    */
   async sendToConversationDurably (conversationId, message, { notificationEligible = false } = {}) {
-    const outboundMessage = message && message.id && !message.type ? { ...message } : message
+    const outboundMessage = this._outgoingRecord(conversationId, message)
     if (outboundMessage !== message) delete outboundMessage.status
 
     const persistence = this.hypercoreManager
@@ -1668,7 +1739,7 @@ class P2PManager extends EventEmitter {
    * @param {string} upToMessageId - Newest of the sender's messages we've read
    */
   sendReadReceipt(conversationId, upToMessageId) {
-    const receipt = { type: '__receipt', kind: 'read', conversationId, upTo: upToMessageId }
+    const receipt = this._outgoingRecord(conversationId, { type: '__receipt', kind: 'read', conversationId, upTo: upToMessageId })
 
     if (this.hypercoreManager) {
       this.hypercoreManager.appendMessage(conversationId, receipt).catch((err) => {
@@ -1681,7 +1752,7 @@ class P2PManager extends EventEmitter {
 
   async sendDeliveryReceipt(conversationId, upToMessageId, senderId, opts = {}) {
     if (!senderId) return false
-    const receipt = { type: '__receipt', kind: 'delivered', conversationId, upTo: upToMessageId, to: senderId }
+    const receipt = this._outgoingRecord(conversationId, { type: '__receipt', kind: 'delivered', conversationId, upTo: upToMessageId, to: senderId })
     const requireDurable = opts.requireDurable === true
 
     if (this.hypercoreManager) {
@@ -1715,12 +1786,13 @@ class P2PManager extends EventEmitter {
     // Check group conversations first
     const groupConv = this.groupConversations.get(conversationId)
     if (groupConv) {
-      const payload = { groupTopicHex: groupConv.groupTopicHex, ...message }
+      const payload = { ...message, groupTopicHex: groupConv.groupTopicHex, conversationId: groupConv.groupTopicHex }
       let sent = false
       const sentPeers = new Set()
       let writeErrors = 0
 
       for (const [peerKeyHex, sockets] of groupConv.connections) {
+        if (!this._peerMayAccessConversation(conversationId, peerKeyHex)) continue
         const framed = this._firstLiveFramed(sockets)
         if (!framed) continue
         try {
@@ -1737,6 +1809,7 @@ class P2PManager extends EventEmitter {
       // Fallback: try allPeerConnections for unreached participants
       const myKey = this.keyPair ? b4a.toString(this.keyPair.publicKey, 'hex') : null
       for (const peerKeyHex of groupConv.participantKeys) {
+        if (!this._peerMayAccessConversation(conversationId, peerKeyHex)) continue
         if (peerKeyHex === myKey) continue
         if (sentPeers.has(peerKeyHex)) continue
 
@@ -1806,6 +1879,7 @@ class P2PManager extends EventEmitter {
     if (groupConv) {
       const reachedPeers = new Set()
       for (const [peerKeyHex, peerSockets] of groupConv.connections) {
+        if (!this._peerMayAccessConversation(conversationId, peerKeyHex)) continue
         for (const socket of peerSockets) {
           const framed = this._liveFramed(socket)
           if (framed) {
@@ -1818,6 +1892,7 @@ class P2PManager extends EventEmitter {
       // Fallback: try allPeerConnections for participants not reached via group topic
       const myKey = this.keyPair ? b4a.toString(this.keyPair.publicKey, 'hex') : null
       for (const peerKeyHex of groupConv.participantKeys) {
+        if (!this._peerMayAccessConversation(conversationId, peerKeyHex)) continue
         if (peerKeyHex === myKey) continue
         if (reachedPeers.has(peerKeyHex)) continue
 
