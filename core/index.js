@@ -237,7 +237,7 @@ async function initializeBlindMirror () {
   if (blindMirror && blindMirror.swarm !== p2pManager.swarm) {
     // In-flight image fetches are registered with the old relay session; they
     // start over once the new mirror is up.
-    mediaRequests.cancelFetches()
+    await mediaRequests.cancelFetches()
     try { await blindMirror.close() } catch (e) { diag('blindMirror close (rebuild): ' + e.message) }
     blindMirror = null
   }
@@ -678,7 +678,7 @@ async function initialize() {
 async function shutdown() {
   diag('Shutting down ZappMessaging Core...')
 
-  mediaRequests.cancelFetches()
+  await mediaRequests.cancelFetches()
   if (blindMirror) {
     try { await blindMirror.close() } catch (e) { diag('blindMirror close: ' + e.message) }
   }

@@ -110,7 +110,9 @@ const imageBytes = () => b4a.concat([b4a.from([0x89, 0x50, 0x4e, 0x47]), crypto.
 
 // Alice sends an image through the production handler; returns the stored
 // row, and a mirror store that replicated her media core before she left.
-async function sentByAlice (t, image) {
+// With `partial`, the mirror is missing the last block, so a receiver's fetch
+// lands every other block and then waits.
+async function sentByAlice (t, image, { partial = false } = {}) {
   const a = await phone(t, alice, bob)
   const prepared = await a.ipcHandler.handleMedia('prepare_send', { filePath: writeTemp(a.dir, image), extension: 'png' })
   const { message } = await a.ipcHandler.handleMedia('send_message', {
@@ -121,12 +123,19 @@ async function sentByAlice (t, image) {
   t.after(() => mirror.close())
   const mirrorCore = mirror.get({ key: b4a.from(message.mediaCoreKey, 'hex') })
   const unlink = link(a.hypercoreManager.store, mirror)
-  const pull = mirrorCore.download({ start: 0, end: -1 })
-  await until(() => mirrorCore.contiguousLength === message.mediaBlockOffset + message.mediaBlockLength)
-  pull.destroy()
+  const end = message.mediaBlockOffset + message.mediaBlockLength
+  await mirrorCore.download({ start: 0, end: partial ? end - 1 : end }).done()
   unlink()
   await a.hypercoreManager.close()
-  return { message, mirror, mirrorCore }
+  // Alice's phone comes back long enough for the relay to finish pulling.
+  const completeMirror = async () => {
+    const sender = new Corestore(path.join(a.dir, 'corestore'))
+    t.after(() => sender.close())
+    const unlinkSender = link(sender, mirror)
+    await mirrorCore.download({ start: 0, end }).done()
+    unlinkSender()
+  }
+  return { message, mirror, mirrorCore, completeMirror }
 }
 
 function writeTemp (dir, bytes) {
@@ -198,7 +207,7 @@ test('send_message appends the image to the media core and describes it on the r
   assert.equal(message.mediaBlockOffset, 0)
   assert.equal(message.mediaBlockLength, Math.ceil(image.length / mediaBlobs.MEDIA_BLOCK_SIZE))
   assert.equal(mediaCore.length, message.mediaBlockLength)
-  assert.ok(b4a.equals(await mediaBlobs.fetch(mediaCore, { offset: 0, n: mediaCore.length, byteLength: image.length }), image))
+  assert.ok(b4a.equals(await mediaBlobs.download(mediaCore, { offset: 0, n: mediaCore.length, byteLength: image.length }).bytes, image))
 
   const [row] = await a.chatStore.getMessages(CONV)
   assert.equal(row.mediaCoreKey, message.mediaCoreKey)
@@ -272,10 +281,24 @@ test('a record without a descriptor still only waits for the live path', async t
   assert.equal(b.events.filter(e => e.type.startsWith('media.')).length, 0)
 })
 
-test('a mirror without the blocks times out, counts an attempt and is retried on the next trigger', async t => {
+// Every block of the range must be gone: a receiver never keeps ciphertext.
+async function assertRangeCleared (phone, message) {
+  const core = await phone.hypercoreManager.openRemoteMediaCore(CONV, hex(alice), message.mediaCoreKey)
+  try {
+    for (let i = message.mediaBlockOffset; i < message.mediaBlockOffset + message.mediaBlockLength; i++) {
+      assert.equal(await core.has(i), false, 'block ' + i + ' was left behind')
+    }
+  } finally {
+    await core.close()
+  }
+}
+
+test('a mirror without the blocks times out, counts an attempt and retries by itself after the cooldown', async t => {
   const image = imageBytes()
   const { message, mirror } = await sentByAlice(t, image)
-  const b = await phone(t, bob, alice)
+  const b = await phone(t, bob, alice, { cooldownMs: 300 })
+  const keepAlive = setInterval(() => {}, 1000)
+  t.after(() => clearInterval(keepAlive))
 
   await b.receive(CONV, hex(alice), wire(message))
   const entry = b.mediaRequests.get(message.mediaId)
@@ -286,11 +309,52 @@ test('a mirror without the blocks times out, counts an attempt and is retried on
   assert.equal(b.events.filter(e => e.type === 'media.transfer_complete').length, 0)
   await until(() => b.mediaRequests._fetches.size === 0)
 
+  // The relay becomes reachable; no message, peer or mirror event follows.
   const unlink = link(mirror, b.hypercoreManager.store)
   t.after(unlink)
-  await sleep(5)
-  await b.mediaRequests.requestMissing(CONV)
-  assert.equal(b.mediaRequests._fetches.size, 1, 'the next trigger retries')
+  await until(() => b.events.some(e => e.type === 'media.transfer_complete'))
+  assert.equal(entry.mirrorAttempts, 1, 'the cooldown timer retried once and succeeded')
+  assert.ok(b4a.equals(b.mediaStore.getMedia(message.mediaId), image))
+})
+
+test('bytes that cannot be saved count as a failed mirror attempt instead of a refetch loop', async t => {
+  const image = imageBytes()
+  const { message, mirror } = await sentByAlice(t, image)
+  const b = await phone(t, bob, alice, { cooldownMs: 60000 })
+  const unlink = link(mirror, b.hypercoreManager.store)
+  t.after(unlink)
+  let opens = 0
+  const open = b.p2pManager.openRemoteMediaCore.bind(b.p2pManager)
+  b.p2pManager.openRemoteMediaCore = (...args) => { opens++; return open(...args) }
+  b.mediaStore.saveMediaWithHash = () => { throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }) }
+
+  await b.receive(CONV, hex(alice), wire(message))
+  const entry = b.mediaRequests.get(message.mediaId)
+  await until(() => entry.mirrorAttempts === 1)
+  await until(() => b.mediaRequests._fetches.size === 0)
+  await sleep(300)
+  assert.equal(opens, 1, 'the image was fetched once')
+  assert.equal(b.events.filter(e => e.type === 'media.transfer_complete').length, 0)
+  assert.equal(b.mediaRequests.get(message.mediaId), entry, 'the request stays for a later attempt')
+  assert.ok(entry.descriptor)
+  await assertRangeCleared(b, message)
+})
+
+test('the mirror coming up gives an image its attempts back', async t => {
+  const image = imageBytes()
+  const { message, mirror } = await sentByAlice(t, image)
+  const b = await phone(t, bob, alice)
+  const unlink = link(mirror, b.hypercoreManager.store)
+  t.after(unlink)
+
+  b.blindMirror.enabled = false
+  await b.receive(CONV, hex(alice), wire(message))
+  const entry = b.mediaRequests.get(message.mediaId)
+  assert.equal(b.mediaRequests._fetches.size, 0, 'no mirror, no fetch')
+  entry.mirrorAttempts = 12
+  b.blindMirror.enabled = true
+  await b.mediaRequests.requestMissingEverywhere()
+  assert.equal(entry.mirrorAttempts, 0)
   await until(() => b.events.some(e => e.type === 'media.transfer_complete'))
   assert.ok(b4a.equals(b.mediaStore.getMedia(message.mediaId), image))
 })
@@ -311,18 +375,20 @@ test('a descriptor whose bytes do not hash to the mediaId is dropped without tou
   assert.equal(b.mediaRequests.get(otherId), entry, 'the live request stays pending')
 })
 
-test('whichever source finishes first wins and the other is cancelled', async t => {
+test('whichever source finishes first wins, the other is cancelled and its blocks are cleared', async t => {
   const image = imageBytes()
-  const { message } = await sentByAlice(t, image)
+  const { message, mirror } = await sentByAlice(t, image, { partial: true })
   const b = await phone(t, bob, alice, { fetchTimeoutMs: 60000 })
   const keepAlive = setInterval(() => {}, 1000)
   t.after(() => clearInterval(keepAlive))
+  const unlink = link(mirror, b.hypercoreManager.store)
+  t.after(unlink)
 
   await b.receive(CONV, hex(alice), wire(message))
-  await until(() => b.mediaRequests._fetches.get(message.mediaId)?.core)
   const fetch = b.mediaRequests._fetches.get(message.mediaId)
+  // The mirror lands all but the last block; then the author's socket overtakes it.
+  await until(() => b.events.filter(e => e.type === 'media.transfer_progress').length === message.mediaBlockLength - 1)
 
-  // The author comes back and streams the bytes over the socket.
   const chunkSize = 64 * 1024
   const total = Math.ceil(image.length / chunkSize)
   const hash = b4a.from(message.mediaId, 'hex')
@@ -332,6 +398,35 @@ test('whichever source finishes first wins and the other is cancelled', async t 
   assert.equal(b.events.filter(e => e.type === 'media.transfer_complete').length, 1)
   assert.equal(b.mediaRequests._fetches.size, 0)
   assert.equal(fetch.cancelled, true)
-  await until(() => fetch.core.closed)
   assert.equal(b.mediaRequests.get(message.mediaId), undefined)
+  await fetch.settled
+  assert.equal(fetch.core.closed, true)
+  await assertRangeCleared(b, message)
+  assert.equal(b.events.filter(e => e.type === 'media.transfer_complete').length, 1)
+})
+
+test('cancelling every fetch clears and closes before resolving', async t => {
+  const image = imageBytes()
+  const { message, mirror, completeMirror } = await sentByAlice(t, image, { partial: true })
+  const b = await phone(t, bob, alice, { fetchTimeoutMs: 60000 })
+  const keepAlive = setInterval(() => {}, 1000)
+  t.after(() => clearInterval(keepAlive))
+  const unlink = link(mirror, b.hypercoreManager.store)
+  t.after(unlink)
+
+  await b.receive(CONV, hex(alice), wire(message))
+  const fetch = b.mediaRequests._fetches.get(message.mediaId)
+  await until(() => b.events.filter(e => e.type === 'media.transfer_progress').length === message.mediaBlockLength - 1)
+  await b.mediaRequests.cancelFetches()
+  assert.equal(fetch.core.closed, true)
+  assert.equal(b.mediaRequests._fetches.size, 0, 'nothing restarts until the mirror is back')
+  assert.ok(b.mediaRequests.get(message.mediaId).descriptor, 'the request survives for the next mirror')
+  await assertRangeCleared(b, message)
+
+  // The relay finishes pulling and the mirror comes back: the request
+  // finishes without any other trigger.
+  await completeMirror()
+  await b.mediaRequests.requestMissingEverywhere()
+  await until(() => b.events.some(e => e.type === 'media.transfer_complete'))
+  assert.ok(b4a.equals(b.mediaStore.getMedia(message.mediaId), image))
 })

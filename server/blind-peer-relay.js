@@ -61,7 +61,7 @@ async function main () {
     log: message => console.error(message)
   })
   await mailbox.listenHttp(httpPort, httpHost)
-  const retention = attachMediaRetention(blindPeer, {
+  const retention = await attachMediaRetention(blindPeer, {
     maxAgeMs: integer(process.env.MEDIA_RETENTION_MAX_AGE_MS, RETENTION.maxAgeMs),
     minIntervalMs: integer(process.env.MEDIA_RETENTION_MIN_INTERVAL_MS, RETENTION.minIntervalMs),
     log: message => console.error(message)

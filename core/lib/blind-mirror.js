@@ -39,7 +39,10 @@ const DEFAULT_NOTIFICATION_RETRY_DELAYS = [0, 1000, 3000]
 
 // The relay evicts lowest priority first when it runs out of space, and
 // server/media-retention.js clears priority-0 cores after a week: images go
-// before message history, and only images expire.
+// before message history, and only images expire. The relay keeps the
+// priority it first recorded for a core, so it also promotes every message
+// core whose owner registers it with announce requested — which is how local
+// message cores have always been registered, on every build.
 const MESSAGE_CORE_PRIORITY = 1
 const MEDIA_CORE_PRIORITY = 0
 
