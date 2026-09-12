@@ -2,8 +2,9 @@
 
 /**
  * The blind peer as Zapp deploys it: a Hypercore mirror, HyperDHT's
- * `blind-relay` connection protocol, and the bootstrap invite mailbox, all
- * under one persistent key.
+ * `blind-relay` connection protocol, the bootstrap invite mailbox and a
+ * retention pass that forgets images a week after they arrive, all under one
+ * persistent key.
  *
  * Stock `blind-peer-cli` provides only the mirror, which is why firewalled
  * peers pointed at it could never obtain a socket.
@@ -14,6 +15,7 @@ const BlindPeer = require('blind-peer')
 const HypercoreId = require('hypercore-id-encoding')
 const { attachBlindRelay } = require('./blind-relay')
 const { attachInviteMailbox, DEFAULTS } = require('./invite-mailbox')
+const { attachMediaRetention, DEFAULTS: RETENTION } = require('./media-retention')
 
 const SCALE = { b: 1, kb: 1000, mb: 1000 ** 2, gb: 1000 ** 3, tb: 1000 ** 4 }
 const DEFAULT_DHT_PORT = 49737
@@ -59,10 +61,15 @@ async function main () {
     log: message => console.error(message)
   })
   await mailbox.listenHttp(httpPort, httpHost)
+  const retention = attachMediaRetention(blindPeer, {
+    maxAgeMs: integer(process.env.MEDIA_RETENTION_MAX_AGE_MS, RETENTION.maxAgeMs),
+    minIntervalMs: integer(process.env.MEDIA_RETENTION_MIN_INTERVAL_MS, RETENTION.minIntervalMs),
+    log: message => console.error(message)
+  })
 
   await blindPeer.listen()
 
-  console.log('Blind peer + connection relay + invite mailbox listening')
+  console.log('Blind peer + connection relay + invite mailbox + media retention listening')
   console.log('Public key: ' + HypercoreId.encode(blindPeer.publicKey))
   console.log('Local address: ' + JSON.stringify(blindPeer.swarm.dht.localAddress()))
   const bound = mailbox.httpAddress()
@@ -72,6 +79,7 @@ async function main () {
   const close = async () => {
     if (closing) return
     closing = true
+    await retention.close()
     await mailbox.close()
     await relay.close()
     await blindPeer.close()

@@ -16,6 +16,8 @@ const { ChatStore } = require('./chat-store')
 const mnemonic = require('./mnemonic')
 const config = require('./config')
 const { IPCRequestError, validateDirectParticipant } = require('./direct-recipient')
+const { isMediaId } = require('./media-id')
+const mediaBlobs = require('./media-blobs')
 const { createDiagnosticLogger } = require('./diagnostics')
 
 // Protocol version — bump when IPC message format changes
@@ -1595,6 +1597,7 @@ class IPCHandler {
 
       case 'send_message': {
         const conversation = await this._requireSendableConversation(payload.conversationId)
+        const descriptor = await this._mediaCoreDescriptor(payload.conversationId, payload.mediaId)
         // Store the message with media metadata and send via P2P
         const message = await this.chatStore.addMessage(payload.conversationId, {
           content: payload.content || '',
@@ -1603,6 +1606,7 @@ class IPCHandler {
           senderName: this.identity.displayName || 'Me',
           isFromMe: true,
           mediaId: payload.mediaId,
+          ...descriptor,
           mediaSize: payload.mediaSize,
           mediaWidth: payload.mediaWidth,
           mediaHeight: payload.mediaHeight,
@@ -1649,6 +1653,32 @@ class IPCHandler {
 
       default:
         throw new Error(`Unknown media action: ${action}`)
+    }
+  }
+
+  /**
+   * Append the image to the conversation's media core so the blind peer can
+   * deliver it after we go offline, and describe where it landed. Null when
+   * that is not possible; the record then travels without a descriptor and
+   * the image reaches only peers that are online with us.
+   */
+  async _mediaCoreDescriptor(conversationId, mediaId) {
+    if (!this.hypercoreManager || !isMediaId(mediaId)) return null
+    try {
+      const core = await this.p2pManager.ensureLocalMediaCore(conversationId)
+      if (!core) return null
+      const mediaCoreKey = b4a.toString(core.key, 'hex')
+      const existing = this.chatStore.findOwnMediaDescriptor(conversationId, mediaId)
+      if (existing && existing.mediaCoreKey === mediaCoreKey) return existing
+      const bytes = this.mediaStore.getMedia(mediaId)
+      if (!bytes) return null
+      const { offset, n } = await mediaBlobs.put(core, bytes)
+      diag('Media appended to core conv=' + conversationId.substring(0, 12) +
+        ' media=' + mediaId.substring(0, 12) + ' offset=' + offset + ' blocks=' + n)
+      return { mediaCoreKey, mediaBlockOffset: offset, mediaBlockLength: n }
+    } catch (err) {
+      diag('Media core append failed conv=' + conversationId.substring(0, 12) + ': ' + (err.message || err))
+      return null
     }
   }
 

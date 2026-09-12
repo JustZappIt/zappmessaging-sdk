@@ -33,6 +33,17 @@ function keys (value, field) {
   if (!Array.isArray(value) || value.length === 0 || value.length > 256) throw new InvalidPeerRecord(field)
   return [...new Set(value.map(k => key(k, field, true)))]
 }
+const MEDIA_DESCRIPTOR_FIELDS = ['mediaCoreKey', 'mediaBlockOffset', 'mediaBlockLength']
+// Where an image's bytes sit in the sender's media core. Meaningless without
+// the mediaId that verifies them, so it is all three fields or none.
+function validateMediaDescriptor (record) {
+  const present = MEDIA_DESCRIPTOR_FIELDS.filter(field => record[field] != null)
+  if (present.length === 0) return
+  if (present.length !== MEDIA_DESCRIPTOR_FIELDS.length || record.mediaId == null) throw new InvalidPeerRecord('media descriptor')
+  key(record.mediaCoreKey, 'mediaCoreKey', true)
+  if (!Number.isSafeInteger(record.mediaBlockOffset) || record.mediaBlockOffset < 0) throw new InvalidPeerRecord('mediaBlockOffset')
+  if (!Number.isSafeInteger(record.mediaBlockLength) || record.mediaBlockLength < 1) throw new InvalidPeerRecord('mediaBlockLength')
+}
 function validateMessage (record) {
   if (!object(record) || record.type != null) throw new InvalidPeerRecord('message shape')
   identifier(record.id, 'id')
@@ -43,6 +54,7 @@ function validateMessage (record) {
   if (record.contentType != null && !/^[\w.+-]+\/[\w.+-]+(?:;[^\r\n]*)?$/.test(record.contentType)) throw new InvalidPeerRecord('contentType')
   identifier(record.replyToId, 'replyToId')
   string(record.mediaId, 'mediaId', 128)
+  validateMediaDescriptor(record)
   // Preserve existing numeric and thumbnail normalization in ChatStore.
   for (const field of ['mediaLocalPath', 'mediaTransferState', 'status']) string(record[field], field, 4096)
 }
@@ -104,7 +116,7 @@ function normalizePeerRecord (input, peer) {
     // Unrecognized types remain controls and are never stored as chat rows.
     return record
   }
-  for (const field of ['id', 'senderName', 'content', 'contentType', 'timestamp', 'mediaId', 'mediaSize', 'mediaWidth', 'mediaHeight', 'thumbnailData', 'replyToId', 'replyToSenderName', 'replyToContent']) {
+  for (const field of ['id', 'senderName', 'content', 'contentType', 'timestamp', 'mediaId', 'mediaSize', 'mediaWidth', 'mediaHeight', 'thumbnailData', 'replyToId', 'replyToSenderName', 'replyToContent', ...MEDIA_DESCRIPTOR_FIELDS]) {
     if (input[field] != null) record[field] = input[field]
   }
   record.senderId = peer
@@ -112,6 +124,7 @@ function normalizePeerRecord (input, peer) {
   validateMessage(record)
   identifier(record.id, 'id', true)
   if (record.mediaId != null) record.mediaId = key(record.mediaId, 'mediaId', true)
+  if (record.mediaCoreKey != null) record.mediaCoreKey = key(record.mediaCoreKey, 'mediaCoreKey', true)
   for (const field of ['timestamp', 'mediaSize', 'mediaWidth', 'mediaHeight']) {
     if (record[field] != null && (typeof record[field] !== 'number' || !Number.isFinite(record[field]))) throw new InvalidPeerRecord(field)
   }
@@ -123,4 +136,4 @@ function controlKey (record, peer) {
   // operation from transport redelivery after an intervening state change.
   return crypto.createHash('sha256').update(JSON.stringify([peer, record.id])).digest('hex')
 }
-module.exports = { InvalidPeerRecord, normalizePeerRecord, validateMessage, controlKey, GROUP_CONTROLS }
+module.exports = { InvalidPeerRecord, normalizePeerRecord, validateMessage, controlKey, GROUP_CONTROLS, MEDIA_DESCRIPTOR_FIELDS }

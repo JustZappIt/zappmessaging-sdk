@@ -4,6 +4,9 @@
  * Each conversation gets:
  * - A local writable Hypercore (this peer's message log)
  * - Remote read-only Hypercores (other peers' logs, keyed by their public key)
+ * - A local writable media Hypercore (this peer's image bytes, see
+ *   media-blobs.js), plus read-only sessions on peers' media cores that are
+ *   open only while an image is being fetched
  *
  * All cores are encrypted with a key derived from the conversation ID,
  * so blind peer servers can store but never read the data.
@@ -44,11 +47,13 @@ function coreFork (core) {
 }
 
 class HypercoreManager extends EventEmitter {
-  constructor () {
+  constructor (opts = {}) {
     super()
+    this._dataDir = opts.dataDir || null
     this.store = null
     this.localCores = new Map()    // conversationId → Hypercore (writable)
     this.remoteCores = new Map()   // conversationId → Map<peerKeyHex, Hypercore>
+    this.localMediaCores = new Map() // conversationId → Hypercore (writable, binary blocks)
     this._coreKeyIndex = new Map() // conversationId → Map<peerKeyHex, coreKeyHex>
     this._localReferrerIndex = new Map() // conversationId → recipient identity pubkey hex
     this._remoteReferrerIndex = new Map() // conversationId → Map<peerKeyHex, recipient identity pubkey hex>
@@ -104,13 +109,16 @@ class HypercoreManager extends EventEmitter {
 
   async initialize () {
     if (this._ready) return
-    const dataDir = getDataDir()
-    const storePath = path.join(dataDir, 'corestore')
+    const storePath = path.join(this._getDataDir(), 'corestore')
     ensureDir(storePath)
     this.store = new Corestore(storePath)
     await this.store.ready()
     this._ready = true
     diag('Corestore ready')
+  }
+
+  _getDataDir () {
+    return this._dataDir || getDataDir()
   }
 
   /**
@@ -203,10 +211,11 @@ class HypercoreManager extends EventEmitter {
     // Evict the cached local core so getOrCreateLocalCore re-opens it with the
     // new epoch key on the next call. Without eviction the stale (epoch-0) core
     // would continue to be used for all subsequent appends.
-    const oldCore = this.localCores.get(conversationId)
-    if (oldCore) {
+    for (const cores of [this.localCores, this.localMediaCores]) {
+      const oldCore = cores.get(conversationId)
+      if (!oldCore) continue
       try { await oldCore.close() } catch (e) { /* ignore */ }
-      this.localCores.delete(conversationId)
+      cores.delete(conversationId)
     }
 
     diag('Key epoch rotated conv=' + conversationId.substring(0, 12) + ' epoch=' + next)
@@ -233,6 +242,57 @@ class HypercoreManager extends EventEmitter {
     diag('Local core ready conv=' + conversationId.substring(0, 12) +
       ' key=' + b4a.toString(core.key, 'hex').substring(0, 12) +
       ' len=' + core.length)
+    return core
+  }
+
+  /**
+   * Get or create the local writable media Hypercore for a conversation. Image
+   * bytes ride the blind peer like the message core does, in a core of their
+   * own so history catch-up never has to pull them.
+   */
+  async getOrCreateLocalMediaCore (conversationId) {
+    if (this.localMediaCores.has(conversationId)) {
+      return this.localMediaCores.get(conversationId)
+    }
+    if (!this._ready) throw new Error('HypercoreManager not initialized')
+
+    const encKey = this.deriveEncryptionKey(conversationId)
+    const core = this.store.get({
+      name: 'zapp-media-' + conversationId,
+      encryptionKey: encKey,
+      valueEncoding: 'binary'
+    })
+    await core.ready()
+    this.localMediaCores.set(conversationId, core)
+    diag('Local media core ready conv=' + conversationId.substring(0, 12) +
+      ' key=' + b4a.toString(core.key, 'hex').substring(0, 12) +
+      ' len=' + core.length)
+    return core
+  }
+
+  /**
+   * Open a peer's media Hypercore read-only for one fetch. Not cached: the
+   * caller closes the session once its blocks are down, so media cores stay
+   * open only while an image is in flight.
+   */
+  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex) {
+    if (!this._ready) throw new Error('HypercoreManager not initialized')
+    this._assertRemoteCoreAuthorized(conversationId, peerKeyHex)
+    if (!/^[0-9a-f]{64}$/i.test(coreKeyHex || '')) throw new Error('remote media core rejected: invalid key')
+
+    const encKey = this.deriveEncryptionKey(conversationId)
+    const core = this.store.get({
+      key: b4a.from(coreKeyHex.toLowerCase(), 'hex'),
+      encryptionKey: encKey,
+      valueEncoding: 'binary'
+    })
+    await core.ready()
+    // A descriptor naming one of our own writers would let a peer make us
+    // clear our own blocks after the fetch.
+    if (core.writable) {
+      await core.close()
+      throw new Error('remote media core rejected: local writer')
+    }
     return core
   }
 
@@ -520,10 +580,11 @@ class HypercoreManager extends EventEmitter {
 
   /** Remove all local lifecycle state for a conversation and notify native. */
   async removeConversation (conversationId, options = {}) {
-    const local = this.localCores.get(conversationId)
-    if (local) {
+    for (const cores of [this.localCores, this.localMediaCores]) {
+      const local = cores.get(conversationId)
+      if (!local) continue
       try { await local.close() } catch (_) {}
-      this.localCores.delete(conversationId)
+      cores.delete(conversationId)
     }
     const remotes = this.remoteCores.get(conversationId)
     if (remotes) {
@@ -676,8 +737,7 @@ class HypercoreManager extends EventEmitter {
         }
       }
       const data = { version: 3, remotes, localReferrers, remoteReferrers, cursors }
-      const dataDir = getDataDir()
-      writeJSON(path.join(dataDir, 'corekeys.json'), data)
+      writeJSON(path.join(this._getDataDir(), 'corekeys.json'), data)
       diag('Saved core key index: ' + Object.keys(remotes).length + ' conversation(s)')
     } catch (err) {
       diag('Failed to save core key index: ' + (err.message || err))
@@ -703,8 +763,7 @@ class HypercoreManager extends EventEmitter {
   async _loadCoreKeyIndex () {
     let hydrated = false
     try {
-      const dataDir = getDataDir()
-      const indexPath = path.join(dataDir, 'corekeys.json')
+      const indexPath = path.join(this._getDataDir(), 'corekeys.json')
       const data = readJSON(indexPath)
       if (!data && fileExists(indexPath)) {
         throw new Error('core key index is unreadable')
@@ -777,8 +836,10 @@ class HypercoreManager extends EventEmitter {
 
     this.saveCoreKeyIndex()
 
-    for (const [, core] of this.localCores) {
-      try { await core.close() } catch (e) { /* ignore */ }
+    for (const cores of [this.localCores, this.localMediaCores]) {
+      for (const [, core] of cores) {
+        try { await core.close() } catch (e) { /* ignore */ }
+      }
     }
     for (const [, remotes] of this.remoteCores) {
       for (const [, core] of remotes) {
@@ -786,6 +847,7 @@ class HypercoreManager extends EventEmitter {
       }
     }
     this.localCores.clear()
+    this.localMediaCores.clear()
     this.remoteCores.clear()
     this._coreKeyIndex.clear()
     this._localReferrerIndex.clear()

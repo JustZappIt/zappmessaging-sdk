@@ -592,11 +592,65 @@ class P2PManager extends EventEmitter {
       // conversations pass null (multi-recipient wakeups are deferred).
       if (recipientKeyHex) this.hypercoreManager.setLocalCoreReferrer(conversationId, recipientKeyHex)
       if (this.blindMirror) this.blindMirror.addLocalCore(conversationId, core, recipientKeyHex)
+      // Opened alongside so a restart resumes any image upload the relay had
+      // not finished pulling before the app was stopped.
+      await this.ensureLocalMediaCore(conversationId)
       return b4a.toString(core.key, 'hex')
     } catch (err) {
       diag('Failed to ensure local core for ' + conversationId.substring(0, 12) + ': ' + (err.message || err))
       return null
     }
+  }
+
+  /**
+   * Ensure the conversation's writable media Hypercore exists and is
+   * registered with the blind mirror. Returns the core, or null when
+   * hypercore support is not wired up or the core cannot be opened.
+   */
+  async ensureLocalMediaCore (conversationId) {
+    if (!this.hypercoreManager) return null
+    try {
+      const core = await this.hypercoreManager.getOrCreateLocalMediaCore(conversationId)
+      if (this.blindMirror) {
+        this.blindMirror.addLocalMediaCore(conversationId, core, this.hypercoreManager.getLocalCoreReferrer(conversationId))
+      }
+      return core
+    } catch (err) {
+      diag('Failed to ensure local media core for ' + conversationId.substring(0, 12) + ': ' + (err.message || err))
+      return null
+    }
+  }
+
+  /**
+   * Open a peer's media Hypercore read-only and register it with the blind
+   * mirror so the relay serves its blocks on our stream. Returns the session,
+   * which the caller closes when its fetch is over, or null when it cannot be
+   * opened.
+   */
+  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex) {
+    if (!this.hypercoreManager || !coreKeyHex) return null
+    try {
+      const core = await this.hypercoreManager.openRemoteMediaCore(conversationId, peerKeyHex, coreKeyHex)
+      if (this.blindMirror) {
+        this.blindMirror.addRemoteMediaCore(conversationId, coreKeyHex, core, this._remoteCoreReferrer(conversationId))
+      }
+      return core
+    } catch (err) {
+      diag('Failed to open remote media core conv=' + conversationId.substring(0, 12) +
+        ' peer=' + peerKeyHex.substring(0, 12) + ': ' + (err.message || err))
+      return null
+    }
+  }
+
+  /**
+   * The identity a peer's core should wake when it grows: ours, since its
+   * blocks are addressed to us. Direct chats only; a group core has many
+   * recipients and a single referrer cannot express that.
+   */
+  _remoteCoreReferrer (conversationId) {
+    return this.groupConversations.has(conversationId) || !this.keyPair
+      ? null
+      : b4a.toString(this.keyPair.publicKey, 'hex')
   }
 
   /**
@@ -612,9 +666,7 @@ class P2PManager extends EventEmitter {
   async openRemoteCore (conversationId, peerKeyHex, coreKeyHex) {
     if (!this.hypercoreManager || !coreKeyHex) return false
     try {
-      const recipientKeyHex = this.groupConversations.has(conversationId) || !this.keyPair
-        ? null
-        : b4a.toString(this.keyPair.publicKey, 'hex')
+      const recipientKeyHex = this._remoteCoreReferrer(conversationId)
       const core = await this.hypercoreManager.openRemoteCore(conversationId, peerKeyHex, coreKeyHex, recipientKeyHex)
       if (this.blindMirror) {
         // A remote core carries messages the peer sends *to us*, so the blind

@@ -37,6 +37,12 @@ function debugDiag (...args) {
 const DEFAULT_BLIND_PEER_KEYS = BLIND_PEER_KEYS
 const DEFAULT_NOTIFICATION_RETRY_DELAYS = [0, 1000, 3000]
 
+// The relay evicts lowest priority first when it runs out of space, and
+// server/media-retention.js clears priority-0 cores after a week: images go
+// before message history, and only images expire.
+const MESSAGE_CORE_PRIORITY = 1
+const MEDIA_CORE_PRIORITY = 0
+
 function delay (ms) {
   if (ms <= 0) return Promise.resolve()
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -433,24 +439,12 @@ class BlindMirror extends EventEmitter {
    *   the conversation peer (the recipient of what we send). Omit for groups.
    */
   addLocalCore (conversationId, core, referrerKeyHex = null) {
-    if (!this._peering || this._closed) {
-      diag('Cannot add local core: mirror not ready (conv=' + conversationId.substring(0, 12) + ')')
-      return
-    }
-    const tag = 'local:' + conversationId
-    const registered = this._registeredBases.get(tag)
-    const registeredReferrer = registered && registered.referrerKeyHex
-    if (registered && registered.core === core && (!referrerKeyHex || registeredReferrer === referrerKeyHex)) return
-    try {
-      const opts = { target: core.key, announce: true }
-      if (referrerKeyHex) opts.referrer = b4a.from(referrerKeyHex, 'hex')
-      this._peering.addCoreBackground(core, opts)
-      this._trackCoreRegistration(tag, core, referrerKeyHex || registeredReferrer || null, opts)
-      diag('Registered local core: conv=' + conversationId.substring(0, 12) +
-        (referrerKeyHex ? ' referrer=' + referrerKeyHex.substring(0, 12) : ''))
-    } catch (err) {
-      diag('Failed to register local core ' + conversationId.substring(0, 12) + ': ' + (err.message || err))
-    }
+    this._registerCore('local:' + conversationId, core, {
+      announce: true,
+      priority: MESSAGE_CORE_PRIORITY,
+      referrerKeyHex,
+      label: 'local core conv=' + conversationId.substring(0, 12)
+    })
   }
 
   /**
@@ -467,21 +461,57 @@ class BlindMirror extends EventEmitter {
    *   groups (multi-recipient, deferred).
    */
   addRemoteCore (conversationId, peerKeyHex, core, referrerKeyHex = null) {
-    if (!this._peering || this._closed) return
-    const tag = 'remote:' + conversationId + ':' + peerKeyHex
+    this._registerCore('remote:' + conversationId + ':' + peerKeyHex, core, {
+      announce: false,
+      priority: MESSAGE_CORE_PRIORITY,
+      referrerKeyHex,
+      label: 'remote core conv=' + conversationId.substring(0, 12) + ' peer=' + peerKeyHex.substring(0, 12)
+    })
+  }
+
+  /**
+   * Register our media core for a conversation. Same referrer as the message
+   * core; never announced, since images are only ever fetched through the
+   * relay connection.
+   */
+  addLocalMediaCore (conversationId, core, referrerKeyHex = null) {
+    this._registerCore('local-media:' + conversationId, core, {
+      announce: false,
+      priority: MEDIA_CORE_PRIORITY,
+      referrerKeyHex,
+      label: 'local media core conv=' + conversationId.substring(0, 12)
+    })
+  }
+
+  /**
+   * Register a peer's media core while one of its images is being fetched, so
+   * the relay serves its blocks on our stream.
+   */
+  addRemoteMediaCore (conversationId, coreKeyHex, core, referrerKeyHex = null) {
+    this._registerCore('remote-media:' + conversationId + ':' + coreKeyHex, core, {
+      announce: false,
+      priority: MEDIA_CORE_PRIORITY,
+      referrerKeyHex,
+      label: 'remote media core conv=' + conversationId.substring(0, 12) + ' key=' + coreKeyHex.substring(0, 12)
+    })
+  }
+
+  _registerCore (tag, core, { announce, priority, referrerKeyHex = null, label }) {
+    if (!this._peering || this._closed) {
+      diag('Cannot register ' + label + ': mirror not ready')
+      return
+    }
     const registered = this._registeredBases.get(tag)
     const registeredReferrer = registered && registered.referrerKeyHex
     if (registered && registered.core === core && (!referrerKeyHex || registeredReferrer === referrerKeyHex)) return
     try {
-      const opts = { target: core.key, announce: false }
+      const opts = { target: core.key, announce, priority }
       if (referrerKeyHex) opts.referrer = b4a.from(referrerKeyHex, 'hex')
       this._peering.addCoreBackground(core, opts)
       this._trackCoreRegistration(tag, core, referrerKeyHex || registeredReferrer || null, opts)
-      diag('Registered remote core: conv=' + conversationId.substring(0, 12) +
-        ' peer=' + peerKeyHex.substring(0, 12) +
-        (referrerKeyHex ? ' referrer=' + referrerKeyHex.substring(0, 12) : ''))
+      diag('Registered ' + label + (referrerKeyHex ? ' referrer=' + referrerKeyHex.substring(0, 12) : ''))
     } catch (err) {
-      diag('Failed to register remote core: ' + (err.message || err))
+      diag('Failed to register ' + label + ': ' + (err.message || err))
     }
   }
 
@@ -509,9 +539,10 @@ class BlindMirror extends EventEmitter {
   removeConversation (conversationId) {
     this._registeredBases.delete(conversationId)
     this._registeredBases.delete('local:' + conversationId)
-    const remotePrefix = 'remote:' + conversationId + ':'
+    this._registeredBases.delete('local-media:' + conversationId)
+    const remotePrefixes = ['remote:' + conversationId + ':', 'remote-media:' + conversationId + ':']
     for (const tag of this._registeredBases.keys()) {
-      if (tag.startsWith(remotePrefix)) this._registeredBases.delete(tag)
+      if (remotePrefixes.some(prefix => tag.startsWith(prefix))) this._registeredBases.delete(tag)
     }
   }
 
@@ -624,6 +655,11 @@ class BlindMirror extends EventEmitter {
     this._ready = false
   }
 
+  /** Whether cores can be registered and fetched through a relay right now. */
+  get enabled () {
+    return this._ready && !this._closed && this.keys.length > 0
+  }
+
   /**
    * Get diagnostic info for debugging.
    */
@@ -637,7 +673,7 @@ class BlindMirror extends EventEmitter {
       }
     } catch (e) { /* peering not ready; report zeros */ }
     return {
-      enabled: this._ready && this.keys.length > 0,
+      enabled: this.enabled,
       blindPeerCount: this.keys.length,
       registeredConversations: this._registeredBases.size,
       relaysConnected,

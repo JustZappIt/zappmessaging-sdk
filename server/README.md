@@ -1,4 +1,4 @@
-# Zapp blind peer: mirror, connection relay, invite mailbox
+# Zapp blind peer: mirror, connection relay, invite mailbox, media retention
 
 This is the only authored copy of Zapp's blind-peer server code. The Android
 repository vendors a generated bundle of it for its own deployment; regenerate
@@ -7,7 +7,10 @@ that bundle rather than editing it, or the two will drift.
 Stock `blind-peer-cli` mirrors encrypted Hypercores but does not serve the
 `blind-relay` Protomux protocol, so pointing Hyperswarm's `relayThrough` option
 at a stock blind peer can never relay a peer connection. It also has nowhere to
-put a first invite, which is what the mailbox is for.
+put a first invite, which is what the mailbox is for. Image bytes ride the
+mirror in per-conversation media cores; `media-retention.js` clears those a
+week after their last new block, so the mirror holds images only long enough
+to deliver them while message history stays until storage pressure evicts it.
 
 ```bash
 cd server
@@ -34,6 +37,8 @@ key. Allow UDP and TCP 49737. All three services run under that one key.
 | `INVITE_MAILBOX_HTTP_HOST` | `127.0.0.1` | Keep on loopback; terminate TLS in front |
 | `INVITE_MAILBOX_MAX_RPM` | `600` | Aggregate HTTP request ceiling |
 | `INVITE_MAILBOX_MAX_BYTES_PER_RECIPIENT` | `262144` | Byte budget per mailbox |
+| `MEDIA_RETENTION_MAX_AGE_MS` | 7 days | Clear a media core this long after its last new block |
+| `MEDIA_RETENTION_MIN_INTERVAL_MS` | 1 hour | Least time between two retention passes |
 
 ## Publishing the mailbox over HTTPS
 

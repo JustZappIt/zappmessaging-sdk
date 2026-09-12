@@ -13,7 +13,7 @@ const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./st
 const { createDiagnosticLogger } = require('./diagnostics')
 
 const { deriveGroupChatTopic } = require('./rooms')
-const { validateMessage } = require('./peer-record')
+const { validateMessage, MEDIA_DESCRIPTOR_FIELDS } = require('./peer-record')
 const diag = createDiagnosticLogger('CHAT')
 
 const MAX_PLATFORM_INT = 0x7fffffff
@@ -477,6 +477,10 @@ class ChatStore {
       // large inline preview: lazy hydration must always produce a bounded IPC
       // response, even for hostile or malformed messages.
       thumbnailData: normalizeThumbnailData(messageData.thumbnailData),
+      // validateMessage above accepted the descriptor whole or rejected it.
+      mediaCoreKey: messageData.mediaCoreKey || null,
+      mediaBlockOffset: normalizePeerInteger(messageData.mediaBlockOffset),
+      mediaBlockLength: normalizePeerInteger(messageData.mediaBlockLength),
       mediaLocalPath: messageData.mediaLocalPath || null,
       mediaTransferState: messageData.mediaTransferState || null,
       replyToId: messageData.replyToId || null,
@@ -577,6 +581,21 @@ class ChatStore {
     if (!this.conversations.has(conversationId) || this.hasLeftConversation(conversationId)) return false
     const messages = readNormalizedMessages(path.join(this.storagePath, conversationId + '.json'), { strict: true })
     return messages.some(m => m.mediaId === mediaId && m.mediaAuthorized === true)
+  }
+
+  /**
+   * The media-core descriptor of an image we already sent in this
+   * conversation, so a resend reuses the blocks instead of appending again.
+   * @returns {{mediaCoreKey: string, mediaBlockOffset: number, mediaBlockLength: number}|null}
+   */
+  findOwnMediaDescriptor(conversationId, mediaId) {
+    if (!this.conversations.has(conversationId)) return null
+    const messages = readNormalizedMessages(path.join(this.storagePath, conversationId + '.json'), { strict: true })
+    const message = messages.find(m => m.isFromMe === true && m.mediaId === mediaId && m.mediaCoreKey != null)
+    if (!message) return null
+    const descriptor = {}
+    for (const field of MEDIA_DESCRIPTOR_FIELDS) descriptor[field] = message[field]
+    return descriptor
   }
 
   authorizeReceivedMedia(conversationId, mediaId) {
