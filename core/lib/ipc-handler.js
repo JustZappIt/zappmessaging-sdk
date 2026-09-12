@@ -15,6 +15,9 @@ const b4a = require('b4a')
 const { ChatStore } = require('./chat-store')
 const mnemonic = require('./mnemonic')
 const config = require('./config')
+const { TaskScope } = require('./task-scope')
+const { NotificationWork } = require('./notification-work')
+const { mediaTiming } = require('./media-timing')
 const { IPCRequestError, validateDirectParticipant } = require('./direct-recipient')
 const { createDiagnosticLogger } = require('./diagnostics')
 
@@ -34,7 +37,19 @@ function isValidString(value, maxLen) {
 }
 
 class IPCHandler {
-  constructor({ identity, chatStore, contactStore, p2pManager, mediaStore, mediaTransfer, blindMirror, hypercoreManager, ensureBlindMirror }) {
+  constructor({ identity, chatStore, contactStore, p2pManager, mediaStore, mediaTransfer, blindMirror, hypercoreManager, ensureBlindMirror, prepareIdentityChange, retryMediaDownload, cancelMediaDownload }) {
+    this._tasks = new TaskScope()
+    this._identityChange = null
+    this._mediaBootstrap = new NotificationWork()
+    this._mediaBootstrapPending = new Set()
+    this.retryMediaDownload = retryMediaDownload
+    this.cancelMediaDownload = cancelMediaDownload
+    this.prepareIdentityChange = prepareIdentityChange || (async () => {
+      if (this.blindMirror) await this.blindMirror.close()
+      this.blindMirror = null
+      this.p2pManager.blindMirror = null
+      if (this.hypercoreManager) await this.hypercoreManager.resetIdentity()
+    })
     this.identity = identity
     this.chatStore = chatStore
     this.contactStore = contactStore
@@ -67,22 +82,22 @@ class IPCHandler {
 
     // Listen for control messages from P2P manager
     this.p2pManager.on('direct_invite', (inviteData, senderPeerId) => {
-      this._handleDirectInvite(inviteData, senderPeerId)
+      this._handleDirectInvite(inviteData, senderPeerId).catch(error => diag(error.message))
     })
     this.p2pManager.on('group_invite', (inviteData, senderPeerId) => {
-      this._handleGroupInvite(inviteData, senderPeerId)
+      this._handleGroupInvite(inviteData, senderPeerId).catch(error => diag(error.message))
     })
     this.p2pManager.on('group_leave', (data, senderPeerId) => {
-      this._handleGroupLeave(data, senderPeerId)
+      this._handleGroupLeave(data, senderPeerId).catch(error => diag(error.message))
     })
     this.p2pManager.on('group_deleted', (data, senderPeerId) => {
-      this._handleGroupDeleted(data, senderPeerId)
+      this._handleGroupDeleted(data, senderPeerId).catch(error => diag(error.message))
     })
     this.p2pManager.on('group_renamed', (data, senderPeerId) => {
-      this._handleGroupRenamed(data, senderPeerId)
+      this._handleGroupRenamed(data, senderPeerId).catch(error => diag(error.message))
     })
     this.p2pManager.on('group_member_added', (data, senderPeerId) => {
-      this._handleGroupMemberAdded(data, senderPeerId)
+      this._handleGroupMemberAdded(data, senderPeerId).catch(error => diag(error.message))
     })
   }
 
@@ -210,6 +225,17 @@ class IPCHandler {
   }
 
   async routeMessage(type, payload) {
+    // Host HTTP replies must remain serviceable while a send/lifecycle operation
+    // waits for them. Identity changes close admission for everything else.
+    if (type.startsWith('platform.')) return this._routeMessage(type, payload)
+    if (this._identityChange) throw new Error('Identity change in progress')
+    if (type === 'identity.create' || type === 'migration.restore_from_seed_phrase') {
+      return this._routeMessage(type, payload)
+    }
+    return this._tasks.run(() => this._routeMessage(type, payload))
+  }
+
+  async _routeMessage(type, payload) {
     const [category, action] = type.split('.')
 
     switch (category) {
@@ -252,14 +278,18 @@ class IPCHandler {
    * @returns {Promise<boolean>}
    */
   async deliverMailboxInvite (invite, senderKeyHex) {
-    if (invite.type === 'direct_invite') {
-      return await this._handleDirectInvite(invite, senderKeyHex)
+    let normalized
+    try { normalized = normalizePeerRecord(invite, senderKeyHex) } catch (error) {
+      if (error.code === 'INVALID_PEER_RECORD') return true
+      throw error
     }
-    if (invite.type === 'group_invite') {
-      return await this._handleGroupInvite(invite, senderKeyHex)
-    }
-    diag('Discarding unsupported mailbox invite type: ' + invite.type)
-    return true
+    const method = normalized.type === 'direct_invite' ? '_handleDirectInvite'
+      : normalized.type === 'group_invite' ? '_handleGroupInvite' : null
+    if (!method) return true
+    // A changed core key, membership, name or explicit ID is a new invite.
+    // The handler checks and commits this marker only AFTER authorization.
+    const mailboxFingerprint = 'mailbox:' + b4a.toString(crypto.data(b4a.from(JSON.stringify(normalized))), 'hex')
+    return this[method](normalized, senderKeyHex, { mailboxFingerprint })
   }
 
   /** The identity payload the native side expects. */
@@ -363,22 +393,69 @@ class IPCHandler {
     }
   }
 
+  async quiesce () {
+    this._tasks.closed = true
+    this._mediaBootstrap.cancel()
+    if (this.cancelMediaDownload) this.cancelMediaDownload()
+    if (this.mediaTransfer) await this.mediaTransfer.resetIdentity()
+    await this.p2pManager.stop()
+    await this._tasks.drain()
+  }
+
+  async _restartCurrentIdentity () {
+    if (this._identityChange) throw new Error('Identity change in progress')
+    const operation = (async () => {
+      await this._tasks.drain()
+      this._tasks = new TaskScope()
+      this._mediaBootstrap.resume()
+      await this.p2pManager.start(this.identity.keyPair)
+      await this.ensureBlindMirror()
+      for (const conversation of this.chatStore.conversations.values()) {
+        if (conversation.type === 'group') {
+          await this.p2pManager.joinGroupConversation(conversation.id, conversation.groupId,
+            [this.identity.publicKeyHex, ...conversation.participantIds])
+        } else {
+          for (const peer of conversation.participantIds) {
+            await this.p2pManager.joinConversation(conversation.id, peer)
+          }
+        }
+        this.p2pManager.restorePendingMessages(conversation.id,
+          this.chatStore.getPendingOutgoingMessages(conversation.id))
+      }
+    })()
+    this._identityChange = operation
+    try { await operation } finally { this._identityChange = null }
+  }
+
+  async _replaceIdentity (install) {
+    if (this._identityChange) throw new Error('Identity change in progress')
+    const operation = (async () => {
+      // Existing work finishes with the OLD identity still installed,
+      // including replication sinks while the core manager closes below.
+      await this.quiesce()
+      await this.prepareIdentityChange()
+      this.readReceiptsEnabled = true
+      if (this.chatStore) await this.chatStore.clearAll()
+      if (this.contactStore) await this.contactStore.clearAll()
+      await install()
+      this._tasks = new TaskScope()
+      this._mediaBootstrap.resume()
+      await this.p2pManager.start(this.identity.keyPair)
+      await this.ensureBlindMirror()
+    })()
+    this._identityChange = operation
+    try { await operation } finally { this._identityChange = null }
+  }
+
   // Identity handlers
   async handleIdentity(action, payload) {
+    if (this._identityChange) throw new Error('Identity change in progress')
     switch (action) {
       case 'create': {
-        // Stop active P2P connections and wipe all user data before issuing
-        // a new identity.  Without this, old conversations and contacts from
-        // the previous account are visible when the next user signs up.
-        await this.p2pManager.stop()
-        // Honor-system prefs return to their defaults for the fresh identity; native
-        // re-pushes the new user's real values once its settings load.
-        this.readReceiptsEnabled = true
-        if (this.chatStore) await this.chatStore.clearAll()
-        if (this.contactStore) await this.contactStore.clearAll()
-        await this.identity.create(payload.displayName)
-        await this.p2pManager.start(this.identity.keyPair)
-        await this.ensureBlindMirror()
+        if (payload.displayName != null && (typeof payload.displayName !== 'string' || payload.displayName.length > 100)) {
+          throw new Error('Invalid displayName')
+        }
+        await this._replaceIdentity(() => this.identity.create(payload.displayName))
         // Return the recovery phrase in the same response so the native side
         // doesn't need a second migration.get_seed_phrase IPC that could fail
         // independently of identity creation.
@@ -720,7 +797,7 @@ class IPCHandler {
    *   rejection counts as finished; only a thrown error might succeed later, and
    *   a mailbox-delivered invite must not be deleted before then.
    */
-  async _handleDirectInvite(inviteData, senderPeerId) {
+  async _handleDirectInvite(inviteData, senderPeerId, { mailboxFingerprint = null } = {}) {
     let failed = false
     try {
       try { inviteData = normalizePeerRecord({ ...inviteData, type: 'direct_invite' }, senderPeerId) } catch (err) {
@@ -774,6 +851,9 @@ class IPCHandler {
         diag('Ignoring direct invite for left conversation: ' + resolvedId.substring(0, 12))
         return true // rejected: terminal, nothing to retry
       }
+
+      if (mailboxFingerprint && conversation &&
+          this.chatStore.hasAppliedControl(conversation.id, mailboxFingerprint)) return true
 
       if (!conversation) {
         conversation = await this.chatStore.createConversationWithId(resolvedId, 'direct', [senderKey], {})
@@ -839,6 +919,8 @@ class IPCHandler {
         }
       }
 
+      if (mailboxFingerprint) this.chatStore.markControlApplied(conversation.id, mailboxFingerprint)
+
       // Notify Swift/Kotlin UI so the conversation appears in the list
       this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
@@ -855,7 +937,7 @@ class IPCHandler {
    * @returns {Promise<boolean>} whether the invite is finished with, as in
    *   [_handleDirectInvite].
    */
-  async _handleGroupInvite(inviteData, senderPeerId) {
+  async _handleGroupInvite(inviteData, senderPeerId, { mailboxFingerprint = null } = {}) {
     let failed = false
     try {
       try { inviteData = normalizePeerRecord({ ...inviteData, type: 'group_invite' }, senderPeerId) } catch (err) {
@@ -915,6 +997,9 @@ class IPCHandler {
           !this._isConversationParticipant(existing, authenticatedPeer) ||
           this.chatStore.hasLeftConversation(existing.id))) return true
 
+      if (mailboxFingerprint && existing &&
+          this.chatStore.hasAppliedControl(existing.id, mailboxFingerprint)) return true
+
       // Other participants (excluding self) become the conversation's participantIds
       const otherParticipants = [...new Set([...(existing ? existing.participantIds : []),
         ...normalizedParticipants.filter(k => k !== myKey.toLowerCase())])]
@@ -941,21 +1026,22 @@ class IPCHandler {
         conversation.displayName = groupName
       }
 
-      // Join group topic so we can send/receive messages
-      await this.p2pManager.joinGroupConversation(
+      // A mailbox entry must survive transient join/core-open failure: it
+      // may be the only copy of the key needed to recover the group's history.
+      if (!await this.p2pManager.joinGroupConversation(
         conversation.id,
         groupId.toLowerCase(),
         [myKey.toLowerCase(), ...otherParticipants]
-      )
+      )) return false
 
-      // If the sender shared their local core key, open it so we can pull
-      // group messages they sent while we were offline via the blind peer.
       if (inviteData.localCoreKey && claimedSender !== myKey.toLowerCase()) {
-        await this.p2pManager.openRemoteCore(conversation.id, claimedSender, inviteData.localCoreKey)
+        if (!await this.p2pManager.openRemoteCore(conversation.id, claimedSender, inviteData.localCoreKey)) return false
       }
 
+      if (mailboxFingerprint) this.chatStore.markControlApplied(conversation.id, mailboxFingerprint)
+
       // Notify Swift/Kotlin UI about the new group
-      if (metadataChanged) this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
+      if (metadataChanged || mailboxFingerprint) this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
       diag('Accepted group invite with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
     } catch (error) {
@@ -1267,7 +1353,15 @@ class IPCHandler {
 
   // Message handlers
   _recordOutgoingStatus(conversationId, message, durability) {
-    const status = durability.relay === 'request_acknowledged' ? 'sent' : 'queued'
+    let known = message.status
+    try {
+      if (this.chatStore.getMessageStatus) known = this.chatStore.getMessageStatus(conversationId, message.id) || known
+    } catch (error) { diag('outgoing status read failed: ' + error.message) }
+    if (known === 'delivered' || known === 'read') {
+      message.status = known
+      return known
+    }
+    const status = known === 'sent' || durability.relay === 'request_acknowledged' ? 'sent' : 'queued'
     if (status === 'sent') {
       message.status = 'sent'
       try {
@@ -1413,7 +1507,7 @@ class IPCHandler {
 
   _sendDeliveryReceiptIfNeeded (conversationId) {
     for (const message of this.chatStore.getLatestIncomingMessages(conversationId)) {
-      this.p2pManager.sendDeliveryReceipt(conversationId, message.id, message.senderId)
+      this.p2pManager.sendDeliveryReceipt(conversationId, message.id, message.senderId).catch(error => diag(error.message))
     }
   }
 
@@ -1449,19 +1543,27 @@ class IPCHandler {
   async handleConnection(action, payload) {
     switch (action) {
       case 'connect':
+        const connectionTiming = mediaTiming()
         const conversation = await this.chatStore.getConversation(payload.conversationId)
         if (!conversation) return { success: false }
 
         if (conversation.type === 'group' && conversation.groupId) {
           // Group: join shared group topic
           const allKeys = [this.identity.publicKeyHex, ...conversation.participantIds]
-          await this.p2pManager.joinGroupConversation(payload.conversationId, conversation.groupId, allKeys)
+          await this.p2pManager.joinGroupConversation(payload.conversationId, conversation.groupId, allKeys, { waitForDiscovery: !payload.forMedia })
         } else if (conversation.participantIds) {
           // Direct: join pairwise topics
           for (const participantId of conversation.participantIds) {
             if (participantId !== this.identity.publicKeyHex) {
-              await this.p2pManager.joinConversation(payload.conversationId, participantId)
-              await this._sendDirectInvite(conversation, participantId)
+              await this.p2pManager.joinConversation(payload.conversationId, participantId, { waitForDiscovery: !payload.forMedia })
+              if (payload.forMedia) {
+                if (!this._mediaBootstrapPending.has(participantId)) {
+                  this._mediaBootstrapPending.add(participantId)
+                  this._mediaBootstrap.resume()
+                  this._mediaBootstrap.enqueue(() => this._sendDirectInvite(conversation, participantId), [0])
+                    .catch(() => {}).finally(() => this._mediaBootstrapPending.delete(participantId))
+                }
+              } else await this._sendDirectInvite(conversation, participantId)
             }
           }
         }
@@ -1470,6 +1572,7 @@ class IPCHandler {
           this.chatStore.getPendingOutgoingMessages(payload.conversationId)
         )
         this._sendDeliveryReceiptIfNeeded(payload.conversationId)
+        connectionTiming('connection_prepared')
         return { success: true }
 
       case 'status':
@@ -1520,6 +1623,7 @@ class IPCHandler {
   // historical reasons; the only durable shape now is BIP-39 entropy and the
   // 24-word mnemonic derived from it.
   async handleMigration(action, payload) {
+    if (this._identityChange) throw new Error('Identity change in progress')
     switch (action) {
       case 'get_seed_phrase': {
         if (!this.identity.keyPair) throw new Error('No identity')
@@ -1533,33 +1637,28 @@ class IPCHandler {
         // button, or any same-seed re-publish from the reactive Kotlin path)
         // would silently erase the user's local history.
         const currentPubkeyHex = this.identity.publicKeyHex
-        let isIdentityChange = currentPubkeyHex == null
-        if (!isIdentityChange) {
-          const incomingSeed = mnemonic.mnemonicToEd25519Seed(payload.seedPhrase)
-          const incomingKeyPair = crypto.keyPair(incomingSeed)
-          const incomingPubkeyHex = b4a.toString(incomingKeyPair.publicKey, 'hex')
-          isIdentityChange = currentPubkeyHex !== incomingPubkeyHex
+        if (payload.displayName != null && (typeof payload.displayName !== 'string' || payload.displayName.length > 100)) {
+          throw new Error('Invalid displayName')
         }
+        // Validate checksum, words and length even when no identity is loaded.
+        const incomingSeed = mnemonic.mnemonicToEd25519Seed(payload.seedPhrase)
+        const incomingKeyPair = crypto.keyPair(incomingSeed)
+        const incomingPubkeyHex = b4a.toString(incomingKeyPair.publicKey, 'hex')
+        const isIdentityChange = currentPubkeyHex !== incomingPubkeyHex
 
         if (!isIdentityChange) {
           // Idempotent re-publish: same identity already loaded. Leave the local
           // stores, swarm state, and stored display name as-is.
-          await this.ensureBlindMirror()
+          if (!this.p2pManager.swarm) await this._restartCurrentIdentity()
+          else await this.ensureBlindMirror()
           return {
             publicKey: this.identity.publicKeyHex,
             displayName: this.identity.displayName
           }
         }
 
-        await this.p2pManager.stop()
-        // Honor-system prefs return to their defaults for the restored identity;
-        // native re-pushes the real values once its settings load.
-        this.readReceiptsEnabled = true
-        if (this.chatStore) await this.chatStore.clearAll()
-        if (this.contactStore) await this.contactStore.clearAll()
-        await this.identity.restoreFromMnemonic(payload.seedPhrase, payload.displayName || '')
-        await this.p2pManager.start(this.identity.keyPair)
-        await this.ensureBlindMirror()
+        await this._replaceIdentity(() =>
+          this.identity.restoreFromMnemonic(payload.seedPhrase, payload.displayName || ''))
         return {
           publicKey: this.identity.publicKeyHex,
           displayName: this.identity.displayName
@@ -1577,6 +1676,7 @@ class IPCHandler {
 
     switch (action) {
       case 'prepare_send': {
+        const timing = mediaTiming()
         // Swift/Kotlin wrote a compressed image to a temp path; JS reads, hashes, and stores it
         const filePath = payload.filePath
         const ext = payload.extension || 'jpg'
@@ -1585,6 +1685,7 @@ class IPCHandler {
           throw new Error('Media must be between 1 byte and ' + config.MEDIA_MAX_BYTES + ' bytes')
         }
         const { hashHex, filePath: storedPath, fileSize } = this.mediaStore.saveMedia(data, ext)
+        timing('media_prepared', fileSize)
 
         return {
           mediaId: hashHex,
@@ -1594,9 +1695,11 @@ class IPCHandler {
       }
 
       case 'send_message': {
+        const timing = mediaTiming()
         const conversation = await this._requireSendableConversation(payload.conversationId)
         // Store the message with media metadata and send via P2P
-        const message = await this.chatStore.addMessage(payload.conversationId, {
+        let message = await this.chatStore.addMessage(payload.conversationId, {
+          id: payload.clientMessageId || undefined,
           content: payload.content || '',
           contentType: payload.contentType,
           senderId: this.identity.publicKeyHex,
@@ -1608,12 +1711,18 @@ class IPCHandler {
           mediaHeight: payload.mediaHeight,
           thumbnailData: payload.thumbnailData,
           mediaLocalPath: payload.mediaLocalPath,
-          mediaTransferState: 'complete',
+          mediaTransferState: 'queued',
           replyToId: payload.replyToId || null,
           replyToSenderName: payload.replyToSenderName || null,
           replyToContent: payload.replyToContent || null
         })
 
+        const retry = !message && !!payload.clientMessageId
+        if (retry) {
+          message = (await this.chatStore.getMessages(payload.conversationId, 5000)).find(m => m.id === payload.clientMessageId)
+          if (!message || !message.isFromMe || message.mediaId !== payload.mediaId) throw new Error('Media retry does not match stored message')
+        }
+        if (!message) throw new Error('Media message unavailable')
         // Send message JSON (with thumbnail) over P2P
         // Strip mediaLocalPath before sending - it's a local-only field
         const wireMessage = { ...message }
@@ -1622,10 +1731,12 @@ class IPCHandler {
         diag('Outgoing media message stored locally conv=' + payload.conversationId.substring(0, 12) +
           ' message=' + message.id)
         const durability = await this.p2pManager.sendToConversationDurably(payload.conversationId, wireMessage, {
-          notificationEligible: conversation && conversation.type === 'direct'
+          notificationEligible: conversation && conversation.type === 'direct',
+          deduplicate: retry
         })
         this._recordOutgoingStatus(payload.conversationId, message, durability)
 
+        timing('message_append', payload.mediaSize || 0)
         // Initiate chunked media transfer to all connected peers
         if (this.mediaTransfer && payload.mediaId) {
           const framedSockets = this.p2pManager.getConversationFramedSockets(payload.conversationId)
@@ -1639,6 +1750,47 @@ class IPCHandler {
         return { message, durability }
       }
 
+      case 'retry': {
+        const conversation = await this._requireSendableConversation(payload.conversationId)
+        const messages = await this.chatStore.getMessages(conversation.id, 5000)
+        const message = messages.find(m => m.id === payload.messageId && m.mediaId)
+        if (!message) throw new Error('Media message not found')
+        if (message.isFromMe) {
+          if (!this.mediaTransfer || !this.mediaStore.hasMedia(message.mediaId)) throw new Error('Media unavailable locally')
+          // A persisted UI row is not evidence that its Hypercore append
+          // succeeded. Recover metadata first; an already committed message
+          // is re-offered live without appending it or notifying twice.
+          const wireMessage = { ...message }
+          delete wireMessage.mediaLocalPath
+          delete wireMessage.mediaTransferState
+          const durability = await this.p2pManager.sendToConversationDurably(conversation.id, wireMessage, {
+            notificationEligible: conversation.type === 'direct', deduplicate: true
+          })
+          this._recordOutgoingStatus(conversation.id, message, durability)
+          const sockets = this.p2pManager.getConversationFramedSockets(conversation.id)
+          if (sockets.length) {
+            this.mediaTransfer.sendMediaToAll(sockets, message.mediaId).catch(() => {})
+          } else {
+            // The durable metadata is queued; bytes are receiver-requested on
+            // reconnect, not queued against a nonexistent socket.
+            this.pushEvent('media.transfer_state', {
+              mediaId: message.mediaId, conversationId: conversation.id, direction: 'upload', state: 'waiting_peer'
+            })
+          }
+          return { queued: true }
+        }
+        if (!this.retryMediaDownload) throw new Error('Media downloads unavailable')
+        this.retryMediaDownload(message.mediaId, conversation.id, message.senderId)
+        return { queued: true }
+      }
+      case 'cancel': {
+        const conversation = await this._requireSendableConversation(payload.conversationId)
+        const message = (await this.chatStore.getMessages(conversation.id, 5000)).find(m => m.id === payload.messageId && m.mediaId)
+        if (!message) throw new Error('Media message not found')
+        if (this.cancelMediaDownload) this.cancelMediaDownload(message.mediaId)
+        if (this.mediaTransfer) this.mediaTransfer.cancelTransfer(message.mediaId)
+        return { cancelled: true }
+      }
       case 'get_path': {
         const mediaPath = this.mediaStore.getMediaPath(payload.mediaId)
         return {
@@ -1700,6 +1852,39 @@ class IPCHandler {
     const event = { type, payload, timestamp: Date.now() }
     const buffer = Buffer.from(JSON.stringify(event) + '\n')
     this.ipc.write(buffer)
+  }
+}
+
+// Include detached invite/setup work in the identity replacement barrier.
+for (const name of [
+  'handlePeerControl',
+  'deliverMailboxInvite',
+  'handleProtocol',
+  'handleBlindPeer',
+  'handlePush',
+  'handleContacts',
+  'handleConversation',
+  '_setupGroupAndSendInvites',
+  '_sendDirectInvite',
+  '_handleDirectInvite',
+  '_handleGroupInvite',
+  '_leaveGroup',
+  '_deleteGroup',
+  '_removeConversation',
+  '_handleGroupLeave',
+  '_handleGroupRenamed',
+  '_handleGroupMemberAdded',
+  '_handleGroupDeleted',
+  'handleMessage',
+  '_requireSendableConversation',
+  '_sendReadReceiptIfNeeded',
+  'handleConnection',
+  'handleMedia'
+]) {
+  const method = IPCHandler.prototype[name]
+  IPCHandler.prototype[name] = function (...args) {
+    if (!this._tasks) this._tasks = new TaskScope()
+    return this._tasks.run(() => method.apply(this, args))
   }
 }
 

@@ -38,6 +38,8 @@ class DHTHealthMonitor extends EventEmitter {
     this.checkTimeout = options.checkTimeout || 8000      // 8 seconds
 
     // External references (set via setSwarm / setPeerCountFn)
+    this._generation = 0
+    this._checks = new Set()
     this._swarm = null
     this._getPeerCount = () => 0
 
@@ -75,23 +77,32 @@ class DHTHealthMonitor extends EventEmitter {
    * Tests the existing swarm's DHT readiness + peer connectivity.
    */
   async checkHealth() {
+    const generation = this._generation
     const timestamp = new Date().toISOString()
     let dhtReady = false
     const peerCount = this._getPeerCount()
 
     if (this._swarm && this._swarm.dht) {
+      let timer
+      let cancel
       try {
         await Promise.race([
           this._swarm.dht.ready(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('DHT ready timeout')), this.checkTimeout)
-          )
+          new Promise((resolve, reject) => {
+            cancel = resolve
+            this._checks.add(cancel)
+            timer = setTimeout(() => reject(new Error('DHT ready timeout')), this.checkTimeout)
+          })
         ])
         dhtReady = true
       } catch (e) {
         diag('[DHTHealth] DHT ready check failed:', e.message)
+      } finally {
+        clearTimeout(timer)
+        this._checks.delete(cancel)
       }
     }
+    if (generation !== this._generation) return this.getStatus()
 
     // Determine status
     let status
@@ -136,6 +147,7 @@ class DHTHealthMonitor extends EventEmitter {
 
     diag(`[DHTHealth] Starting monitoring (interval: ${this.checkInterval}ms)`)
     this.isMonitoring = true
+    const generation = this._generation
 
     try {
       const initial = await this.checkHealth()
@@ -145,6 +157,7 @@ class DHTHealthMonitor extends EventEmitter {
       diag('[DHTHealth] Initial check failed:', e.message)
     }
 
+    if (!this.isMonitoring || generation !== this._generation) return
     this.monitoringInterval = setInterval(async () => {
       try { await this.checkHealth() } catch (e) {
         diag('[DHTHealth] Periodic check failed:', e.message)
@@ -156,6 +169,9 @@ class DHTHealthMonitor extends EventEmitter {
    * Stop monitoring.
    */
   stopMonitoring() {
+    this._generation++
+    for (const cancel of this._checks) cancel()
+    this._checks.clear()
     if (!this.isMonitoring) return
     diag('[DHTHealth] Stopping monitoring')
     if (this.monitoringInterval) {

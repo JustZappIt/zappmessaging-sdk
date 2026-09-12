@@ -24,6 +24,7 @@ const Corestore = require('corestore')
 const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const path = require('bare-path')
+const fs = require('bare-fs')
 const EventEmitter = require('bare-events')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { getInboundPushTopics } = require('./push-topics')
@@ -44,10 +45,12 @@ function coreFork (core) {
 }
 
 class HypercoreManager extends EventEmitter {
-  constructor () {
+  constructor (opts = {}) {
     super()
+    this._dataDir = opts.dataDir || getDataDir()
     this.store = null
     this.localCores = new Map()    // conversationId → Hypercore (writable)
+    this._appendChains = new Map() // serialize retry lookup + append per writer
     this.remoteCores = new Map()   // conversationId → Map<peerKeyHex, Hypercore>
     this._coreKeyIndex = new Map() // conversationId → Map<peerKeyHex, coreKeyHex>
     this._localReferrerIndex = new Map() // conversationId → recipient identity pubkey hex
@@ -104,12 +107,13 @@ class HypercoreManager extends EventEmitter {
 
   async initialize () {
     if (this._ready) return
-    const dataDir = getDataDir()
+    const dataDir = this._dataDir
     const storePath = path.join(dataDir, 'corestore')
     ensureDir(storePath)
     this.store = new Corestore(storePath)
     await this.store.ready()
     this._ready = true
+    this._closed = false
     diag('Corestore ready')
   }
 
@@ -495,8 +499,30 @@ class HypercoreManager extends EventEmitter {
   /**
    * Append a message to the local Hypercore for a conversation.
    */
-  async appendMessage (conversationId, message) {
+  async appendMessage (conversationId, message, { deduplicate = false } = {}) {
+    const previous = this._appendChains.get(conversationId) || Promise.resolve()
+    const operation = previous.catch(() => {}).then(() => this._appendMessage(conversationId, message, deduplicate))
+    this._appendChains.set(conversationId, operation)
+    try { return await operation } finally {
+      if (this._appendChains.get(conversationId) === operation) this._appendChains.delete(conversationId)
+    }
+  }
+
+  async _appendMessage (conversationId, message, deduplicate) {
     const core = await this.getOrCreateLocalCore(conversationId)
+    // Only retries scan history; ordinary sends remain constant-time. The log
+    // itself is authoritative, including after an IPC timeout or process death
+    // between committing the append and recording/returning its result.
+    if (deduplicate && message && message.id && !message.type) {
+      for (let index = core.length - 1; index >= 0; index--) {
+        const stored = await core.get(index)
+        if (!stored || stored.type || stored.id !== message.id) continue
+        if (stored.senderId !== message.senderId || stored.mediaId !== message.mediaId) {
+          throw new Error('Message retry does not match durable record')
+        }
+        return { core, index, duplicate: true }
+      }
+    }
     const appendResult = await core.append(message)
     const index = appendResult.length - 1
     diag('Appended conv=' + conversationId.substring(0, 12) +
@@ -676,7 +702,7 @@ class HypercoreManager extends EventEmitter {
         }
       }
       const data = { version: 3, remotes, localReferrers, remoteReferrers, cursors }
-      const dataDir = getDataDir()
+      const dataDir = this._dataDir
       writeJSON(path.join(dataDir, 'corekeys.json'), data)
       diag('Saved core key index: ' + Object.keys(remotes).length + ' conversation(s)')
     } catch (err) {
@@ -703,7 +729,7 @@ class HypercoreManager extends EventEmitter {
   async _loadCoreKeyIndex () {
     let hydrated = false
     try {
-      const dataDir = getDataDir()
+      const dataDir = this._dataDir
       const indexPath = path.join(dataDir, 'corekeys.json')
       const data = readJSON(indexPath)
       if (!data && fileExists(indexPath)) {
@@ -771,9 +797,22 @@ class HypercoreManager extends EventEmitter {
     }
   }
 
+  // Called only for a different identity, after network/IPC work quiesces.
+  // Reusing named writable cores would retain the previous account's log/key.
+  async resetIdentity () {
+    await this.close()
+    fs.rmSync(path.join(this._dataDir, 'corestore'), { recursive: true, force: true })
+    fs.rmSync(path.join(this._dataDir, 'corekeys.json'), { force: true })
+    this._coreKeyIndexHydrated = false
+    this._coreKeyIndexLoadPromise = null
+    await this.initialize()
+  }
+
   async close () {
     if (this._closed) return
     this._closed = true
+
+    await Promise.allSettled([...this._appendChains.values()])
 
     this.saveCoreKeyIndex()
 

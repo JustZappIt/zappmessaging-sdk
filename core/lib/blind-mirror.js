@@ -17,6 +17,7 @@
  */
 
 const EventEmitter = require('bare-events')
+const { NotificationWork } = require('./notification-work')
 const b4a = require('b4a')
 const { BLIND_PEER_KEYS, BLIND_PEER_ADDRESS, CUSTOM_BOOTSTRAP_NODES, LOG_LEVEL } = require('./config')
 const { createDiagnosticLogger } = require('./diagnostics')
@@ -37,11 +38,6 @@ function debugDiag (...args) {
 const DEFAULT_BLIND_PEER_KEYS = BLIND_PEER_KEYS
 const DEFAULT_NOTIFICATION_RETRY_DELAYS = [0, 1000, 3000]
 
-function delay (ms) {
-  if (ms <= 0) return Promise.resolve()
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
 class BlindMirror extends EventEmitter {
   /**
    * @param {Hyperswarm} swarm - The Hyperswarm instance from P2PManager
@@ -60,6 +56,7 @@ class BlindMirror extends EventEmitter {
     this.mirrors = opts.mirrors || Math.min(2, this.keys.length)
     this._usesDefaultMirrorCount = !opts.mirrors
     this._notificationRetryDelays = opts.notificationRetryDelays || DEFAULT_NOTIFICATION_RETRY_DELAYS
+    this._notifications = new NotificationWork(opts.notificationWork)
     this._peering = null
     this._ready = false
     this._closed = false
@@ -189,7 +186,7 @@ class BlindMirror extends EventEmitter {
       // ever drops without us getting an explicit error.
       this._stateInterval = setInterval(() => this._dumpState(), 10000)
       // First dump shortly after construction so we don't wait 10s for signal.
-      setTimeout(() => this._dumpState(), 2000)
+      this._firstStateTimer = setTimeout(() => this._dumpState(), 2000)
 
       // Debug-only: run an independent findPeer() probe every 20s and log
       // responder counts. Useful for diagnosing PEER_NOT_FOUND failures and
@@ -197,7 +194,7 @@ class BlindMirror extends EventEmitter {
       // flooding production logs.
       if (LOG_LEVEL === 'debug') {
         this._probeInterval = setInterval(() => this._probeFindPeer(), 20000)
-        setTimeout(() => this._probeFindPeer(), 3000)
+        this._firstProbeTimer = setTimeout(() => this._probeFindPeer(), 3000)
       }
     } catch (err) {
       diag('Failed to initialize blind-peering: ' + (err.message || err))
@@ -526,19 +523,13 @@ class BlindMirror extends EventEmitter {
    * random discovery key; no identity-to-token lookup is involved.
    */
   async sendNotification (core, index) {
-    let lastError = null
-    for (const retryDelay of this._notificationRetryDelays) {
-      if (retryDelay > 0) await delay(retryDelay)
+    return this._notifications.enqueue(() => {
       if (!this._peering || this._closed) throw new Error('blind mirror unavailable')
-      try {
-        await this._peering.sendNotification(core, { index })
-        return
-      } catch (err) {
-        lastError = err
-      }
-    }
-    throw lastError || new Error('blind notification failed')
+      return this._peering.sendNotification(core, { index })
+    }, this._notificationRetryDelays)
   }
+
+  cancelNotifications () { this._notifications.cancel() }
 
   /**
    * Update blind peer keys at runtime (e.g. from settings).
@@ -570,6 +561,7 @@ class BlindMirror extends EventEmitter {
    * Closes connections to blind peers to save battery.
    */
   async suspend () {
+    this.cancelNotifications()
     if (!this._peering) return
     try {
       await this._peering.suspend()
@@ -584,6 +576,8 @@ class BlindMirror extends EventEmitter {
    * Reconnects to blind peers and flushes any pending data.
    */
   async resume () {
+    if (this._closed) return
+    this._notifications.resume()
     if (!this._peering) return
     try {
       await this._peering.resume()
@@ -599,6 +593,11 @@ class BlindMirror extends EventEmitter {
   async close () {
     if (this._closed) return
     this._closed = true
+    this.cancelNotifications()
+    clearTimeout(this._firstStateTimer)
+    clearTimeout(this._firstProbeTimer)
+    this._firstStateTimer = null
+    this._firstProbeTimer = null
 
     if (this._stateInterval) {
       clearInterval(this._stateInterval)

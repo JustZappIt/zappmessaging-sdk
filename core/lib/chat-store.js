@@ -146,6 +146,41 @@ function readNormalizedMessages (messagesPath, { strict = true } = {}) {
 }
 
 class ChatStore {
+  // Cache only successfully persisted normalized rows. Stat validation detects
+  // repairs/external edits; copy-on-read prevents failed mutations poisoning it.
+  _historyStamp (file) {
+    try {
+      const stat = require('bare-fs').statSync(file)
+      return { key: [stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':'), bytes: stat.size }
+    } catch (_) { return null }
+  }
+  _cacheMessages (file, messages) {
+    const stamp = this._historyStamp(file)
+    this._historyCache.delete(file)
+    if (!stamp || stamp.bytes > 8 * 1024 * 1024) return
+    this._historyCache.set(file, { ...stamp, messages: messages.map(message => ({ ...message })) })
+    let bytes = 0
+    for (const value of this._historyCache.values()) bytes += value.bytes
+    while (this._historyCache.size > 4 || bytes > 8 * 1024 * 1024) {
+      const first = this._historyCache.keys().next().value
+      bytes -= this._historyCache.get(first).bytes
+      this._historyCache.delete(first)
+    }
+  }
+  _readMessages (file, options = {}) {
+    const cached = this._historyCache.get(file)
+    const stamp = cached && this._historyStamp(file)
+    if (cached && stamp && cached.key === stamp.key) return cached.messages.map(message => ({ ...message }))
+    this._historyCache.delete(file)
+    const messages = readNormalizedMessages(file, options)
+    this._cacheMessages(file, messages)
+    return messages
+  }
+  _writeMessages (file, messages) {
+    writeJSON(file, messages)
+    this._cacheMessages(file, messages)
+  }
+
   constructor() {
     this.storagePath = path.join(getDataDir(), 'chats')
     this.conversations = new Map()
@@ -154,6 +189,7 @@ class ChatStore {
     // Note: index is populated at runtime via addMessage(); pre-existing media
     // messages fall back to full conversation scan in updateMediaPath().
     this._mediaIndex = new Map()
+    this._historyCache = new Map()
     // conversationId → newest peer message id we've already acked with a read
     // receipt. Lets _sendReadReceiptIfNeeded skip redundant receipts.
     this.sentReadWatermarks = new Map()
@@ -487,7 +523,7 @@ class ChatStore {
 
     // Load existing messages
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    let messages = readNormalizedMessages(messagesPath, { strict: true })
+    let messages = this._readMessages(messagesPath, { strict: true })
 
     // Dedup: same message can arrive via the live socket AND the per-peer
     // Hypercore (blind-peer replication). Returning null lets callers
@@ -513,13 +549,13 @@ class ChatStore {
       if (!messages.includes(message)) {
         // The late insert itself fell outside retention. Persist the trim but
         // report null — like the dedup path — so callers suppress the UI event.
-        writeJSON(messagesPath, messages)
+        this._writeMessages(messagesPath, messages)
         return null
       }
     }
 
     // Save messages
-    writeJSON(messagesPath, messages)
+    this._writeMessages(messagesPath, messages)
 
     // Update media index for efficient lookups
     if (message.mediaId) {
@@ -567,7 +603,7 @@ class ChatStore {
     // Scan persisted references too: the runtime media index is only a cache.
     for (const conv of this.conversations.values()) {
       if (!this.isPeerAuthorized(conv.id, peer)) continue
-      const messages = readNormalizedMessages(path.join(this.storagePath, conv.id + '.json'), { strict: true })
+      const messages = this._readMessages(path.join(this.storagePath, conv.id + '.json'), { strict: true })
       if (messages.some(m => m.mediaId === mediaId && m.mediaAuthorized === true)) return true
     }
     return false
@@ -575,22 +611,23 @@ class ChatStore {
 
   hasAuthorizedMediaReference(conversationId, mediaId) {
     if (!this.conversations.has(conversationId) || this.hasLeftConversation(conversationId)) return false
-    const messages = readNormalizedMessages(path.join(this.storagePath, conversationId + '.json'), { strict: true })
+    const messages = this._readMessages(path.join(this.storagePath, conversationId + '.json'), { strict: true })
     return messages.some(m => m.mediaId === mediaId && m.mediaAuthorized === true)
   }
 
-  authorizeReceivedMedia(conversationId, mediaId) {
+  authorizeReceivedMedia(conversationId, mediaId, filePath = null) {
     if (!this.conversations.has(conversationId) || this.hasLeftConversation(conversationId)) return false
     const messagesPath = path.join(this.storagePath, conversationId + '.json')
-    const messages = readNormalizedMessages(messagesPath, { strict: true })
+    const messages = this._readMessages(messagesPath, { strict: true })
     let changed = false
     for (const message of messages) {
-      if (message.mediaId === mediaId && message.mediaAuthorized !== true) {
+      if (message.mediaId === mediaId && (message.mediaAuthorized !== true || (filePath && message.mediaLocalPath !== filePath))) {
         message.mediaAuthorized = true
+        if (filePath) { message.mediaLocalPath = filePath; message.mediaTransferState = 'complete' }
         changed = true
       }
     }
-    if (changed) writeJSON(messagesPath, messages)
+    if (changed) this._writeMessages(messagesPath, messages)
     return changed
   }
 
@@ -627,7 +664,7 @@ class ChatStore {
       const messagesPath = path.join(this.storagePath, `${convId}.json`)
       try {
         if (!fs.existsSync(messagesPath)) continue
-        const messages = readNormalizedMessages(messagesPath)
+        const messages = this._readMessages(messagesPath)
         let changed = false
         for (const msg of messages) {
           if (msg.mediaId === mediaId && !msg.mediaLocalPath) {
@@ -636,7 +673,7 @@ class ChatStore {
           }
         }
         if (changed) {
-          writeJSON(messagesPath, messages)
+          this._writeMessages(messagesPath, messages)
         }
       } catch (err) {
         diag('Failed to update media path for', convId.substring(0, 12), err)
@@ -658,7 +695,7 @@ class ChatStore {
   markReadUpTo(conversationId, upToMessageId) {
     if (!upToMessageId) return []
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    const messages = readNormalizedMessages(messagesPath, { strict: true })
+    const messages = this._readMessages(messagesPath, { strict: true })
 
     // The receipt names one of our messages; we don't have it if it was trimmed
     // at the cap or never reached us. Without a position there's nothing to mark.
@@ -673,14 +710,14 @@ class ChatStore {
         changed.push(m.id)
       }
     }
-    if (changed.length > 0) writeJSON(messagesPath, messages)
+    if (changed.length > 0) this._writeMessages(messagesPath, messages)
     return changed
   }
 
   markDeliveredUpTo(conversationId, upToMessageId) {
     if (!upToMessageId) return []
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    const messages = readNormalizedMessages(messagesPath, { strict: true })
+    const messages = this._readMessages(messagesPath, { strict: true })
 
     const cutoff = messages.findIndex(m => m && m.id === upToMessageId)
     if (cutoff < 0) return []
@@ -694,7 +731,7 @@ class ChatStore {
         changed.push(message.id)
       }
     }
-    if (changed.length > 0) writeJSON(messagesPath, messages)
+    if (changed.length > 0) this._writeMessages(messagesPath, messages)
     return changed
   }
 
@@ -713,7 +750,7 @@ class ChatStore {
   markRelayedByIds(conversationId, messageIds) {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return []
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
-    const messages = readNormalizedMessages(messagesPath, { strict: true })
+    const messages = this._readMessages(messagesPath, { strict: true })
 
     const wanted = new Set(messageIds)
     const changed = []
@@ -725,14 +762,14 @@ class ChatStore {
       message.status = 'sent'
       changed.push(message.id)
     }
-    if (changed.length > 0) writeJSON(messagesPath, messages)
+    if (changed.length > 0) this._writeMessages(messagesPath, messages)
     return changed
   }
 
   getPendingOutgoingMessages(conversationId) {
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
     try {
-      return readNormalizedMessages(messagesPath).filter(message =>
+      return this._readMessages(messagesPath).filter(message =>
         message && message.isFromMe &&
         (message.status === 'queued' || message.status === 'sent')
       )
@@ -754,7 +791,7 @@ class ChatStore {
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
     let messages
     try {
-      messages = readNormalizedMessages(messagesPath)
+      messages = this._readMessages(messagesPath)
     } catch (err) {
       return null
     }
@@ -769,7 +806,7 @@ class ChatStore {
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
     let messages
     try {
-      messages = readNormalizedMessages(messagesPath)
+      messages = this._readMessages(messagesPath)
     } catch (err) {
       return []
     }
@@ -809,16 +846,26 @@ class ChatStore {
    */
   async clearAll() {
     const fs = require('bare-fs')
-    try {
-      const entries = fs.readdirSync(this.storagePath)
-      for (const entry of entries) {
-        try { fs.unlinkSync(path.join(this.storagePath, entry)) } catch (e) { /* ignore */ }
+    let entries
+    try { entries = fs.readdirSync(this.storagePath) } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+      entries = []
+    }
+    for (const entry of entries) {
+      try { fs.unlinkSync(path.join(this.storagePath, entry)) } catch (error) {
+        if (error.code !== 'ENOENT') throw error
       }
-    } catch (e) { /* ignore — directory may not exist */ }
+    }
     this.conversations.clear()
     this.leftConversations.clear()
     this._mediaIndex.clear()
+    this._historyCache.clear()
     this.sentReadWatermarks.clear()
+  }
+
+  getMessageStatus (conversationId, messageId) {
+    const messages = this._readMessages(path.join(this.storagePath, conversationId + '.json'))
+    return messages.find(message => message.id === messageId)?.status
   }
 
   /**
@@ -831,7 +878,7 @@ class ChatStore {
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
 
     try {
-      const messages = readNormalizedMessages(messagesPath)
+      const messages = this._readMessages(messagesPath)
       return messages.slice(-limit)
     } catch (error) {
       diag('Failed to get messages:', error)
@@ -851,7 +898,7 @@ class ChatStore {
     if (!conversationId || !messageId) return null
     const messagesPath = path.join(this.storagePath, `${conversationId}.json`)
     try {
-      const raw = readNormalizedMessages(messagesPath)
+      const raw = this._readMessages(messagesPath)
       for (const m of raw) {
         if (m && m.id === messageId) return m.thumbnailData || null
       }

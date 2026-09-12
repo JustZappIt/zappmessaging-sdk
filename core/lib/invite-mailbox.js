@@ -87,7 +87,12 @@ async function drainInvites (request, keyPair, deliver) {
 
     const finished = []
     for (const entry of decoded) {
-      if (entry.invalid || !deliver || await deliver(entry)) finished.push(entry.id)
+      try {
+        if (entry.invalid || !deliver || await deliver(entry)) finished.push(entry.id)
+      } catch (_) {
+        // A transient application failure belongs to this entry. Other entries
+        // can still be applied and acknowledged on their originating store.
+      }
     }
     accepted.push(...decoded)
 
@@ -112,7 +117,8 @@ function asPage (reply) {
 
 function decodeEntries (entries, keyPair) {
   const decoded = []
-  for (const entry of Array.isArray(entries) ? entries : []) {
+  if (JSON.stringify(entries).length > 256 * 1024) throw new Error('mailbox page too large')
+  for (const entry of (Array.isArray(entries) ? entries : []).slice(0, 100)) {
     if (!entry || typeof entry.id !== 'string') continue
     try {
       decoded.push({ id: entry.id, ...decryptInvite(entry.envelope, keyPair) })
@@ -132,6 +138,7 @@ function decodeEntries (entries, keyPair) {
  */
 async function throughDht (dht, keyPair, blindPeerKey, address, operation, opts = {}) {
   const timeout = opts.timeout || DEFAULT_TIMEOUT_MS
+  const deadline = Date.now() + (opts.operationTimeout || 30000)
   const connection = dht.connect(encodeTarget(blindPeerKey, address), { keyPair })
   const rpc = new ProtomuxRPC(connection, {
     protocol: PROTOCOL,
@@ -139,10 +146,12 @@ async function throughDht (dht, keyPair, blindPeerKey, address, operation, opts 
     valueEncoding: c.string
   })
   const request = async (method, body) => {
+    const remaining = Math.min(timeout, deadline - Date.now())
+    if (remaining <= 0) throw new Error('mailbox operation timeout')
     const raw = await rpc.request(method, JSON.stringify(body), {
       requestEncoding: c.string,
       responseEncoding: method === LIST_METHOD ? c.string : c.none,
-      timeout
+      timeout: remaining
     })
     return method === LIST_METHOD ? JSON.parse(raw) : {}
   }
@@ -169,11 +178,22 @@ async function throughHttps (baseUrl, keyPair, operation, opts = {}) {
   }
   const base = String(baseUrl || '').replace(/\/+$/, '')
   if (!/^https:\/\//i.test(base)) throw new Error('invite mailbox URL must use HTTPS')
+  const deadline = Date.now() + (opts.operationTimeout || 30000)
   const request = async (method, body) => {
     const payload = method === PUT_METHOD
       ? body
       : createAuthRequest(method, keyPair, body.ids || [])
-    return await opts.postJson(base + '/' + method, payload) || {}
+    const timeout = Math.min(opts.timeout || DEFAULT_TIMEOUT_MS, deadline - Date.now())
+    if (timeout <= 0) throw new Error('mailbox operation timeout')
+    let timer
+    try {
+      return await Promise.race([
+        opts.postJson(base + '/' + method, payload),
+        new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('mailbox request timeout')), timeout)
+        })
+      ]) || {}
+    } finally { clearTimeout(timer) }
   }
   return await operation(request)
 }

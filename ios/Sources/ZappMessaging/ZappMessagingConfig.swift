@@ -53,6 +53,9 @@ public struct ZappMessagingConfig: Sendable {
     /// buffer at the same time.
     public var mediaMaxBytes: Int?
 
+    /// Numeric media timing events only; independent of general debug logging.
+    public var mediaDiagnostics: Bool = false
+
     public init(
         dataDir: URL,
         blindPeerKeys: String? = nil,
@@ -61,7 +64,8 @@ public struct ZappMessagingConfig: Sendable {
         localGateway: String? = nil,
         inviteMailboxURL: String? = nil,
         logLevel: String? = nil,
-        mediaMaxBytes: Int? = nil
+        mediaMaxBytes: Int? = nil,
+        mediaDiagnostics: Bool = false
     ) {
         self.dataDir = dataDir
         self.blindPeerKeys = blindPeerKeys
@@ -71,6 +75,7 @@ public struct ZappMessagingConfig: Sendable {
         self.inviteMailboxURL = inviteMailboxURL
         self.logLevel = logLevel
         self.mediaMaxBytes = mediaMaxBytes
+        self.mediaDiagnostics = mediaDiagnostics
     }
 
     /// The argv handed to `BareWorklet.start`. Order and spelling must match
@@ -100,6 +105,7 @@ public struct ZappMessagingConfig: Sendable {
             args.append("--media-max-bytes=\(mediaMaxBytes)")
         }
 
+        if mediaDiagnostics { args.append("--media-diagnostics") }
         return args
     }
 }

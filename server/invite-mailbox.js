@@ -85,8 +85,15 @@ class MailboxStore {
     this.ttlMs = positiveInteger(opts.ttlMs, DEFAULTS.ttlMs)
     fs.mkdirSync(this.directory, { recursive: true, mode: 0o700 })
     this._total = 0
+    this._maintenanceRecipients = new Set()
+    this._cleanupBatchSize = positiveInteger(opts.cleanupBatchSize, 16)
+    this._log = opts.log || (() => {})
     this._importLegacyFile()
     this._total = this._countAll()
+    this._maintenanceTimer = setInterval(() => this.reclaimExpired(),
+      positiveInteger(opts.cleanupIntervalMs, 1000))
+    this._maintenanceTimer.unref()
+
   }
 
   put (recipient, envelope, expectedSender) {
@@ -102,6 +109,7 @@ class MailboxStore {
     if (storedBytes + envelope.length > this.maxBytesPerRecipient) {
       throw new Error('invite mailbox recipient byte quota exceeded')
     }
+    if (this._total >= this.maxTotal) this.reclaimExpired()
     if (this._total >= this.maxTotal) {
       throw new Error('invite mailbox is full')
     }
@@ -171,10 +179,13 @@ class MailboxStore {
     let parsed
     try {
       parsed = JSON.parse(fs.readFileSync(this._pathFor(recipient), 'utf8'))
-    } catch (_) {
-      return []
+    } catch (error) {
+      // Missing is empty; unreadable/corrupt is not. Never overwrite accepted
+      // invitations after a failed read or silently discount their capacity.
+      if (error.code === 'ENOENT' || !RECIPIENT_KEY.test(recipient)) return []
+      throw error
     }
-    if (!Array.isArray(parsed)) return []
+    if (!Array.isArray(parsed)) throw new Error('invalid mailbox file')
     const cutoff = Date.now() - this.ttlMs
     const current = parsed.filter(entry => (
       entry &&
@@ -190,30 +201,53 @@ class MailboxStore {
   _write (recipient, entries, previous) {
     const target = this._pathFor(recipient)
     if (entries.length === 0) {
-      try { fs.unlinkSync(target) } catch (_) {}
+      try { fs.unlinkSync(target) } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+      }
     } else {
       const temp = target + '.tmp'
       fs.writeFileSync(temp, JSON.stringify(entries), { mode: 0o600 })
       fs.renameSync(temp, target)
     }
+    if (entries.length) this._maintenanceRecipients.add(recipient)
+    else this._maintenanceRecipients.delete(recipient)
     this._total += entries.length - previous
     if (this._total < 0) this._total = 0
   }
 
   _countAll () {
     let total = 0
-    for (const recipient of this._recipients()) total += this._read(recipient).length
+    for (const recipient of this._recipients()) {
+      const count = this._read(recipient).length
+      total += count
+      if (count) this._maintenanceRecipients.add(recipient)
+    }
     return total
   }
 
-  _recipients () {
-    try {
-      return fs.readdirSync(this.directory)
-        .filter(name => /^[0-9a-f]{64}\.json$/.test(name))
-        .map(name => name.slice(0, 64))
-    } catch (_) {
-      return []
+  // Rotate a bounded in-memory recipient index, populated once at startup
+  // and maintained only after successful writes. No per-request directory scan.
+  reclaimExpired () {
+    const count = Math.min(this._cleanupBatchSize, this._maintenanceRecipients.size)
+    for (let i = 0; i < count; i++) {
+      const recipient = this._maintenanceRecipients.values().next().value
+      this._maintenanceRecipients.delete(recipient)
+      this._maintenanceRecipients.add(recipient)
+      try { this._read(recipient) } catch (error) {
+        this._log('invite mailbox expiration failed: ' + error.message)
+      }
     }
+  }
+
+  close () {
+    clearInterval(this._maintenanceTimer)
+    this._maintenanceTimer = null
+  }
+
+  _recipients () {
+    return fs.readdirSync(this.directory)
+      .filter(name => /^[0-9a-f]{64}\.json$/.test(name))
+      .map(name => name.slice(0, 64))
   }
 
   /**
@@ -353,6 +387,7 @@ function attachInviteMailbox (blindPeer, opts = {}) {
       return httpServer ? httpServer.address() : null
     },
     async close () {
+      store.close()
       blindPeer.swarm.removeListener('connection', onConnection)
       for (const rpc of rpcs) {
         try { rpc.destroy() } catch (_) {}

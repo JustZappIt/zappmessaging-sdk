@@ -2,6 +2,7 @@ package xyz.justzappit.zappmessaging.core
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import to.holepunch.bare.kit.IPC
@@ -103,6 +104,7 @@ class BareWorkletManager {
                 argv += "--local-gateway=$gatewayIp"
                 ZMLog.debug(TAG) { "Local gateway detected" }
             }
+            if (Log.isLoggable("ZappMediaTiming", Log.DEBUG)) argv += "--media-diagnostics"
             if (BuildConfig.ZAPP_MESSAGING_LOG_LEVEL.isNotEmpty()) {
                 argv += "--log-level=${BuildConfig.ZAPP_MESSAGING_LOG_LEVEL}"
             }

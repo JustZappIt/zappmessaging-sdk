@@ -39,6 +39,9 @@ function makeHarness ({ conversations = {}, groupTopics = {}, leftConversations 
   const chatStore = {
     conversations: new Map(Object.entries(conversations)),
     leftConversations: new Set(leftConversations),
+    hasAppliedControl: ChatStore.prototype.hasAppliedControl,
+    markControlApplied: ChatStore.prototype.markControlApplied,
+    saveConversationsIndex () {},
     async getConversation (id) { return this.conversations.get(id) || null },
     hasLeftConversation (id) { return this.leftConversations.has(id) },
     clearLeftStatus (id) {

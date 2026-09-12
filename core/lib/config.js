@@ -50,6 +50,8 @@ const BLIND_PEER_ADDRESS = (() => {
 // with identity-signed list/ack requests. It is a control-plane fallback only;
 // message blocks remain in Hypercore/blind-peering.
 const INVITE_MAILBOX_URL = getArg('invite-mailbox-url') || null
+// Optional explicit mapping of the HTTPS URL to a configured blind-peer store.
+const INVITE_MAILBOX_PEER_KEY = getArg('invite-mailbox-peer-key') || null
 
 // --- Identity file key (secret; injected by the native layer) ---
 // 64 hex chars = 32 bytes. When present, identity.json (the BIP-39 wallet
@@ -126,6 +128,7 @@ module.exports = {
   BLIND_PEER_KEYS,
   BLIND_PEER_ADDRESS,
   INVITE_MAILBOX_URL,
+  INVITE_MAILBOX_PEER_KEY,
   IDENTITY_FILE_KEY,
   LOCAL_GATEWAY_IP,
   DEFAULT_BOOTSTRAP_NODES,

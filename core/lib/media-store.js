@@ -64,8 +64,14 @@ class MediaStore {
     const fileName = hashHex + '.' + safeExt
     const filePath = path.join(this.mediaDir, fileName)
 
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, buffer)
+    // The caller verified these bytes. Replace interrupted/corrupt earlier
+    // files atomically instead of treating mere existence as valid content.
+    const temporary = filePath + '.tmp'
+    try {
+      fs.writeFileSync(temporary, buffer)
+      fs.renameSync(temporary, filePath)
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary)
     }
 
     return filePath

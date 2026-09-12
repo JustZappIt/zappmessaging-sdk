@@ -142,6 +142,8 @@ if (!P2PManager) {
     suspend() {}
     resume() {}
     async stop() {}
+    runTask(fn) { return Promise.resolve().then(fn) }
+    async dispose() { this.removeAllListeners() }
   }
   diag('Using stub P2PManager - P2P networking is disabled')
   diag('Using stub P2PManager - P2P networking is disabled')
@@ -158,10 +160,17 @@ if (!Identity || !ChatStore || !ContactStore || !IPCHandler) {
 // when an inbound message references a mediaId we don't have on disk, request
 // it from the author (or any connected peer in the conversation), and retry
 // when a peer (re)connects or an in-flight transfer stalls.
-const _mediaRequests = new Map() // mediaId -> { conversationId, senderId, attempts, lastAt }
-const MEDIA_REQUEST_MAX_ATTEMPTS = 12
-const MEDIA_REQUEST_COOLDOWN_MS = 10000
-const MAX_PENDING_MEDIA_REQUESTS = 512
+const { MediaDownloads } = require('./lib/media-downloads')
+const { mediaTiming, setMediaTimingSink } = require('./lib/media-timing')
+const _mediaRequests = new MediaDownloads({
+  request: (...args) => p2pManager && !p2pManager._stopping && p2pManager.requestMedia(...args),
+  cancel: hash => mediaTransfer && mediaTransfer.cancelDownload(hash),
+  state: (mediaId, state, conversationId) => ipcHandler && ipcHandler.pushEvent('media.transfer_state',
+    { mediaId, state, conversationId, direction: 'download' })
+})
+if (typeof Bare !== 'undefined' && Bare.argv.includes('--media-diagnostics')) {
+  setMediaTimingSink(event => ipcHandler && ipcHandler.pushEvent('media.diagnostic', event))
+}
 
 function peerIdOrNull (value) {
   return isPeerId(value) ? value : null
@@ -171,36 +180,14 @@ function requestMediaForMessage (conversationId, message, peerId) {
   try {
     if (typeof conversationId !== 'string' || conversationId.length === 0) return
     if (!message || message.isFromMe || !isMediaId(message.mediaId)) return
-    if (!mediaStore || !p2pManager) return
+    if (!mediaStore || !p2pManager || p2pManager._stopping) return
     if (mediaStore.hasMedia(message.mediaId) && chatStore &&
         chatStore.hasAuthorizedMediaReference(conversationId, message.mediaId)) {
       return
     }
 
-    const mediaId = message.mediaId
-    const now = Date.now()
-    const senderId = peerIdOrNull(peerId) || peerIdOrNull(message.senderId)
-    const entry = _mediaRequests.get(mediaId) ||
-      { conversationId, senderId, attempts: 0, lastAt: 0 }
-    // A transfer's authorization scope cannot move when another conversation
-    // references the same hash. Its chunks prove possession only in this scope.
-
-    if (!_mediaRequests.has(mediaId) && _mediaRequests.size >= MAX_PENDING_MEDIA_REQUESTS) {
-      const oldestMediaId = _mediaRequests.keys().next().value
-      _mediaRequests.delete(oldestMediaId)
-      if (mediaTransfer) mediaTransfer.cancelTransfer(oldestMediaId)
-    }
-    _mediaRequests.set(mediaId, entry)
-
-    if (entry.attempts >= MEDIA_REQUEST_MAX_ATTEMPTS) return
-    if (entry.lastAt && (now - entry.lastAt) < MEDIA_REQUEST_COOLDOWN_MS) return
-
-    const sent = p2pManager.requestMedia(entry.conversationId, mediaId, entry.senderId)
-    if (sent) {
-      entry.attempts += 1
-      entry.lastAt = now
-    }
-    // If no socket was available the entry is retained so peer_online retries.
+    _mediaRequests.enqueue(message.mediaId, conversationId,
+      peerIdOrNull(peerId) || peerIdOrNull(message.senderId))
   } catch (err) {
     diag('requestMediaForMessage failed: ' + (err.message || err))
   }
@@ -209,17 +196,16 @@ function requestMediaForMessage (conversationId, message, peerId) {
 async function requestMissingMediaForConversation (conversationId, peerId) {
   try {
     if (!chatStore || !mediaStore) return
-    const messages = await chatStore.getMessages(conversationId, 50)
+    const messages = await chatStore.getMessages(conversationId, 5000)
     for (const m of messages) {
       if (m && isMediaId(m.mediaId) && !m.isFromMe &&
           (!mediaStore.hasMedia(m.mediaId) || !chatStore.hasAuthorizedMediaReference(conversationId, m.mediaId))) {
-        const entry = _mediaRequests.get(m.mediaId)
+        const entry = _mediaRequests.get(m.mediaId, conversationId)
         const onlinePeerId = peerIdOrNull(peerId)
         // A fresh author connection is a meaningful new opportunity. Reset a
         // prior cap, but never replace the author with an unrelated group peer.
         if (entry && onlinePeerId && onlinePeerId === peerIdOrNull(m.senderId)) {
-          entry.attempts = 0
-          entry.lastAt = 0
+          _mediaRequests.enqueue(m.mediaId, conversationId, entry.senderId, true)
         }
         requestMediaForMessage(conversationId, m, m.senderId)
       }
@@ -240,6 +226,7 @@ let ipcHandler = null
 let hypercoreManager = null
 let blindMirror = null
 let blindMirrorInitPromise = null
+let blindMirrorInitSwarm = null
 
 const receivePeerRecord = createPeerReceiver(() => ({
   chatStore, p2pManager, ipcHandler, identity, processReceipt,
@@ -289,27 +276,46 @@ async function ensureBlindMirror () {
   // DHT readiness and the normal post-start fallback can race each other.
   // Share one initialization so only one mirror and one set of replication
   // sessions can be created for a swarm.
-  if (blindMirrorInitPromise) return blindMirrorInitPromise
+  if (blindMirrorInitPromise) {
+    const initializingSwarm = blindMirrorInitSwarm
+    await blindMirrorInitPromise
+    // A plain stop/start can overtake initialization (without changing keys).
+    // Completion for that old swarm must not satisfy the new swarm's wiring.
+    if (p2pManager.swarm && p2pManager.swarm !== initializingSwarm) return ensureBlindMirror()
+    return
+  }
+  blindMirrorInitSwarm = p2pManager.swarm
   blindMirrorInitPromise = initializeBlindMirror()
   try {
     return await blindMirrorInitPromise
   } finally {
     blindMirrorInitPromise = null
+    blindMirrorInitSwarm = null
   }
 }
 
 async function initializeBlindMirror () {
+  const swarm = p2pManager.swarm
+  const current = () => swarm && p2pManager.swarm === swarm && !p2pManager._stopping
   // If the mirror already exists but its swarm reference is stale (a previous
   // p2pManager.stop() destroyed it), tear it down so we can rebuild fresh.
   if (blindMirror && blindMirror.swarm !== p2pManager.swarm) {
+    p2pManager.blindMirror = null
+    if (ipcHandler) ipcHandler.blindMirror = null
     try { await blindMirror.close() } catch (e) { diag('blindMirror close (rebuild): ' + e.message) }
     blindMirror = null
   }
 
+  if (!current()) return
   if (!blindMirror) {
     try {
-      blindMirror = new BlindMirror(p2pManager.swarm, hypercoreManager.store)
+      blindMirror = new BlindMirror(swarm, hypercoreManager.store)
       await blindMirror.ready()
+      if (!current()) {
+        await blindMirror.close()
+        blindMirror = null
+        return
+      }
       p2pManager.blindMirror = blindMirror
       if (ipcHandler) ipcHandler.blindMirror = blindMirror
       diag('BlindMirror initialized with ' +
@@ -336,6 +342,7 @@ async function initializeBlindMirror () {
   // resume pulling them via the blind peer immediately on launch.
   try {
     await hypercoreManager.loadCoreKeyIndex()
+    if (!current()) return
     for (const [convId, peerMap] of hypercoreManager.remoteCores) {
       for (const [peerKey, core] of peerMap) {
         blindMirror.addRemoteCore(convId, peerKey, core, hypercoreManager.getRemoteCoreReferrer(convId, peerKey))
@@ -508,9 +515,21 @@ async function initialize() {
         p2pManager,
         mediaStore,
         mediaTransfer,
+        retryMediaDownload: (hash, conversationId, senderId) => _mediaRequests.enqueue(hash, conversationId, senderId, true),
+        cancelMediaDownload: hash => hash ? _mediaRequests.delete(hash) : _mediaRequests.clear(),
         // blindMirror is set on the handler after init below
         hypercoreManager,
-        ensureBlindMirror
+        ensureBlindMirror,
+        prepareIdentityChange: async () => {
+          if (blindMirrorInitPromise) await blindMirrorInitPromise
+          const previous = blindMirror
+          blindMirror = null
+          p2pManager.blindMirror = null
+          ipcHandler.blindMirror = null
+          if (previous) await previous.close()
+          _mediaRequests.clear()
+          if (hypercoreManager) await hypercoreManager.resetIdentity()
+        }
       })
       diag('IPC handler initialized')
     } else {
@@ -551,7 +570,7 @@ async function initialize() {
 
     // Receipts use the live socket when available and Hypercore otherwise.
     p2pManager.on('receipt', (conversationId, receipt) => {
-      processReceipt(conversationId, receipt).catch((err) => {
+      p2pManager.runTask(() => processReceipt(conversationId, receipt)).catch((err) => {
         diag('receipt handler failed: ' + (err.message || err))
       })
     })
@@ -588,7 +607,7 @@ async function initialize() {
       }
       // A peer just became reachable — pull any media we're still missing for
       // this conversation (e.g. sent while we were offline, the doorbell case).
-      requestMissingMediaForConversation(conversationId, peerId)
+      p2pManager.runTask(() => requestMissingMediaForConversation(conversationId, peerId)).catch(() => {})
     })
 
     p2pManager.on('peer_offline', (conversationId, peerId) => {
@@ -605,18 +624,17 @@ async function initialize() {
 
     // Set up media transfer event handlers
     if (mediaTransfer) {
-      const retryPendingMedia = (hashHex) => {
-        const entry = _mediaRequests.get(hashHex)
-        if (!entry) return
-        entry.lastAt = 0 // bypass the cooldown for an immediate retry
-        requestMediaForMessage(entry.conversationId,
-          { mediaId: hashHex, senderId: entry.senderId, isFromMe: false }, entry.senderId)
-      }
+      const retryPendingMedia = hashHex => _mediaRequests.retry(hashHex)
+      mediaTransfer.on('upload_state', (mediaId, state) => {
+        if (ipcHandler) ipcHandler.pushEvent('media.transfer_state', { mediaId, state, direction: 'upload' })
+      })
 
       mediaTransfer.on('complete', (hashHex, fullData) => {
         try {
           const request = _mediaRequests.get(hashHex)
-          if (!request) return
+          if (!request || !request.active) return
+          const timing = mediaTiming()
+          timing('receiver_verified', fullData.length)
           // Determine extension from first bytes (magic number detection)
           let ext = 'jpg'
           if (fullData.length >= 4) {
@@ -628,30 +646,32 @@ async function initialize() {
           const filePath = mediaStore.saveMediaWithHash(fullData, hashHex, ext)
           // Completion is emitted only after hash verification. Never grant
           // other conversations merely because their peer named the same hash.
-          if (chatStore) chatStore.authorizeReceivedMedia(request.conversationId, hashHex)
+          if (chatStore) chatStore.authorizeReceivedMedia(request.conversationId, hashHex, filePath)
+          timing('receiver_persisted', fullData.length)
           diag('Media transfer complete: ' + hashHex.substring(0, 12) + ' (' + fullData.length + ' bytes) -> ' + ext)
-
-          // Downloaded — stop tracking it as a pending fetch.
-          _mediaRequests.delete(hashHex)
-
-          // Update all messages with this mediaId to have the local path
-          if (chatStore) chatStore.updateMediaPath(hashHex, filePath)
 
           // Notify UI
           if (ipcHandler) {
+            timing('receiver_ui_event', fullData.length)
             ipcHandler.pushEvent('media.transfer_complete', {
               mediaId: hashHex,
+              conversationId: request.conversationId,
               mediaLocalPath: filePath,
               mediaSize: fullData.length
             })
           }
+          // Only this conversation proved possession. Other conversations
+          // retain their own requests and must verify bytes from their peers.
+          _mediaRequests.complete(hashHex)
         } catch (err) {
+          retryPendingMedia(hashHex)
           diag('Failed to save received media:', err)
           diag('Failed to save received media: ' + (err.message || err))
         }
       })
 
       mediaTransfer.on('progress', (hashHex, progress) => {
+        _mediaRequests.progress(hashHex)
         if (ipcHandler) {
           ipcHandler.pushEvent('media.transfer_progress', {
             mediaId: hashHex,
@@ -671,9 +691,9 @@ async function initialize() {
     }
 
     // Handle media requests from peers
-    p2pManager.on('media_request', async (hashBuf, peerId, framedSocket) => {
+    p2pManager.on('media_request', async (hashBuf, peerId, framedSocket, attempt) => {
       try {
-        await serveAuthorizedMedia(chatStore, mediaTransfer, hashBuf, peerId, framedSocket)
+        await p2pManager.runTask(() => serveAuthorizedMedia(chatStore, mediaTransfer, hashBuf, peerId, framedSocket, attempt))
       } catch (err) {
         diag('Failed to handle media request:', err)
         diag('Failed to handle media request: ' + (err.message || err))
@@ -777,12 +797,19 @@ async function initialize() {
 async function shutdown() {
   diag('Shutting down ZappMessaging Core...')
 
+  if (ipcHandler) await ipcHandler.quiesce()
+  else if (p2pManager) await p2pManager.stop()
+  if (blindMirrorInitPromise) await blindMirrorInitPromise
   if (blindMirror) {
     try { await blindMirror.close() } catch (e) { diag('blindMirror close: ' + e.message) }
+    blindMirror = null
   }
+  _mediaRequests.clear()
   if (p2pManager) {
-    await p2pManager.stop()
+    p2pManager.blindMirror = null
+    await p2pManager.dispose()
   }
+  if (ipcHandler) ipcHandler.blindMirror = null
   if (hypercoreManager) {
     try { await hypercoreManager.close() } catch (e) { diag('hypercoreManager close: ' + e.message) }
   }

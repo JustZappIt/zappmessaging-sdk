@@ -112,7 +112,9 @@ class ContactStore {
       if (fs.existsSync(this.storagePath)) {
         fs.unlinkSync(this.storagePath)
       }
-    } catch (e) { /* ignore */ }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
     this.contacts.clear()
   }
 
