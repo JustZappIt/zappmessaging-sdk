@@ -18,6 +18,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # The relay retention test runs against the blind-peer the server deploys.
+      - run: cd server && npm ci
       - run: npm test
       - name: Repack Android worklet and verify the checked-in bundle
         run: |

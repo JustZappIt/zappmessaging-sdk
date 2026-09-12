@@ -536,6 +536,9 @@ Send a text message.
       "mediaSize": null,
       "mediaWidth": null,
       "mediaHeight": null,
+      "mediaCoreKey": null,
+      "mediaBlockOffset": null,
+      "mediaBlockLength": null,
       "thumbnailData": null,
       "mediaLocalPath": null,
       "mediaTransferState": null,
@@ -720,6 +723,17 @@ with the same `durability` shape as `message.send`. Note there is no top-level
 The message JSON carries only the metadata and thumbnail. The bytes are
 transferred separately in chunks, pushed to peers connected at send time and
 pulled by any recipient that sees a `mediaId` it does not have on disk.
+
+The bytes are also appended, encrypted with the conversation key, to a media
+Hypercore that the blind peer mirrors like the message core, so a recipient who
+comes online after the sender has gone offline still gets them. The returned
+message then carries `mediaCoreKey`, `mediaBlockOffset` and `mediaBlockLength`,
+which say where the image sits in that core; a recipient downloads exactly that
+range from the relay and verifies it against `mediaId`. The fields are absent
+when the core could not be written, in which case only the live path delivers.
+The wrappers need no change: they ignore the fields, and delivery is reported
+through the same `media.transfer_progress` / `media.transfer_complete` events.
+The relay forgets an image core a week after its last new block.
 
 #### `media.get_path`
 Get local path for media by hash.
@@ -1103,8 +1117,9 @@ also fails with `MESSAGE_NOT_DURABLE`.
 ```
 
 ### `media.transfer_complete`
-Triggered when an inbound chunked media transfer finishes and its content hash
-verifies. The core emits nothing on the outbound side, so this is always a
+Triggered when an inbound media transfer finishes and its content hash
+verifies, whether the bytes were streamed by a peer or downloaded from the
+blind peer. The core emits nothing on the outbound side, so this is always a
 completed download, and `mediaLocalPath` is always present. Both shipping
 wrappers key on `mediaLocalPath` to identify one.
 
@@ -1121,8 +1136,9 @@ wrappers key on `mediaLocalPath` to identify one.
 ```
 
 ### `media.transfer_progress`
-Triggered as inbound chunks arrive. `progress` is the fraction of chunks
-received, 0 to 1. Outbound transfers report no progress.
+Triggered as inbound chunks arrive from a peer, or as blocks arrive from the
+blind peer. `progress` is the fraction received, 0 to 1. Outbound transfers
+report no progress.
 
 ```json
 {
