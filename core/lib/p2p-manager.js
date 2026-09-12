@@ -1629,13 +1629,13 @@ class P2PManager extends EventEmitter {
    * durable replication of the block. `relay` therefore reports what is known
    * without overstating the durability boundary.
    */
-  async sendToConversationDurably (conversationId, message, { notificationEligible = false } = {}) {
+  async sendToConversationDurably (conversationId, message, { notificationEligible = false, deduplicate = false } = {}) {
     if (this._stopping) throw new Error('Messaging lifecycle stopped')
     const outboundMessage = this._outgoingRecord(conversationId, message)
     if (outboundMessage !== message) delete outboundMessage.status
 
     const persistence = this.hypercoreManager
-      ? await this._persistOutgoing(conversationId, outboundMessage, notificationEligible)
+      ? await this._persistOutgoing(conversationId, outboundMessage, notificationEligible, deduplicate)
       : { appended: false, relay: 'unavailable' }
 
     if (!persistence.appended) {
@@ -1710,10 +1710,10 @@ class P2PManager extends EventEmitter {
       })
   }
 
-  async _persistOutgoing (conversationId, message, notificationEligible) {
+  async _persistOutgoing (conversationId, message, notificationEligible, deduplicate = false) {
     let appended
     try {
-      appended = await this.hypercoreManager.appendMessage(conversationId, message)
+      appended = await this.hypercoreManager.appendMessage(conversationId, message, { deduplicate })
     } catch (err) {
       diag('Hypercore append failed: ' + (err.message || err))
       this.emit('message_persist_failed', {
@@ -1726,7 +1726,7 @@ class P2PManager extends EventEmitter {
 
     const isUserVisibleDirectMessage =
       notificationEligible && !!(message && message.id && !message.type)
-    if (!isUserVisibleDirectMessage || !this.blindMirror || !appended) {
+    if (!isUserVisibleDirectMessage || !this.blindMirror || !appended || appended.duplicate) {
       return { appended: !!appended, relay: this.blindMirror ? 'not_requested' : 'unavailable' }
     }
 

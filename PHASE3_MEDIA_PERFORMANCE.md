@@ -97,7 +97,12 @@ bare test/media-backpressure.js
   fully stalled set of active recipients can still make other transfers wait;
   each stalled write has a deadline and queue rejection produces failure state.
 - Receiver requests have a 10-second first-byte/inactivity deadline, 1-second
-  retry spacing, 12 attempts, four active requests and 512 retained entries.
+  retry spacing, 12 attempts, four active requests and 512 retained conversation/hash scopes.
+  Only one conversation at a time may use a hash's reassembler. A scope with
+  no reachable peer releases its active slot while retaining its retry timer;
+  another conversation can request the same image immediately. Completion
+  removes only the verified scope, leaving other conversations to prove their
+  own possession. Pending limits count scopes, not just distinct hashes.
   A fresh author connection immediately wakes a request that previously found
   no peer, rather than waiting out its first-byte deadline.
   Subsequent attempts rotate reachable candidate sockets instead of repeatedly
@@ -133,8 +138,14 @@ connection context. Tests exercise streamx under both Node and Bare.
 Both Kotlin and Swift support `clientMessageId` on media send, `retryMedia` and
 `cancelMedia`. Stable client IDs are persisted as the SDK message ID, so an
 ambiguous response can be retried without creating duplicate visible rows.
-An explicit retry of an accepted upload uses its existing message, without
-appending another message. An outgoing socket write never advances delivery
+Retries also reconcile against the durable Hypercore log, under a per-writer
+append lock. An existing committed message is reused without another block or
+notification; a locally saved row whose append failed is appended before retry
+reports success or sends bytes. This lookup survives reopening the store and
+ambiguous append results. Retry lookup scans backward through the local log
+(linear in history in the worst case); ordinary first sends do not scan it.
+Offline retry queues the durable metadata and emits `waiting_peer`; the receiver
+requests bytes on reconnect. An outgoing socket write never advances delivery
 status to delivered/read.
 
 `media.transfer_state` carries `mediaId`, `direction` and `state`. Native state
@@ -255,12 +266,17 @@ Android media logging. Core sources and worklet bytes are unchanged by the rebas
 
 Installed test APK SHA-256:
 `692e61ea9d6b774e41b87b66fc0d75eec95968c46102b5fa20a54ef2fa10adf4`.
-Its packaged worklet is byte-identical to the public SDK Android bundle:
+Its packaged worklet was byte-identical to the then-current public SDK Android bundle:
 `855ef4a1652a491fdd26e1563a95c64fb39009bee2f797632dc0cf4201f58157`.
 
 ## Verification and integration status
 
-- SDK baseline: 367 passing tests; final: **385 passing tests**.
+- SDK baseline: 367 passing tests; initial PR: 385; review follow-up: **394 passing tests**.
+- Review follow-up adds concurrent/sequential stable-ID retry, failed/ambiguous
+  append recovery, store-reopen deduplication, per-conversation same-hash queue
+  bounds/fairness, and actual worklet authorization/completion regressions.
+  Both worklet bundles are rebuilt for the follow-up. The physical-device and
+  Android app results below are from the earlier build, not a new device run.
 - Production worklet regression covers metadata plus image chunks in one read,
   authorization, persistence and the resulting UI event.
 - Other new regressions cover stalled discovery/invitation/notification, duplicate

@@ -123,15 +123,15 @@ test('no-first-byte requests retry to a bounded failure and reconnect can recove
   assert.equal(attempts, 3)
   assert.equal(downloads.get(hash).failed, true)
   assert.equal(states.at(-1), 'failed')
-  downloads.enqueue(hash, 'other-conversation', 'attacker', true)
-  assert.equal(downloads.get(hash).conversationId, 'conversation')
-  assert.equal(downloads.get(hash).senderId, 'peer')
+  downloads.enqueue(hash, 'conversation', 'peer', true)
+  assert.equal(attempts, 4)
+  assert.equal(downloads.get(hash, 'conversation').failed, false)
   downloads.delete(hash)
   assert.equal(downloads.active, 0)
 })
 test('download queue is bounded and cancelled timers do not cross identity reset', async () => {
   let attempts = 0
-  const downloads = new MediaDownloads({ request: () => { attempts++ }, cancel () {}, state () {},
+  const downloads = new MediaDownloads({ request: () => { attempts++; return true }, cancel () {}, state () {},
     maxPending: 2, concurrency: 1, timeoutMs: 5 })
   assert.equal(downloads.enqueue('a', 'conv', 'peer'), true)
   assert.equal(downloads.enqueue('b', 'conv', 'peer'), true)
@@ -140,6 +140,72 @@ test('download queue is bounded and cancelled timers do not cross identity reset
   await new Promise(resolve => setTimeout(resolve, 15))
   assert.equal(attempts, 1)
   assert.equal(downloads.size, 0)
+})
+
+test('an offline same-hash scope does not block an online conversation or lose its own retry', () => {
+  const requested = [], cancelled = []
+  let firstOnline = false
+  const downloads = new MediaDownloads({
+    request: conversation => { requested.push(conversation); return conversation === 'second' || firstOnline },
+    cancel: hash => cancelled.push(hash), state () {}
+  })
+  downloads.enqueue(hash, 'first', 'peer-a')
+  downloads.enqueue(hash, 'second', 'peer-b')
+  assert.deepEqual(requested, ['first', 'second'])
+  assert.equal(downloads.size, 2)
+  assert.equal(downloads.active, 1)
+  assert.equal(downloads.get(hash).conversationId, 'second')
+  assert.equal(downloads.get(hash, 'first').senderId, 'peer-a')
+  downloads.complete(hash)
+  assert.equal(downloads.size, 1)
+  assert.equal(downloads.get(hash, 'second'), undefined)
+  firstOnline = true
+  downloads.enqueue(hash, 'first', 'peer-a', true)
+  assert.deepEqual(requested, ['first', 'second', 'first'])
+  assert.equal(downloads.get(hash).conversationId, 'first')
+  downloads.complete(hash)
+  assert.equal(downloads.size, 0)
+  assert.equal(downloads.active, 0)
+  assert.deepEqual(cancelled, [])
+})
+
+test('same-hash downloads serialize authorization scopes and preserve queued scopes on completion', () => {
+  const requested = []
+  const downloads = new MediaDownloads({ request: conversation => { requested.push(conversation); return true }, cancel () {}, state () {} })
+  downloads.enqueue(hash, 'first', 'peer-a')
+  downloads.enqueue(hash, 'second', 'peer-b', true)
+  assert.deepEqual(requested, ['first'])
+  assert.equal(downloads.get(hash).conversationId, 'first')
+  assert.equal(downloads.active, 1)
+  downloads.complete(hash)
+  assert.deepEqual(requested, ['first', 'second'])
+  assert.equal(downloads.get(hash).conversationId, 'second')
+  assert.equal(downloads.active, 1)
+  downloads.delete(hash)
+  assert.equal(downloads.active, 0)
+  assert.equal(downloads.size, 0)
+})
+
+test('a stalled same-hash scope yields to another conversation without waiting through all retries', () => {
+  const requested = [], cancelled = []
+  const downloads = new MediaDownloads({ request: conversation => { requested.push(conversation); return true },
+    cancel: hash => cancelled.push(hash), state () {} })
+  downloads.enqueue(hash, 'first', 'peer-a')
+  downloads.enqueue(hash, 'second', 'peer-b')
+  downloads.retry(hash)
+  assert.deepEqual(requested, ['first', 'second'])
+  assert.deepEqual(cancelled, [hash])
+  assert.equal(downloads.get(hash).conversationId, 'second')
+  downloads.clear()
+})
+
+test('pending limits count conversation scopes even when every scope names the same hash', () => {
+  const downloads = new MediaDownloads({ request: () => false, cancel () {}, state () {}, maxPending: 2 })
+  assert.equal(downloads.enqueue(hash, 'first', 'peer-a'), true)
+  assert.equal(downloads.enqueue(hash, 'second', 'peer-b'), true)
+  assert.equal(downloads.enqueue(hash, 'third', 'peer-c'), false)
+  assert.equal(downloads.size, 2)
+  downloads.clear()
 })
 test('diagnostics are disabled by default and accept only numeric metrics and temporary IDs', () => {
   const events = []

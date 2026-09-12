@@ -50,6 +50,7 @@ class HypercoreManager extends EventEmitter {
     this._dataDir = opts.dataDir || getDataDir()
     this.store = null
     this.localCores = new Map()    // conversationId → Hypercore (writable)
+    this._appendChains = new Map() // serialize retry lookup + append per writer
     this.remoteCores = new Map()   // conversationId → Map<peerKeyHex, Hypercore>
     this._coreKeyIndex = new Map() // conversationId → Map<peerKeyHex, coreKeyHex>
     this._localReferrerIndex = new Map() // conversationId → recipient identity pubkey hex
@@ -498,8 +499,30 @@ class HypercoreManager extends EventEmitter {
   /**
    * Append a message to the local Hypercore for a conversation.
    */
-  async appendMessage (conversationId, message) {
+  async appendMessage (conversationId, message, { deduplicate = false } = {}) {
+    const previous = this._appendChains.get(conversationId) || Promise.resolve()
+    const operation = previous.catch(() => {}).then(() => this._appendMessage(conversationId, message, deduplicate))
+    this._appendChains.set(conversationId, operation)
+    try { return await operation } finally {
+      if (this._appendChains.get(conversationId) === operation) this._appendChains.delete(conversationId)
+    }
+  }
+
+  async _appendMessage (conversationId, message, deduplicate) {
     const core = await this.getOrCreateLocalCore(conversationId)
+    // Only retries scan history; ordinary sends remain constant-time. The log
+    // itself is authoritative, including after an IPC timeout or process death
+    // between committing the append and recording/returning its result.
+    if (deduplicate && message && message.id && !message.type) {
+      for (let index = core.length - 1; index >= 0; index--) {
+        const stored = await core.get(index)
+        if (!stored || stored.type || stored.id !== message.id) continue
+        if (stored.senderId !== message.senderId || stored.mediaId !== message.mediaId) {
+          throw new Error('Message retry does not match durable record')
+        }
+        return { core, index, duplicate: true }
+      }
+    }
     const appendResult = await core.append(message)
     const index = appendResult.length - 1
     diag('Appended conv=' + conversationId.substring(0, 12) +
@@ -788,6 +811,8 @@ class HypercoreManager extends EventEmitter {
   async close () {
     if (this._closed) return
     this._closed = true
+
+    await Promise.allSettled([...this._appendChains.values()])
 
     this.saveCoreKeyIndex()
 

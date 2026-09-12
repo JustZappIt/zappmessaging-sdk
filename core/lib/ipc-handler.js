@@ -1717,7 +1717,8 @@ class IPCHandler {
           replyToContent: payload.replyToContent || null
         })
 
-        if (!message && payload.clientMessageId) {
+        const retry = !message && !!payload.clientMessageId
+        if (retry) {
           message = (await this.chatStore.getMessages(payload.conversationId, 5000)).find(m => m.id === payload.clientMessageId)
           if (!message || !message.isFromMe || message.mediaId !== payload.mediaId) throw new Error('Media retry does not match stored message')
         }
@@ -1730,7 +1731,8 @@ class IPCHandler {
         diag('Outgoing media message stored locally conv=' + payload.conversationId.substring(0, 12) +
           ' message=' + message.id)
         const durability = await this.p2pManager.sendToConversationDurably(payload.conversationId, wireMessage, {
-          notificationEligible: conversation && conversation.type === 'direct'
+          notificationEligible: conversation && conversation.type === 'direct',
+          deduplicate: retry
         })
         this._recordOutgoingStatus(payload.conversationId, message, durability)
 
@@ -1755,8 +1757,26 @@ class IPCHandler {
         if (!message) throw new Error('Media message not found')
         if (message.isFromMe) {
           if (!this.mediaTransfer || !this.mediaStore.hasMedia(message.mediaId)) throw new Error('Media unavailable locally')
+          // A persisted UI row is not evidence that its Hypercore append
+          // succeeded. Recover metadata first; an already committed message
+          // is re-offered live without appending it or notifying twice.
+          const wireMessage = { ...message }
+          delete wireMessage.mediaLocalPath
+          delete wireMessage.mediaTransferState
+          const durability = await this.p2pManager.sendToConversationDurably(conversation.id, wireMessage, {
+            notificationEligible: conversation.type === 'direct', deduplicate: true
+          })
+          this._recordOutgoingStatus(conversation.id, message, durability)
           const sockets = this.p2pManager.getConversationFramedSockets(conversation.id)
-          this.mediaTransfer.sendMediaToAll(sockets, message.mediaId).catch(() => {})
+          if (sockets.length) {
+            this.mediaTransfer.sendMediaToAll(sockets, message.mediaId).catch(() => {})
+          } else {
+            // The durable metadata is queued; bytes are receiver-requested on
+            // reconnect, not queued against a nonexistent socket.
+            this.pushEvent('media.transfer_state', {
+              mediaId: message.mediaId, conversationId: conversation.id, direction: 'upload', state: 'waiting_peer'
+            })
+          }
           return { queued: true }
         }
         if (!this.retryMediaDownload) throw new Error('Media downloads unavailable')

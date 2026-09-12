@@ -200,7 +200,7 @@ async function requestMissingMediaForConversation (conversationId, peerId) {
     for (const m of messages) {
       if (m && isMediaId(m.mediaId) && !m.isFromMe &&
           (!mediaStore.hasMedia(m.mediaId) || !chatStore.hasAuthorizedMediaReference(conversationId, m.mediaId))) {
-        const entry = _mediaRequests.get(m.mediaId)
+        const entry = _mediaRequests.get(m.mediaId, conversationId)
         const onlinePeerId = peerIdOrNull(peerId)
         // A fresh author connection is a meaningful new opportunity. Reset a
         // prior cap, but never replace the author with an unrelated group peer.
@@ -650,21 +650,19 @@ async function initialize() {
           timing('receiver_persisted', fullData.length)
           diag('Media transfer complete: ' + hashHex.substring(0, 12) + ' (' + fullData.length + ' bytes) -> ' + ext)
 
-          // Downloaded — stop tracking it as a pending fetch.
-          _mediaRequests.delete(hashHex)
-
-          // Update all messages with this mediaId to have the local path
-          if (chatStore) chatStore.updateMediaPath(hashHex, filePath)
-
           // Notify UI
           if (ipcHandler) {
             timing('receiver_ui_event', fullData.length)
             ipcHandler.pushEvent('media.transfer_complete', {
               mediaId: hashHex,
+              conversationId: request.conversationId,
               mediaLocalPath: filePath,
               mediaSize: fullData.length
             })
           }
+          // Only this conversation proved possession. Other conversations
+          // retain their own requests and must verify bytes from their peers.
+          _mediaRequests.complete(hashHex)
         } catch (err) {
           retryPendingMedia(hashHex)
           diag('Failed to save received media:', err)

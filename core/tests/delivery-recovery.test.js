@@ -621,8 +621,79 @@ test('media connection preparation and durable send proceed while discovery, inv
   // Retrying transfer reuses the persisted message, never appends another row.
   await h.ipc.handleMedia('retry', { conversationId: conv.id, messageId: accepted.message.id })
   assert.equal((await h.chatStore.getMessages(conv.id)).length, 1)
+  assert.equal((await h.hypercoreManager.getOrCreateLocalCore(conv.id)).length, 1)
   discovery.resolve(); invitation.resolve(); notification.resolve()
   h.ipc._mediaBootstrap.cancel()
+})
+
+async function mediaFixture (t) {
+  const h = await harness(t), peer = pair(19)
+  const conv = await h.chatStore.createConversationWithId(
+    ChatStore.directChatId(h.identity.publicKeyHex, hex(peer)), 'direct', [hex(peer)])
+  const saved = h.ipc.mediaStore.saveMedia(b4a.alloc(1024, 7), 'jpg')
+  const payload = { conversationId: conv.id, contentType: 'image/jpeg', mediaId: saved.hashHex,
+    mediaLocalPath: saved.filePath, mediaSize: saved.fileSize, clientMessageId: 'retry-client-id' }
+  const core = await h.hypercoreManager.getOrCreateLocalCore(conv.id)
+  const send = () => h.ipc.routeMessage('media.send_message', payload)
+  const retry = () => h.ipc.routeMessage('media.retry', { conversationId: conv.id, messageId: payload.clientMessageId })
+  return { ...h, conv, payload, core, send, retry }
+}
+
+test('stable media IDs deduplicate sequential and concurrent IPC retries in the durable log', async t => {
+  const h = await mediaFixture(t)
+  let notifications = 0
+  h.p2p.blindMirror = { sendNotification: async () => { notifications++ } }
+  await Promise.all([h.send(), h.send(), h.send()])
+  await h.send()
+  await Promise.all([h.retry(), h.retry()])
+  assert.equal((await h.chatStore.getMessages(h.conv.id)).length, 1)
+  assert.equal(h.core.length, 1)
+  assert.equal(notifications, 1)
+  assert.equal(h.p2p.pendingMessages.get(h.conv.id).length, 1)
+})
+
+test('media retry repairs a failed append before reporting queued while offline', async t => {
+  const h = await mediaFixture(t)
+  const append = h.core.append.bind(h.core)
+  h.core.append = async () => { throw new Error('disk unavailable') }
+  await assert.rejects(h.send(), /disk unavailable/)
+  assert.equal((await h.chatStore.getMessages(h.conv.id)).length, 1)
+  assert.equal(h.core.length, 0)
+  await assert.rejects(h.retry(), /disk unavailable/)
+  assert.equal(h.p2p.pendingMessages.has(h.conv.id), false)
+  h.core.append = append
+  assert.deepEqual(await h.retry(), { queued: true })
+  assert.equal(h.core.length, 1)
+  assert.equal((await h.core.get(0)).id, h.payload.clientMessageId)
+  assert.equal(h.p2p.pendingMessages.get(h.conv.id)[0].message.id, h.payload.clientMessageId)
+  assert.ok(h.events.some(({ type, payload }) => type === 'media.transfer_state' && payload.state === 'waiting_peer'))
+  await h.retry()
+  assert.equal(h.core.length, 1)
+})
+
+test('media retry reconciles an append that committed before its caller saw an error', async t => {
+  const h = await mediaFixture(t)
+  const append = h.core.append.bind(h.core)
+  h.core.append = async message => { await append(message); throw new Error('ambiguous append result') }
+  await assert.rejects(h.send(), /ambiguous append result/)
+  assert.equal(h.core.length, 1)
+  h.core.append = append
+  await h.retry()
+  await h.send()
+  assert.equal(h.core.length, 1)
+})
+
+test('media deduplication survives reopening the durable store without in-memory results', async t => {
+  const h = await mediaFixture(t)
+  await h.send()
+  await h.hypercoreManager.close()
+  await h.hypercoreManager.initialize()
+  h.chatStore._historyCache.clear()
+  await h.send()
+  await h.retry()
+  const reopened = await h.hypercoreManager.getOrCreateLocalCore(h.conv.id)
+  assert.notEqual(reopened, h.core)
+  assert.equal(reopened.length, 1)
 })
 
 test('large live catch-up is throttled without silently discarding records', async t => {

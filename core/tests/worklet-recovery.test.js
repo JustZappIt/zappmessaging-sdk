@@ -113,3 +113,60 @@ test('worklet production wiring follows a mirror init overtaken by restart and s
   assert.equal(row.mediaTransferState, 'complete')
   await tick()
 })
+
+test('worklet receives identical media from separate conversations without blocking or sharing authorization', async t => {
+  await worklet.initialize()
+  t.after(async () => {
+    process.stdin.removeAllListeners('data')
+    process.stdin.pause()
+    await worklet.shutdown()
+  })
+  const { ipcHandler: ipc, p2pManager: p2p, identity, chatStore, mediaTransfer } = worklet.getInstances()
+  const events = []
+  ipc.pushEvent = (type, payload) => events.push({ type, payload })
+  await ipc.handleIdentity('create', { displayName: 'Same hash receiver' })
+  const peers = [10, 11].map(n => crypto.keyPair(b4a.alloc(32, n)))
+  const peerIds = peers.map(peer => b4a.toString(peer.publicKey, 'hex'))
+  const ids = peerIds.map(peer => ChatStore.directChatId(peer, identity.publicKeyHex))
+  const bytes = b4a.from('same image, separately authorized senders')
+  const hash = crypto.data(bytes), mediaId = b4a.toString(hash, 'hex')
+  const requests = []
+  let firstOnline = false
+  p2p.requestMedia = (conversationId, requestedHash, senderId) => {
+    requests.push({ conversationId, requestedHash, senderId })
+    return conversationId === ids[1] || firstOnline
+  }
+  for (let i = 0; i < peers.length; i++) {
+    const socket = new EventEmitter()
+    socket.remotePublicKey = peers[i].publicKey
+    socket.writable = true
+    socket.write = () => true
+    socket.destroy = () => { socket.destroyed = true; socket.emit('close') }
+    p2p.swarm.connections.add(socket)
+    p2p.swarm.emit('connection', socket, { publicKey: peers[i].publicKey })
+    const framed = p2p.framedSockets.get(socket)
+    await framed.onMessage({ type: 'direct_invite', senderKey: peerIds[i], conversationId: ids[i], bootstrapReply: true })
+    await framed.onMessage({ id: 'shared-' + i, conversationId: ids[i], contentType: 'image/jpeg', mediaId })
+  }
+  assert.ok(requests.some(request => request.conversationId === ids[1] && request.senderId === peerIds[1]))
+  // The first scope is still offline. Its late chunks and an outsider's
+  // chunks cannot enter the second conversation's active reassembler.
+  p2p.emit('media_chunk', hash, 0, 1, bytes, peerIds[0])
+  p2p.emit('media_chunk', hash, 0, 1, bytes, 'ff'.repeat(32))
+  assert.equal(mediaTransfer.activeTransfers.size, 0)
+  assert.equal(events.filter(event => event.type === 'media.transfer_complete').length, 0)
+  p2p.emit('media_chunk', hash, 0, 1, bytes, peerIds[1])
+  assert.equal(chatStore.hasAuthorizedMediaReference(ids[1], mediaId), true)
+  assert.equal(chatStore.hasAuthorizedMediaReference(ids[0], mediaId), false)
+  assert.equal((await chatStore.getMessages(ids[0]))[0].mediaLocalPath, null)
+  assert.equal(events.find(event => event.type === 'media.transfer_complete').payload.conversationId, ids[1])
+  // Completion did not discard the first conversation. It can reconnect and
+  // prove its own possession without authorizing from the existing disk cache.
+  firstOnline = true
+  await ipc.routeMessage('media.retry', { conversationId: ids[0], messageId: 'shared-0' })
+  p2p.emit('media_chunk', hash, 0, 1, bytes, peerIds[1])
+  assert.equal(chatStore.hasAuthorizedMediaReference(ids[0], mediaId), false)
+  p2p.emit('media_chunk', hash, 0, 1, bytes, peerIds[0])
+  assert.equal(chatStore.hasAuthorizedMediaReference(ids[0], mediaId), true)
+  assert.equal(events.filter(event => event.type === 'media.transfer_complete').length, 2)
+})
