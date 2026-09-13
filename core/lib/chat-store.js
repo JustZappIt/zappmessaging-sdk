@@ -11,6 +11,7 @@ const hcrypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const { getDataDir, ensureDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { createDiagnosticLogger } = require('./diagnostics')
+const config = require('./config')
 
 const { deriveGroupChatTopic } = require('./rooms')
 const { validateMessage, MEDIA_DESCRIPTOR_FIELDS } = require('./peer-record')
@@ -158,13 +159,17 @@ class ChatStore {
     // receipt. Lets _sendReadReceiptIfNeeded skip redundant receipts.
     this.sentReadWatermarks = new Map()
     this.ensureStorageDir()
-    this.loadConversations()
-    this.loadLeftConversations()
-    this.loadReadReceiptWatermarks()
+    this._loadPersistedState()
   }
 
   ensureStorageDir() {
     ensureDir(this.storagePath)
+  }
+
+  _loadPersistedState () {
+    this.loadConversations()
+    this.loadLeftConversations()
+    this.loadReadReceiptWatermarks()
   }
 
   loadConversations() {
@@ -509,11 +514,10 @@ class ChatStore {
     messages.splice(insertionIndex(messages, message), 0, message)
 
     // Cap messages per conversation to prevent unbounded file growth
-    const MAX_MESSAGES_PER_CONVERSATION = 5000
-    if (messages.length > MAX_MESSAGES_PER_CONVERSATION) {
-      const trimmed = messages.length - MAX_MESSAGES_PER_CONVERSATION
-      diag('Chat', conversationId.substring(0, 12), ': trimmed', trimmed, 'oldest message(s) at cap', MAX_MESSAGES_PER_CONVERSATION)
-      messages = messages.slice(-MAX_MESSAGES_PER_CONVERSATION)
+    const cap = config.MAX_MESSAGES_PER_CONVERSATION
+    if (messages.length > cap) {
+      diag('Chat', conversationId.substring(0, 12), ': trimmed', messages.length - cap, 'oldest message(s) at cap', cap)
+      messages = messages.slice(-cap)
       if (!messages.includes(message)) {
         // The late insert itself fell outside retention. Persist the trim but
         // report null — like the dedup path — so callers suppress the UI event.
@@ -825,19 +829,39 @@ class ChatStore {
   /**
    * Clear all conversations, messages, and left-conversation records.
    * Used when creating a new identity so no prior-user data leaks through.
+   * A missing directory or file is fine. Every other file is still attempted,
+   * but the first real deletion failure is thrown after the in-memory state
+   * has been reloaded from whatever survived on disk, so a partial wipe is
+   * neither reported as complete nor hidden behind stale memory.
    */
   async clearAll() {
     const fs = require('bare-fs')
+    let entries = []
     try {
-      const entries = fs.readdirSync(this.storagePath)
-      for (const entry of entries) {
-        try { fs.unlinkSync(path.join(this.storagePath, entry)) } catch (e) { /* ignore */ }
+      entries = fs.readdirSync(this.storagePath)
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error
+    }
+
+    let failure = null
+    for (const entry of entries) {
+      try {
+        fs.unlinkSync(path.join(this.storagePath, entry))
+      } catch (error) {
+        if (error && error.code === 'ENOENT') continue
+        diag('Failed to delete chat file:', error)
+        if (!failure) failure = error
       }
-    } catch (e) { /* ignore — directory may not exist */ }
+    }
+
     this.conversations.clear()
     this.leftConversations.clear()
     this._mediaIndex.clear()
     this.sentReadWatermarks.clear()
+    if (failure) {
+      this._loadPersistedState()
+      throw failure
+    }
   }
 
   /**

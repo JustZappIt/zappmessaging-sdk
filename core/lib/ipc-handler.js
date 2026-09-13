@@ -35,6 +35,10 @@ function isValidString(value, maxLen) {
   return typeof value === 'string' && value.length > 0 && value.length <= maxLen
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
 class IPCHandler {
   constructor({ identity, chatStore, contactStore, p2pManager, mediaStore, mediaTransfer, blindMirror, hypercoreManager, ensureBlindMirror }) {
     this.identity = identity
@@ -59,7 +63,7 @@ class IPCHandler {
     // Keep raw bytes until a complete NDJSON line is available.
     this._recvBuf = b4a.alloc(0)
     this._skippingOversizedFrame = false
-    this._maxRecvBufSize = 1048576 // 1MB safety limit
+    this._maxRecvBufSize = config.IPC_MAX_RECV_BUF_SIZE
 
     if (this.ipc) {
       this.setupMessageHandler()
@@ -166,7 +170,12 @@ class IPCHandler {
 
       if (lineBytes.byteLength === 0) continue
       const line = b4a.toString(lineBytes, 'utf8')
-      this._processLine(line)
+      // _processLine settles every outcome itself; this catch is the backstop
+      // that keeps a native-side frame from ever reaching the global rejection
+      // handler.
+      this._processLine(line).catch(error => {
+        diag('IPC line handling failed: ' + (error && error.message ? error.message : error))
+      })
     }
 
     // An unterminated frame crossed the cap. Discard only that frame's bytes,
@@ -186,28 +195,69 @@ class IPCHandler {
     })
   }
 
+  /**
+   * Parse and dispatch one NDJSON line from the native side.
+   *
+   * Every outcome is controlled: a line that is not a request envelope is
+   * dropped with an `ipc.error` event (or an error response when it at least
+   * carries a usable id), a request that fails gets an error response, and a
+   * response that cannot be written is logged. The returned promise never
+   * rejects.
+   */
   async _processLine(line) {
     let message
     try {
       message = JSON.parse(line)
     } catch (error) {
       diag('Failed to parse IPC message')
+      this.pushEvent('ipc.error', { code: 'MALFORMED_FRAME', message: 'IPC frame is not valid JSON' })
       return
     }
 
+    if (!isPlainObject(message) || !isValidString(message.id, 256)) {
+      diag('IPC frame is not a request envelope')
+      this.pushEvent('ipc.error', { code: 'INVALID_ENVELOPE', message: 'IPC frame is not a request envelope' })
+      return
+    }
     const { id, type, payload } = message
+    if (!isValidString(type, 256) || (payload != null && !isPlainObject(payload))) {
+      diag('IPC request has an invalid type or payload')
+      this._respond(id, false, null, { code: 'INVALID_ENVELOPE', message: 'IPC request has an invalid type or payload' })
+      return
+    }
 
+    let result
     try {
       diag('Routing message: ' + type)
-      const result = await this.routeMessage(type, payload || {})
+      result = await this.routeMessage(type, payload || {})
       diag('Message routed successfully: ' + type)
-      this.sendResponse(id, true, result)
     } catch (error) {
       diag('Error handling ' + type + ': ' + (error.message || error))
-      this.sendResponse(id, false, null, {
+      this._respond(id, false, null, {
         code: typeof error.code === 'string' ? error.code : 'ERROR',
         message: error.message || 'Unknown error'
       })
+      return
+    }
+    this._respond(id, true, result)
+  }
+
+  /**
+   * Write a response without letting a serialization or transport failure
+   * escape. A result that cannot be written is downgraded to an error response
+   * so the native caller is released instead of waiting for its timeout.
+   */
+  _respond (id, success, data, error = null) {
+    try {
+      this.sendResponse(id, success, data, error)
+    } catch (err) {
+      diag('Failed to send IPC response: ' + (err.message || err))
+      if (!success) return
+      try {
+        this.sendResponse(id, false, null, { code: 'RESPONSE_FAILED', message: 'Response could not be delivered' })
+      } catch (_) {
+        // The transport is gone; the caller's timeout is the remaining signal.
+      }
     }
   }
 
@@ -269,6 +319,62 @@ class IPCHandler {
     return {
       publicKey: this.identity.publicKeyHex,
       displayName: this.identity.displayName
+    }
+  }
+
+  /**
+   * Replace the loaded identity: stop the transport, wipe every account-scoped
+   * store, run `install`, then bring the transport up on the new keypair.
+   *
+   * Nothing from the previous account may survive into the next one, so a
+   * wipe or install failure aborts the transition and is reported to the
+   * caller. The previous identity is still the one loaded at that point; its
+   * transport is restarted so the failure leaves a working (if partially
+   * wiped) account that can retry, rather than a silently offline process.
+   */
+  async _replaceIdentity (install) {
+    await this.p2pManager.stop()
+    // Honor-system prefs return to their defaults for the fresh identity; native
+    // re-pushes the new user's real values once its settings load.
+    const previousReadReceipts = this.readReceiptsEnabled
+    this.readReceiptsEnabled = true
+    try {
+      await this._wipeAccountData()
+      await install()
+    } catch (error) {
+      this.readReceiptsEnabled = previousReadReceipts
+      await this._restartPreviousIdentity()
+      throw error
+    }
+    await this.p2pManager.start(this.identity.keyPair)
+    await this.ensureBlindMirror()
+  }
+
+  /**
+   * Both stores are attempted even when the first fails, so one bad file
+   * cannot leave the other store's data behind unnoticed. Each store leaves
+   * its memory consistent with disk on failure; the first error is rethrown.
+   */
+  async _wipeAccountData () {
+    let failure = null
+    for (const store of [this.chatStore, this.contactStore]) {
+      if (!store) continue
+      try {
+        await store.clearAll()
+      } catch (error) {
+        if (!failure) failure = error
+      }
+    }
+    if (failure) throw failure
+  }
+
+  async _restartPreviousIdentity () {
+    if (!this.identity.keyPair) return
+    try {
+      await this.p2pManager.start(this.identity.keyPair)
+      await this.ensureBlindMirror()
+    } catch (error) {
+      diag('Transport restart after failed identity replacement failed: ' + (error.message || error))
     }
   }
 
@@ -369,18 +475,7 @@ class IPCHandler {
   async handleIdentity(action, payload) {
     switch (action) {
       case 'create': {
-        // Stop active P2P connections and wipe all user data before issuing
-        // a new identity.  Without this, old conversations and contacts from
-        // the previous account are visible when the next user signs up.
-        await this.p2pManager.stop()
-        // Honor-system prefs return to their defaults for the fresh identity; native
-        // re-pushes the new user's real values once its settings load.
-        this.readReceiptsEnabled = true
-        if (this.chatStore) await this.chatStore.clearAll()
-        if (this.contactStore) await this.contactStore.clearAll()
-        await this.identity.create(payload.displayName)
-        await this.p2pManager.start(this.identity.keyPair)
-        await this.ensureBlindMirror()
+        await this._replaceIdentity(() => this.identity.create(payload.displayName))
         // Return the recovery phrase in the same response so the native side
         // doesn't need a second migration.get_seed_phrase IPC that could fail
         // independently of identity creation.
@@ -430,10 +525,17 @@ class IPCHandler {
         await this.contactStore.deleteContact(payload.publicKey)
         return { success: true }
 
-      case 'update':
+      case 'update': {
         if (!isValidPublicKey(payload.publicKey)) throw new Error('Invalid publicKey')
-        await this.contactStore.updateContact(payload.publicKey, payload.updates)
+        const updates = payload.updates
+        if (!updates || typeof updates !== 'object' || Array.isArray(updates)) throw new Error('Invalid updates')
+        // Same name rules as contacts.add; the store validates the rest.
+        if (Object.prototype.hasOwnProperty.call(updates, 'name') && !isValidString(updates.name, 100)) {
+          throw new Error('Invalid name')
+        }
+        await this.contactStore.updateContact(payload.publicKey, updates)
         return { success: true }
+      }
 
       case 'updateWalletAddress':
         if (!isValidPublicKey(payload.publicKey)) throw new Error('Invalid publicKey')
@@ -1534,38 +1636,22 @@ class IPCHandler {
         // serve. Otherwise an auto-derive retry (process-death recovery, retry
         // button, or any same-seed re-publish from the reactive Kotlin path)
         // would silently erase the user's local history.
-        const currentPubkeyHex = this.identity.publicKeyHex
-        let isIdentityChange = currentPubkeyHex == null
-        if (!isIdentityChange) {
-          const incomingSeed = mnemonic.mnemonicToEd25519Seed(payload.seedPhrase)
-          const incomingKeyPair = crypto.keyPair(incomingSeed)
-          const incomingPubkeyHex = b4a.toString(incomingKeyPair.publicKey, 'hex')
-          isIdentityChange = currentPubkeyHex !== incomingPubkeyHex
-        }
+        // Deriving up front also rejects a malformed phrase before anything
+        // destructive happens.
+        const incomingSeed = mnemonic.mnemonicToEd25519Seed(payload.seedPhrase)
+        const incomingPubkeyHex = b4a.toString(crypto.keyPair(incomingSeed).publicKey, 'hex')
 
-        if (!isIdentityChange) {
+        if (this.identity.publicKeyHex === incomingPubkeyHex) {
           // Idempotent re-publish: same identity already loaded. Leave the local
           // stores, swarm state, and stored display name as-is.
           await this.ensureBlindMirror()
-          return {
-            publicKey: this.identity.publicKeyHex,
-            displayName: this.identity.displayName
-          }
+          return this._identityPayload()
         }
 
-        await this.p2pManager.stop()
-        // Honor-system prefs return to their defaults for the restored identity;
-        // native re-pushes the real values once its settings load.
-        this.readReceiptsEnabled = true
-        if (this.chatStore) await this.chatStore.clearAll()
-        if (this.contactStore) await this.contactStore.clearAll()
-        await this.identity.restoreFromMnemonic(payload.seedPhrase, payload.displayName || '')
-        await this.p2pManager.start(this.identity.keyPair)
-        await this.ensureBlindMirror()
-        return {
-          publicKey: this.identity.publicKeyHex,
-          displayName: this.identity.displayName
-        }
+        await this._replaceIdentity(
+          () => this.identity.restoreFromMnemonic(payload.seedPhrase, payload.displayName || '')
+        )
+        return this._identityPayload()
       }
 
       default:

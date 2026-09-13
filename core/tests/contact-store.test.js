@@ -173,3 +173,108 @@ test('addContact overwrites existing contact with same key', async () => {
   await store.deleteContact('duplicate')
 })
 
+
+test('updateContact rejects a non-string name and keeps the list readable', async () => {
+  const store = new ContactStore()
+  await store.addContact('typed-a', 'Alice')
+  await store.addContact('typed-b', 'Bob')
+
+  await assert.rejects(store.updateContact('typed-b', { name: 42 }), /Invalid name/)
+  await assert.rejects(store.updateContact('typed-b', { name: '' }), /Invalid name/)
+  await assert.rejects(store.updateContact('typed-b', { name: 'x'.repeat(101) }), /Invalid name/)
+
+  const list = await store.listContacts()
+  assert.deepStrictEqual(list.map(c => c.name), ['Alice', 'Bob'])
+  const onDisk = JSON.parse(fs.readFileSync(store.storagePath, 'utf8'))
+  assert.strictEqual(onDisk.find(c => c.publicKey === 'typed-b').name, 'Bob')
+
+  await store.deleteContact('typed-a')
+  await store.deleteContact('typed-b')
+})
+
+test('updateContact rejects malformed update objects and unsupported fields', async () => {
+  const store = new ContactStore()
+  await store.addContact('strict-a', 'Alice')
+
+  await assert.rejects(store.updateContact('strict-a', null), /Invalid contact updates/)
+  await assert.rejects(store.updateContact('strict-a', ['name']), /Invalid contact updates/)
+  await assert.rejects(store.updateContact('strict-a', {}), /No contact fields/)
+  await assert.rejects(store.updateContact('strict-a', { addressType: 'sapling' }), /Unsupported contact field/)
+  await assert.rejects(store.updateContact('strict-a', { addedAt: 0 }), /Unsupported contact field/)
+  // A shadowed hasOwnProperty must not bypass validation.
+  await assert.rejects(
+    store.updateContact('strict-a', { hasOwnProperty: () => true, name: 7 }),
+    /Unsupported contact field|Invalid name/
+  )
+
+  assert.strictEqual((await store.getContact('strict-a')).name, 'Alice')
+  await store.deleteContact('strict-a')
+})
+
+test('updateContact validates walletAddress like updateWalletAddress', async () => {
+  const store = new ContactStore()
+  await store.addContact('wallet-a', 'Alice')
+
+  await assert.rejects(store.updateContact('wallet-a', { walletAddress: 'nope' }), /Invalid Zcash address/)
+
+  const updated = await store.updateContact('wallet-a', { walletAddress: 'zs1' + 'q'.repeat(40) })
+  assert.strictEqual(updated.addressType, 'sapling')
+  assert.ok(updated.addressUpdatedAt > 0)
+
+  await store.deleteContact('wallet-a')
+})
+
+test('a rejected write leaves memory and disk at the previous state', async () => {
+  const store = new ContactStore()
+  await store.addContact('persist-a', 'Alice')
+  const before = fs.readFileSync(store.storagePath, 'utf8')
+
+  const realSave = store.saveContacts
+  store.saveContacts = () => { throw new Error('simulated disk failure') }
+  try {
+    await assert.rejects(store.updateContact('persist-a', { name: 'Unsaved' }), /disk failure/)
+    await assert.rejects(store.updateWalletAddress('persist-a', 'u1' + 'q'.repeat(40)), /disk failure/)
+    await assert.rejects(store.addContact('persist-b', 'Bob'), /disk failure/)
+    await assert.rejects(store.deleteContact('persist-a'), /disk failure/)
+  } finally {
+    store.saveContacts = realSave
+  }
+
+  const alice = await store.getContact('persist-a')
+  assert.strictEqual(alice.name, 'Alice')
+  assert.strictEqual(alice.walletAddress, undefined)
+  assert.strictEqual(await store.getContact('persist-b'), null)
+  assert.strictEqual(fs.readFileSync(store.storagePath, 'utf8'), before)
+
+  await store.deleteContact('persist-a')
+})
+
+test('clearAll reports a deletion failure instead of hiding surviving contacts', async () => {
+  const store = new ContactStore()
+  await store.addContact('wipe-a', 'Alice')
+  await store.addContact('wipe-b', 'Bob')
+
+  const realUnlink = fs.unlinkSync
+  fs.unlinkSync = file => {
+    if (file === store.storagePath) {
+      throw Object.assign(new Error('simulated permission failure'), { code: 'EACCES' })
+    }
+    return realUnlink(file)
+  }
+  try {
+    await assert.rejects(store.clearAll(), { code: 'EACCES' })
+  } finally {
+    fs.unlinkSync = realUnlink
+  }
+
+  assert.strictEqual(store.contacts.size, 2, 'memory must still reflect the surviving file')
+  assert.ok(fs.existsSync(store.storagePath))
+
+  await store.clearAll()
+  assert.strictEqual(store.contacts.size, 0)
+  assert.strictEqual(fs.existsSync(store.storagePath), false)
+  assert.strictEqual(new ContactStore().contacts.size, 0)
+
+  // A missing file is a completed wipe, not a failure.
+  await store.clearAll()
+})

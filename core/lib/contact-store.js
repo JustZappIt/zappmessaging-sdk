@@ -1,13 +1,28 @@
 /**
  * Contact Store - Manages contact list
- * 
- * Stores contacts in contacts.json with public key as identifier
+ *
+ * Stores contacts in contacts.json with public key as identifier. Every
+ * mutation is written to disk before it becomes visible, so a rejected write
+ * leaves the in-memory list matching the file.
  */
 
 const path = require('bare-path')
+const fs = require('bare-fs')
 const { getDataDir, readJSON, writeJSON, ensureDir } = require('./storage')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-function diag (...args) { /* no-op; contact-store uses file-level try/catch instead */ }
+const diag = createDiagnosticLogger('CONTACTS')
+
+const MAX_NAME_LENGTH = 100
+const UPDATABLE_FIELDS = new Set(['name', 'walletAddress'])
+
+function isValidName (name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= MAX_NAME_LENGTH
+}
+
+function hasOwn (object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key)
+}
 
 class ContactStore {
   constructor() {
@@ -29,11 +44,26 @@ class ContactStore {
     }
   }
 
-  saveContacts() {
-    const contactList = Array.from(this.contacts.values())
+  saveContacts(contacts = this.contacts) {
+    const contactList = Array.from(contacts.values())
     const dir = path.dirname(this.storagePath)
     ensureDir(dir)
     writeJSON(this.storagePath, contactList)
+  }
+
+  /**
+   * Persist the list with one entry replaced (or removed when `contact` is
+   * null) and only then publish the change to `this.contacts`.
+   * @private
+   */
+  _commit (publicKey, contact) {
+    const next = new Map(this.contacts)
+    if (contact) next.set(publicKey, contact)
+    else next.delete(publicKey)
+    this.saveContacts(next)
+    if (contact) this.contacts.set(publicKey, contact)
+    else this.contacts.delete(publicKey)
+    return contact
   }
 
   /**
@@ -46,17 +76,14 @@ class ContactStore {
     if (!publicKey || !name) {
       throw new Error('Public key and name are required')
     }
+    if (typeof publicKey !== 'string') throw new Error('Invalid publicKey')
+    if (!isValidName(name)) throw new Error('Invalid name')
 
-    const contact = {
+    return this._commit(publicKey, {
       publicKey,
       name,
       addedAt: Date.now()
-    }
-
-    this.contacts.set(publicKey, contact)
-    this.saveContacts()
-
-    return contact
+    })
   }
 
   /**
@@ -78,7 +105,9 @@ class ContactStore {
   }
 
   /**
-   * Update a contact
+   * Update a contact. Accepts `name` and `walletAddress`; the address is
+   * validated and its derived fields set exactly as updateWalletAddress does.
+   * Anything else is rejected rather than silently dropped.
    * @param {string} publicKey - Contact's public key (hex)
    * @param {Object} updates - Fields to update
    * @returns {Object} Updated contact
@@ -88,31 +117,40 @@ class ContactStore {
     if (!contact) {
       throw new Error('Contact not found')
     }
-
-    // Allowlist: only permit known safe fields to be updated
-    const allowedFields = ['name', 'walletAddress', 'addressType', 'addressUpdatedAt']
-    for (const key of allowedFields) {
-      if (updates.hasOwnProperty(key)) {
-        contact[key] = updates[key]
-      }
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+      throw new Error('Invalid contact updates')
     }
-    this.contacts.set(publicKey, contact)
-    this.saveContacts()
+    const fields = Object.keys(updates)
+    if (fields.length === 0) throw new Error('No contact fields to update')
+    for (const field of fields) {
+      if (!UPDATABLE_FIELDS.has(field)) throw new Error('Unsupported contact field: ' + field)
+    }
 
-    return contact
+    const candidate = { ...contact }
+    if (hasOwn(updates, 'name')) {
+      if (!isValidName(updates.name)) throw new Error('Invalid name')
+      candidate.name = updates.name
+    }
+    if (hasOwn(updates, 'walletAddress')) {
+      Object.assign(candidate, this._walletAddressFields(updates.walletAddress))
+    }
+
+    return this._commit(publicKey, candidate)
   }
 
   /**
    * Clear all contacts.
    * Used when creating a new identity so no prior-user data leaks through.
+   * A missing file is fine; any other deletion failure is thrown and the
+   * in-memory list is left intact, so the caller cannot mistake a surviving
+   * file for a completed wipe.
    */
   async clearAll() {
-    const fs = require('bare-fs')
     try {
-      if (fs.existsSync(this.storagePath)) {
-        fs.unlinkSync(this.storagePath)
-      }
-    } catch (e) { /* ignore */ }
+      fs.unlinkSync(this.storagePath)
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error
+    }
     this.contacts.clear()
   }
 
@@ -121,8 +159,8 @@ class ContactStore {
    * @param {string} publicKey - Contact's public key (hex)
    */
   async deleteContact(publicKey) {
-    this.contacts.delete(publicKey)
-    this.saveContacts()
+    if (!this.contacts.has(publicKey)) return
+    this._commit(publicKey, null)
   }
 
   /**
@@ -137,20 +175,18 @@ class ContactStore {
       throw new Error('Contact not found')
     }
 
+    return this._commit(publicKey, { ...contact, ...this._walletAddressFields(walletAddress) })
+  }
+
+  _walletAddressFields (walletAddress) {
     if (!this.isValidZcashAddress(walletAddress)) {
       throw new Error('Invalid Zcash address format')
     }
-
-    const addressType = this.detectAddressType(walletAddress)
-    
-    contact.walletAddress = walletAddress
-    contact.addressType = addressType
-    contact.addressUpdatedAt = Date.now()
-
-    this.contacts.set(publicKey, contact)
-    this.saveContacts()
-
-    return contact
+    return {
+      walletAddress,
+      addressType: this.detectAddressType(walletAddress),
+      addressUpdatedAt: Date.now()
+    }
   }
 
   /**
@@ -165,7 +201,7 @@ class ContactStore {
 
     const validPrefixes = ['u1', 'zs1', 't1', 't3']
     const hasValidPrefix = validPrefixes.some(prefix => address.startsWith(prefix))
-    
+
     return hasValidPrefix && address.length > 20
   }
 

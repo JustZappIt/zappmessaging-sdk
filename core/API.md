@@ -107,6 +107,12 @@ receipt preference to its default. Any prior conversations, messages and
 contacts on this device are gone. It restarts P2P and re-arms the blind-peer
 mirror on the new keypair before responding.
 
+The wipe must actually succeed. A missing file is fine, but any other deletion
+failure aborts the request with an error response: no new identity is issued,
+the previous identity stays loaded with its transport restarted, and the stores
+reflect whatever survived on disk, so the caller can retry rather than mistake
+a surviving file for a completed wipe.
+
 **Request:**
 ```json
 {
@@ -223,7 +229,11 @@ List all contacts, sorted by name.
 ```
 
 #### `contacts.update`
-Update contact information.
+Update contact information. `updates` accepts `name` (1–100 characters) and
+`walletAddress` (validated and typed exactly as `contacts.updateWalletAddress`
+does). Any other field, an empty object, or a value of the wrong type is
+rejected before the store is touched; a rejected update leaves the contact
+unchanged in memory and on disk.
 
 **Request:**
 ```json
@@ -1227,7 +1237,14 @@ Advisory: the message is still durable and still replicates.
 Host-carried HTTPS request. See "Host-Carried HTTPS Bridge" above.
 
 ### `ipc.error`
-Triggered when an inbound NDJSON line exceeded the 1 MB cap and was discarded.
+Triggered when an inbound NDJSON line could not be handled as a request:
+
+- `BUFFER_OVERFLOW`: the line exceeded the 1 MB cap and was discarded.
+- `MALFORMED_FRAME`: the line was not valid JSON.
+- `INVALID_ENVELOPE`: the line parsed but was not an object with a string
+  `id`. A frame that does carry an id but has a non-string `type` or a
+  non-object `payload` gets an error *response* with this code instead, so
+  the caller is released rather than left to time out.
 
 ```json
 {
@@ -1272,9 +1289,11 @@ thrown message.
 - `INVALID_PUBLIC_KEY`: direct chat participant key is not 64 hex characters
 - `OWN_PUBLIC_KEY`: direct chat addressed to this identity's own key
 - `MESSAGE_NOT_DURABLE`: the outgoing message was not appended to Hypercore, so nothing was sent
+- `INVALID_ENVELOPE`: the request carried an id but a non-string `type` or a non-object `payload`
+- `RESPONSE_FAILED`: the handler succeeded but its result could not be written back; the caller must not assume the operation was observed
 
-`BUFFER_OVERFLOW` is not a response code. It appears as the `code` field of the
-`ipc.error` push event.
+`BUFFER_OVERFLOW` and `MALFORMED_FRAME` are not response codes. They appear as
+the `code` field of the `ipc.error` push event.
 
 ## Storage Locations
 

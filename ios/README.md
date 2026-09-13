@@ -14,7 +14,7 @@ ZappMessaging is a peer-to-peer messaging SDK that uses Hyperswarm for network c
 - 2 chat types: Direct and Group
 - Content-addressed media storage
 - Chunked media transfer
-- No duplicate seed storage in the SDK or Keychain
+- Identity entropy encrypted at rest under a Keychain-held key
 - SwiftUI-friendly with Combine publishers
 
 ## Requirements
@@ -91,8 +91,30 @@ let identity = try await sdk.restoreFromSeedPhrase(
     displayName: "Alice"
 )
 
-// The SDK does not store or export the wallet seed.
+// The worklet persists the BIP-39 entropy behind this phrase (see
+// "Identity storage" below); the phrase itself is not kept in any other form.
 ```
+
+### Identity storage
+
+`restoreFromSeedPhrase` derives the chat keypair inside the JavaScript worklet
+and persists the 32 bytes of BIP-39 entropy — enough to reconstruct the whole
+mnemonic — in `identity.json` under the SDK's data dir, so the identity can be
+reloaded on the next launch and the phrase re-exported. That entropy is
+equivalent to the wallet seed, so the data dir deserves the same care as the
+wallet's own storage.
+
+At rest the entropy is secretbox-encrypted (XSalsa20-Poly1305) under a random
+32-byte key that `IdentityFileKeyStore` mints once and keeps in the iOS
+Keychain as a non-syncing, this-device-only item, excluded from iCloud and
+device backups. The key is handed to the worklet as `--identity-file-key` at
+start. Two fallbacks matter:
+
+- If the Keychain is unusable when the worklet starts, no key is supplied and
+  the core keeps `identity.json` in its legacy plaintext format rather than
+  losing messaging.
+- If the Keychain item is lost later, the encrypted file can no longer be read,
+  the SDK reports no identity, and the user restores from the 24-word phrase.
 
 ### Manage Contacts
 
@@ -283,7 +305,7 @@ SDK error types with localized descriptions.
 
 - **Ed25519 Keypairs**: Industry-standard elliptic curve cryptography
 - **BIP39 Seed Phrases**: 24-word mnemonic for backup/restore
-- **No Duplicate Seed Storage**: The wallet seed is passed through for deterministic derivation and is not copied into the SDK or Keychain
+- **Identity entropy at rest**: the BIP-39 entropy behind the phrase is stored encrypted under a Keychain-held key, with a plaintext fallback when the Keychain is unavailable — see "Identity storage" above
 - **P2P Encryption**: All messages encrypted via Hyperswarm's Noise protocol
 
 ## Current limitation

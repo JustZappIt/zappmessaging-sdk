@@ -29,6 +29,7 @@ import xyz.justzappit.zappmessaging.models.*
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Data returned by [ZappMessagingSDK.createIdentity]. Contains both the identity and the
@@ -55,7 +56,12 @@ data class ZMIdentityWithSeed(
  * val identity = sdk.createIdentity("Alice")
  * ```
  */
-class ZappMessagingSDK {
+class ZappMessagingSDK internal constructor(
+    private val ipcBridge: IPCBridge,
+    private val workletManager: BareWorkletManager,
+) {
+
+    constructor() : this(IPCBridge(), BareWorkletManager())
 
     // ── Published State ─────────────────────────────────────────────────
 
@@ -79,7 +85,7 @@ class ZappMessagingSDK {
     /** Peer count */
     val peerCount: StateFlow<Int> = _peerCount.asStateFlow()
 
-    private val _dhtHealth = MutableStateFlow("healthy")
+    private val _dhtHealth = MutableStateFlow(DHT_HEALTH_DEFAULT)
     /** DHT health status: "healthy", "degraded", or "critical" */
     val dhtHealth: StateFlow<String> = _dhtHealth.asStateFlow()
 
@@ -98,11 +104,11 @@ class ZappMessagingSDK {
     val inviteReceived: SharedFlow<ZMConversation> = _inviteReceived.asSharedFlow()
 
     private val _mediaDownloadProgress = MutableSharedFlow<Pair<String, Double>>(extraBufferCapacity = 64)
-    /** Flow of (mediaId, progress) for media downloads */
+    /** Flow of (mediaId, progress 0..1) as chunks of an inbound media transfer arrive. */
     val mediaDownloadProgress: SharedFlow<Pair<String, Double>> = _mediaDownloadProgress.asSharedFlow()
 
     private val _mediaDownloadComplete = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
-    /** Flow of (mediaId, filePath) for completed media downloads */
+    /** Flow of (mediaId, filePath) once an inbound media transfer is stored and hash-verified. */
     val mediaDownloadComplete: SharedFlow<Pair<String, String>> = _mediaDownloadComplete.asSharedFlow()
 
     private val _memberLeft = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
@@ -126,11 +132,19 @@ class ZappMessagingSDK {
     val messageStatus: SharedFlow<Triple<String, String, String>> = _messageStatus.asSharedFlow()
 
     private val _mediaTransferProgress = MutableSharedFlow<Pair<String, Double>>(extraBufferCapacity = 64)
-    /** Flow of (mediaId, progress) for media uploads */
+    /**
+     * Same events as [mediaDownloadProgress]: the core reports progress only
+     * for inbound transfers and nothing for sends. Kept for hosts that
+     * subscribed before the direction was named; prefer [mediaDownloadProgress].
+     */
     val mediaTransferProgress: SharedFlow<Pair<String, Double>> = _mediaTransferProgress.asSharedFlow()
 
     private val _mediaTransferComplete = MutableSharedFlow<String>(extraBufferCapacity = 16)
-    /** Flow of mediaId when an upload completes */
+    /**
+     * The mediaId of each completed inbound transfer, i.e. [mediaDownloadComplete]
+     * without the path. This never signals that an outbound send finished;
+     * prefer [mediaDownloadComplete].
+     */
     val mediaTransferComplete: SharedFlow<String> = _mediaTransferComplete.asSharedFlow()
 
     private val _pushTopicsChanged = MutableSharedFlow<Unit>(extraBufferCapacity = 16)
@@ -139,8 +153,6 @@ class ZappMessagingSDK {
 
     // ── Private Components ──────────────────────────────────────────────
 
-    private val ipcBridge = IPCBridge()
-    private val workletManager = BareWorkletManager()
     private var applicationContext: Context? = null
 
     /**
@@ -153,6 +165,14 @@ class ZappMessagingSDK {
     @Volatile
     private var isInitialized = false
     private val initializationMutex = Mutex()
+
+    /**
+     * Advances whenever the published identity changes or the SDK shuts down.
+     * List refreshes capture it before their round-trip and discard a result
+     * that belongs to an older account, so a refresh started under the previous
+     * identity can never publish that account's data under the new one.
+     */
+    private val accountGeneration = AtomicLong(0)
 
     // ── Initialization ──────────────────────────────────────────────────
 
@@ -167,13 +187,8 @@ class ZappMessagingSDK {
         try {
             applicationContext = context.applicationContext
             hostScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            // Wire IPC bridge to worklet manager
-            ipcBridge.setWorkletManager(workletManager)
-
-            // Start worklet
+            ipcBridge.setTransport(workletManager)
             workletManager.start(context.applicationContext, ipcBridge)
-
-            // Set up event handlers
             setupEventHandlers()
 
             // Verify worklet started and negotiate protocol version.
@@ -197,7 +212,7 @@ class ZappMessagingSDK {
             // Load identity if it exists
             try {
                 val response = ipcBridge.sendRequest("identity.get")
-                _identity.value = ipcBridge.parseIdentity(response)
+                publishIdentity(ipcBridge.parseIdentity(response))
             } catch (_: Exception) {
                 ZMLog.debug(TAG) { "No existing identity available during initialization" }
             }
@@ -216,26 +231,52 @@ class ZappMessagingSDK {
             isInitialized = true
             ZMLog.debug(TAG) { "SDK initialized" }
         } catch (error: Throwable) {
-            ipcBridge.cancelAllPendingRequests()
-            workletManager.stop()
-            ipcBridge.clearEventHandlers()
-            isInitialized = false
+            teardown()
             throw error
         }
     }
 
     /**
      * Shutdown the SDK and release all resources.
+     *
+     * Every published value returns to its initial state: no identity, empty
+     * conversation and contact lists, offline with zero peers. Nothing observed
+     * from a stopped worklet is authoritative, and a later [initialize] loads
+     * whatever the core holds at that point.
      */
     fun shutdown() {
-        ipcBridge.cancelAllPendingRequests()
+        teardown()
+        ZMLog.debug(TAG) { "SDK shut down" }
+    }
+
+    private fun teardown() {
+        // Stopping the worklet ends the bridge session, which fails every
+        // in-flight request and drops any partial frame from the old stream.
         workletManager.stop()
         ipcBridge.clearEventHandlers()
         hostScope?.cancel()
         hostScope = null
         applicationContext = null
         isInitialized = false
-        ZMLog.debug(TAG) { "SDK shut down" }
+        publishIdentity(null)
+        _isOnline.value = false
+        _peerCount.value = 0
+        _dhtHealth.value = DHT_HEALTH_DEFAULT
+    }
+
+    /**
+     * Make [newIdentity] the published identity. When it differs from the
+     * current one, the account-scoped caches are emptied first and the
+     * generation advances, so nothing from the previous account is visible
+     * under the new key even if a refresh later fails.
+     */
+    private fun publishIdentity(newIdentity: ZMIdentity?) {
+        if (_identity.value?.publicKey != newIdentity?.publicKey) {
+            accountGeneration.incrementAndGet()
+            _conversations.value = emptyList()
+            _contacts.value = emptyList()
+        }
+        _identity.value = newIdentity
     }
 
     // ── Identity Management ─────────────────────────────────────────────
@@ -256,7 +297,7 @@ class ZappMessagingSDK {
         val seedPhrase = response["seedPhrase"]?.jsonPrimitive?.contentOrNull
             ?: throw ZMError.InvalidData("identity.create response missing seedPhrase")
 
-        _identity.value = newIdentity
+        publishIdentity(newIdentity)
         return ZMIdentityWithSeed(identity = newIdentity, seedPhrase = seedPhrase)
     }
 
@@ -307,9 +348,11 @@ class ZappMessagingSDK {
         val restoredName = response["displayName"]?.jsonPrimitive?.contentOrNull ?: displayName
 
         val restoredIdentity = ZMIdentity(publicKey = publicKey, displayName = restoredName)
-        _identity.value = restoredIdentity
+        publishIdentity(restoredIdentity)
 
-        // Reload data
+        // The restore itself is durable at this point; a transient list failure
+        // must not make the host report that it failed. The caches were already
+        // emptied above, so the failure cannot leave old data published.
         try {
             refreshConversations()
             refreshContacts()
@@ -371,11 +414,13 @@ class ZappMessagingSDK {
      * Refresh conversations from core.
      */
     suspend fun refreshConversations() {
+        val generation = accountGeneration.get()
         val response = ipcBridge.sendRequest("conversation.list")
         val convArray = response["conversations"]?.jsonArray ?: return
-        _conversations.value = convArray.mapNotNull { element ->
+        val conversations = convArray.mapNotNull { element ->
             element.jsonObject.let { ipcBridge.parseConversation(it) }
         }
+        if (accountGeneration.get() == generation) _conversations.value = conversations
     }
 
     /**
@@ -461,10 +506,7 @@ class ZappMessagingSDK {
         }
 
         val response = ipcBridge.sendRequest("message.send", payload)
-        val msgData = response["message"]?.jsonObject
-            ?: throw ZMError.InvalidData("Missing message in response")
-        return ipcBridge.parseMessage(msgData)
-            ?: throw ZMError.InvalidData("Invalid message data")
+        return parsePersistedMessage(response)
     }
 
     /**
@@ -616,38 +658,19 @@ class ZappMessagingSDK {
         }
 
         val response = ipcBridge.sendRequest("media.send_message", sendPayload)
-        val msgData = response["message"]?.jsonObject
-
-        // Parse response or construct message from known data
-        return if (msgData != null) {
-            ipcBridge.parseMessage(msgData) ?: buildMediaMessage(
-                conversationId, caption, contentType, mediaId, mediaSize, mediaLocalPath
-            )
-        } else {
-            buildMediaMessage(conversationId, caption, contentType, mediaId, mediaSize, mediaLocalPath)
-        }
+        return parsePersistedMessage(response)
     }
 
-    private fun buildMediaMessage(
-        conversationId: String,
-        caption: String,
-        contentType: String,
-        mediaId: String,
-        mediaSize: Int,
-        mediaLocalPath: String
-    ): ZMMessage {
-        val currentIdentity = _identity.value ?: throw ZMError.IdentityNotFound()
-        return ZMMessage(
-            id = java.util.UUID.randomUUID().toString(),
-            conversationId = conversationId,
-            senderId = currentIdentity.publicKey,
-            content = caption,
-            contentType = contentType,
-            isFromMe = true,
-            mediaId = mediaId,
-            mediaSize = mediaSize,
-            mediaLocalPath = mediaLocalPath
-        )
+    /**
+     * The message the core persisted is the only one whose id later receipts,
+     * replies and history refer to. A successful response without one is a
+     * contract violation, not something to paper over with a local stand-in.
+     */
+    private fun parsePersistedMessage(response: JsonObject): ZMMessage {
+        val msgData = response["message"]?.jsonObject
+            ?: throw ZMError.InvalidData("Missing message in response")
+        return ipcBridge.parseMessage(msgData)
+            ?: throw ZMError.InvalidData("Invalid message data")
     }
 
     // ── Contact Management ──────────────────────────────────────────────
@@ -669,9 +692,11 @@ class ZappMessagingSDK {
      * Refresh contacts from core.
      */
     suspend fun refreshContacts() {
+        val generation = accountGeneration.get()
         val response = ipcBridge.sendRequest("contacts.list")
         val contactArray = response["contacts"]?.jsonArray ?: return
-        _contacts.value = contactArray.mapNotNull { ipcBridge.parseContact(it.jsonObject) }
+        val contacts = contactArray.mapNotNull { ipcBridge.parseContact(it.jsonObject) }
+        if (accountGeneration.get() == generation) _contacts.value = contacts
     }
 
     /**
@@ -731,27 +756,7 @@ class ZappMessagingSDK {
         }
 
         val response = ipcBridge.sendRequest(type.ipcType, payload)
-        val msgData = response["message"]?.jsonObject
-
-        return if (msgData != null) {
-            ipcBridge.parseMessage(msgData) ?: ZMMessage(
-                id = java.util.UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = _identity.value!!.publicKey,
-                content = message.toString(),
-                contentType = "text/plain",
-                isFromMe = true
-            )
-        } else {
-            ZMMessage(
-                id = java.util.UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                senderId = _identity.value!!.publicKey,
-                content = message.toString(),
-                contentType = "text/plain",
-                isFromMe = true
-            )
-        }
+        return parsePersistedMessage(response)
     }
 
     // ── Connection Management ───────────────────────────────────────────
@@ -903,7 +908,7 @@ class ZappMessagingSDK {
      */
     fun resume() {
         workletManager.resume()
-        kotlinx.coroutines.GlobalScope.launch {
+        hostScope?.launch {
             try {
                 getConnectionStatus()
             } catch (_: Exception) {
@@ -914,7 +919,7 @@ class ZappMessagingSDK {
 
     // ── Event Handling ──────────────────────────────────────────────────
 
-    private fun setupEventHandlers() {
+    internal fun setupEventHandlers() {
         ipcBridge.onEvent { eventType, payload ->
             when (eventType) {
                 "message.received" -> {
@@ -1010,31 +1015,15 @@ class ZappMessagingSDK {
                     }
                 }
 
-                "media.download_complete" -> {
-                    val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
-                    val filePath = payload["filePath"]?.jsonPrimitive?.contentOrNull
-                    if (mediaId != null && filePath != null) {
-                        _mediaDownloadComplete.tryEmit(Pair(mediaId, filePath))
-                    }
-                }
-
-                "media.download_progress" -> {
-                    val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
-                    val progress = payload["progress"]?.jsonPrimitive?.doubleOrNull
-                    if (mediaId != null && progress != null) {
-                        _mediaDownloadProgress.tryEmit(Pair(mediaId, progress))
-                    }
-                }
-
+                // Both media events are inbound only: the core emits them as
+                // received chunks land and once the stored file's hash verifies
+                // (see core/API.md). Nothing is emitted for outbound sends.
                 "media.transfer_complete" -> {
                     val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
                     val mediaLocalPath = payload["mediaLocalPath"]?.jsonPrimitive?.contentOrNull
-                    if (mediaId != null) {
+                    if (mediaId != null && mediaLocalPath != null) {
+                        _mediaDownloadComplete.tryEmit(Pair(mediaId, mediaLocalPath))
                         _mediaTransferComplete.tryEmit(mediaId)
-                        // When mediaLocalPath is present, this is a received media download completion
-                        if (mediaLocalPath != null) {
-                            _mediaDownloadComplete.tryEmit(Pair(mediaId, mediaLocalPath))
-                        }
                     }
                 }
 
@@ -1042,6 +1031,7 @@ class ZappMessagingSDK {
                     val mediaId = payload["mediaId"]?.jsonPrimitive?.contentOrNull
                     val progress = payload["progress"]?.jsonPrimitive?.doubleOrNull
                     if (mediaId != null && progress != null) {
+                        _mediaDownloadProgress.tryEmit(Pair(mediaId, progress))
                         _mediaTransferProgress.tryEmit(Pair(mediaId, progress))
                     }
                 }
@@ -1149,6 +1139,7 @@ class ZappMessagingSDK {
 
     companion object {
         private const val TAG = "ZappMessagingSDK"
+        private const val DHT_HEALTH_DEFAULT = "healthy"
         /** Max concurrent message.get_thumbnail fetches while hydrating a list. */
         private const val THUMBNAIL_FETCH_CONCURRENCY = 6
         private const val WORKLET_STARTUP_PROBE_DELAY_MS = 300L

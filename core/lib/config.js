@@ -15,11 +15,13 @@ function getArg (name) {
   return arg ? arg.substring(prefix.length) : null
 }
 
-function getArgInt (name, fallback) {
+// A flag that is not a whole number inside [min, max] keeps the fallback, so a
+// typo cannot set a zero-byte buffer cap or a negative interval.
+function getArgInt (name, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const raw = getArg(name)
-  if (raw === null) return fallback
-  const n = parseInt(raw, 10)
-  return Number.isNaN(n) ? fallback : n
+  if (raw === null || !/^\d+$/.test(raw.trim())) return fallback
+  const n = Number(raw.trim())
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : fallback
 }
 
 // --- Blind peer configuration ---
@@ -65,11 +67,11 @@ const IDENTITY_FILE_KEY = (() => {
 })()
 
 // --- Local gateway IP (passed by Android when on Wi-Fi/hotspot) ---
-// Used to seed phone2's DHT routing table from phone1's node on the local
-// LAN when phone2 is behind double-NAT (e.g. on phone1's tethered hotspot).
-// The gateway is typically the AP's LAN IP (e.g. 10.215.90.1 for Android
-// hotspot). Phone1's DHT listens on all interfaces including the hotspot
-// interface, so phone2 can reach it at gateway:49737 to bootstrap DHT.
+// A device tethered to another Zapp phone's hotspot sits behind double-NAT
+// with no direct UDP path to the internet, but the hotspot phone's HyperDHT
+// listens on the hotspot interface at gateway:49737. Probing the gateway lets
+// the tethered device seed its routing table from that node (see
+// p2p-manager.js); other gateways simply do not answer.
 const LOCAL_GATEWAY_IP = getArg('local-gateway') || null
 
 // --- Bootstrap node configuration ---

@@ -31,8 +31,9 @@ const path = require('bare-path')
 const mnemonic = require('./mnemonic')
 const { getDataDir, readJSON, writeJSON, fileExists } = require('./storage')
 const { IDENTITY_FILE_KEY } = require('./config')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-function diag (...args) { /* no-op; identity logging goes through index.js diag */ }
+const diag = createDiagnosticLogger('IDENTITY')
 
 const SEED_BYTES = 32
 const FILE_KEY_BYTES = 32
@@ -85,12 +86,7 @@ class Identity {
   async restoreFromMnemonic(mnemonicPhrase, displayName = '') {
     const entropy = mnemonic.mnemonicToEntropy(mnemonicPhrase)
     const seed = mnemonic.mnemonicToEd25519Seed(mnemonicPhrase)
-    this.keyPair = crypto.keyPair(seed)
-    this.bipEntropy = entropy
-    this.displayName = displayName
-    this.createdAt = Date.now()
-    await this.save()
-    return this.keyPair
+    return this._install(crypto.keyPair(seed), entropy, displayName)
   }
 
   /**
@@ -102,11 +98,32 @@ class Identity {
     const entropy = crypto.randomBytes(SEED_BYTES)
     const mnemonicPhrase = mnemonic.entropyToMnemonic(entropy)
     const seed = mnemonic.mnemonicToEd25519Seed(mnemonicPhrase)
-    this.keyPair = crypto.keyPair(seed)
+    return this._install(crypto.keyPair(seed), entropy, displayName || '')
+  }
+
+  /**
+   * Publish a new keypair only once it is on disk. A failed save leaves the
+   * previously loaded identity in place, so memory never advertises a key
+   * that the next launch cannot reproduce.
+   * @private
+   */
+  async _install (keyPair, entropy, displayName) {
+    const previous = {
+      keyPair: this.keyPair,
+      bipEntropy: this.bipEntropy,
+      displayName: this.displayName,
+      createdAt: this.createdAt
+    }
+    this.keyPair = keyPair
     this.bipEntropy = entropy
-    this.displayName = displayName || ''
+    this.displayName = displayName
     this.createdAt = Date.now()
-    await this.save()
+    try {
+      await this.save()
+    } catch (error) {
+      Object.assign(this, previous)
+      throw error
+    }
     return this.keyPair
   }
 

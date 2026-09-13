@@ -20,9 +20,11 @@ import kotlin.coroutines.suspendCoroutine
  * Equivalent to iOS BareWorkletManager.swift.
  *
  * Handles starting, stopping, suspending, and resuming the worklet,
- * and wires IPC data flow to [IPCBridge].
+ * and wires IPC data flow to [IPCBridge]. Each start opens a new bridge
+ * session and each stop ends it, so bytes from a stopped reader can never
+ * land in the next worklet's frame buffer.
  */
-class BareWorkletManager {
+internal class BareWorkletManager : IPCTransport {
 
     private var worklet: Worklet? = null
     private var ipc: IPC? = null
@@ -51,6 +53,7 @@ class BareWorkletManager {
 
             shuttingDown.set(false)
             this.ipcBridge = ipcBridge
+            val session = ipcBridge.beginSession()
 
             // Extract worklet bundle from APK assets to internal storage.
             // Bare runtime needs a filesystem path to load the bundle format
@@ -119,10 +122,10 @@ class BareWorkletManager {
 
             // Set up readable callback for incoming data from worklet.
             // Guard against reads after shutdown: the callback runs on the BareKit
-            // IPC thread and may overlap with stop() on the main thread.
+            // IPC thread and may overlap with stop() on the main thread. Bytes it
+            // delivers after stop() carry a stale session token and are dropped.
             ipcChannel.readable {
                 if (shuttingDown.get()) return@readable
-                val bridge = ipcBridge ?: return@readable
                 try {
                     var hasData = false
                     while (!shuttingDown.get()) {
@@ -132,7 +135,7 @@ class BareWorkletManager {
                         val bytes = ByteArray(data.remaining())
                         data.get(bytes)
                         ZMLog.debug(TAG) { "IPC data received" }
-                        bridge.handleIncomingData(bytes)
+                        ipcBridge.handleIncomingData(bytes, session)
                     }
                     if (!hasData) {
                         ZMLog.debug(TAG) { "IPC callback had no available data" }
@@ -167,6 +170,10 @@ class BareWorkletManager {
                 ZMLog.warning(TAG) { "IPC close failed during shutdown" }
             }
             ipc = null
+            // Ending the session fails every in-flight request and invalidates
+            // the token the reader callback holds, so anything it still
+            // delivers is dropped rather than buffered for the next worklet.
+            ipcBridge?.beginSession()
             ipcBridge = null
 
             // Give the native IPC callback thread time to observe the closed
@@ -239,7 +246,7 @@ class BareWorkletManager {
      * @param data The bytes to send
      * @throws IllegalStateException if the worklet is not running
      */
-    suspend fun sendData(data: ByteArray) = writeMutex.withLock {
+    override suspend fun sendData(data: ByteArray): Unit = writeMutex.withLock {
         if (shuttingDown.get()) {
             throw IllegalStateException("IPC unavailable — worklet is shutting down")
         }

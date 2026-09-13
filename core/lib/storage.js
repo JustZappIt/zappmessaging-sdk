@@ -7,12 +7,9 @@
 const path = require('bare-path')
 const fs = require('bare-fs')
 const os = require('bare-os')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-// Minimal diag stub — storage.js loads before the data dir is known,
-// so logs go to stderr only.  Other modules use file-based diag.
-function diag (...args) {
-  // no-op in production; enable via LOG_LEVEL=debug if needed
-}
+const diag = createDiagnosticLogger('STORAGE')
 
 let _dataDir = null
 
@@ -40,7 +37,6 @@ function getDataDir() {
   // Ensure directory exists
   ensureDir(_dataDir)
 
-  diag('Data directory:', _dataDir)
   return _dataDir
 }
 
@@ -54,7 +50,7 @@ function ensureDir(dirPath) {
       fs.mkdirSync(dirPath, { recursive: true })
     }
   } catch (err) {
-    diag('Failed to create directory:', dirPath, err)
+    diag('Failed to create directory:', err)
     throw err
   }
 }
@@ -72,7 +68,7 @@ function readJSON(filePath) {
     const data = fs.readFileSync(filePath, 'utf8')
     return JSON.parse(data)
   } catch (err) {
-    diag('Failed to read JSON file:', filePath, err)
+    diag('Failed to read JSON file:', err)
     return null
   }
 }
@@ -91,7 +87,7 @@ function writeJSON(filePath, data) {
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8')
     fs.renameSync(tmpPath, filePath)
   } catch (err) {
-    diag('Failed to write JSON file:', filePath, err)
+    diag('Failed to write JSON file:', err)
     throw err
   }
 }

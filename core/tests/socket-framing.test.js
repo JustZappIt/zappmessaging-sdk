@@ -260,3 +260,30 @@ test('rejects frames that are too large', () => {
   })
 })
 
+
+test('legacy mode decodes a UTF-8 code point split across reads', () => {
+  const mockSocket = new MockSocket()
+  const framed = new FramedSocket(mockSocket)
+  const received = []
+  framed.onMessage = message => received.push(message)
+
+  const bytes = b4a.from(JSON.stringify({ content: 'hello 😀' }) + '\n')
+  const cut = bytes.indexOf(b4a.from('😀')) + 2
+  mockSocket.simulateData(bytes.subarray(0, cut))
+  assert.deepStrictEqual(received, [], 'nothing is emitted before the line completes')
+  mockSocket.simulateData(bytes.subarray(cut))
+
+  assert.deepStrictEqual(received, [{ content: 'hello 😀' }])
+})
+
+test('legacy mode handles several newline-delimited frames and a trailing unterminated one', () => {
+  const mockSocket = new MockSocket()
+  const framed = new FramedSocket(mockSocket)
+  const received = []
+  framed.onMessage = message => received.push(message)
+
+  mockSocket.simulateData(b4a.from('{"a":1}\n\n{"b":"é"}\n{"c":'))
+  assert.deepStrictEqual(received, [{ a: 1 }, { b: 'é' }])
+  mockSocket.simulateData(b4a.from('3}'))
+  assert.deepStrictEqual(received, [{ a: 1 }, { b: 'é' }, { c: 3 }])
+})

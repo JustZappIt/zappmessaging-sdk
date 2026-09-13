@@ -42,6 +42,12 @@ public final class ZappMessagingSDK: ObservableObject {
     private var eventCancellables: Set<AnyCancellable> = []
     private var conversationRefreshTask: Task<Void, Never>?
     private var conversationRefreshNeedsFollowup = false
+
+    /// Advances whenever the published identity changes or the SDK shuts down.
+    /// List refreshes capture it before their round-trip and discard a result
+    /// that belongs to an older account, so a refresh started under the
+    /// previous identity can never publish that account's data under the new one.
+    private var accountGeneration: UInt64 = 0
     
     // MARK: - Event Publishers
     
@@ -66,16 +72,20 @@ public final class ZappMessagingSDK: ObservableObject {
     /// Publisher for message delivery status updates
     public let messageStatus = PassthroughSubject<(messageId: String, conversationId: String, status: String), Never>()
     
-    /// Publisher for media download progress
+    /// (mediaId, progress 0..1) as chunks of an inbound media transfer arrive.
     public let mediaDownloadProgress = PassthroughSubject<(mediaId: String, progress: Double), Never>()
     
-    /// Publisher for media download completion
+    /// (mediaId, filePath) once an inbound media transfer is stored and hash-verified.
     public let mediaDownloadComplete = PassthroughSubject<(mediaId: String, filePath: String), Never>()
     
-    /// Publisher for media transfer progress (sending)
+    /// Same events as `mediaDownloadProgress`: the core reports progress only
+    /// for inbound transfers and nothing for sends. Kept for hosts that
+    /// subscribed before the direction was named; prefer `mediaDownloadProgress`.
     public let mediaTransferProgress = PassthroughSubject<(mediaId: String, progress: Double), Never>()
     
-    /// Publisher for media transfer completion (sending)
+    /// The mediaId of each completed inbound transfer, i.e. `mediaDownloadComplete`
+    /// without the path. This never signals that an outbound send finished;
+    /// prefer `mediaDownloadComplete`.
     public let mediaTransferComplete = PassthroughSubject<String, Never>()
 
     /// Per-conversation peer presence. `peerId` is truncated to 12 chars by the
@@ -95,8 +105,10 @@ public final class ZappMessagingSDK: ObservableObject {
     /// Startup configuration handed to the worklet as argv.
     private let config: ZappMessagingConfig
 
-    /// Worklet readiness probe, mirroring Kotlin's ZappMessagingSDK.
-    /// Cumulative envelope if every attempt fails: 300+600+900+1200+1500 = 4.5s.
+    /// Worklet readiness probe, mirroring Kotlin's ZappMessagingSDK: five
+    /// `protocol.init` attempts, each preceded by a 300ms incremental backoff
+    /// and bounded by the 5s protocol timeout. The backoff alone totals 4.5s;
+    /// an unreachable worklet costs about 29.5s before `initialize()` fails.
     private static let startupProbeDelayMs: UInt64 = 300
     private static let startupMaxRetries = 5
 
@@ -112,8 +124,7 @@ public final class ZappMessagingSDK: ObservableObject {
     public func initialize() async throws {
         guard !isInitialized else { return }
 
-        // Connect IPC bridge to worklet manager
-        await ipcBridge.setWorkletManager(workletManager)
+        await ipcBridge.setTransport(workletManager)
         await workletManager.setFailureHandler { [weak self] error, recovered in
             Task { @MainActor [weak self] in
                 self?.operationalFailure.send(
@@ -126,7 +137,6 @@ public final class ZappMessagingSDK: ObservableObject {
             }
         }
 
-        // Start worklet
         try await workletManager.start(config: config, ipcBridge: ipcBridge)
 
         try await negotiateProtocolWithRetry()
@@ -139,7 +149,7 @@ public final class ZappMessagingSDK: ObservableObject {
         // A missing identity is the normal first-run outcome, not a failure: the
         // app derives one from the wallet seed once the user picks a name.
         do {
-            identity = try await ipcBridge.getIdentity()
+            publishIdentity(try await ipcBridge.getIdentity())
         } catch {
             ZMLog.debug("SDK", "No existing identity available during initialization")
         }
@@ -179,15 +189,38 @@ public final class ZappMessagingSDK: ObservableObject {
         throw ZMError.notInitialized
     }
 
-    /// Shutdown the SDK
+    /// Shutdown the SDK.
+    ///
+    /// Every published value returns to its initial state: no identity, empty
+    /// conversation and contact lists, offline with zero peers. Nothing observed
+    /// from a stopped worklet is authoritative, and a later `initialize()` loads
+    /// whatever the core holds at that point.
     public func shutdown() async {
         conversationRefreshTask?.cancel()
         conversationRefreshTask = nil
         conversationRefreshNeedsFollowup = false
-        await ipcBridge.cancelAllPendingRequests()
+        // Stopping the worklet ends the bridge session, which fails every
+        // in-flight request and drops any partial frame from the old stream.
         await workletManager.stop()
         await ipcBridge.clearEventHandlers()
+        publishIdentity(nil)
+        isOnline = false
+        peerCount = 0
+        dhtHealth = "healthy"
         isInitialized = false
+    }
+
+    /// Make `newIdentity` the published identity. When it differs from the
+    /// current one, the account-scoped caches are emptied first and the
+    /// generation advances, so nothing from the previous account is visible
+    /// under the new key even if a refresh later fails.
+    private func publishIdentity(_ newIdentity: ZMIdentity?) {
+        if identity?.publicKey != newIdentity?.publicKey {
+            accountGeneration &+= 1
+            conversations = []
+            contacts = []
+        }
+        identity = newIdentity
     }
     
     // MARK: - Identity Management
@@ -219,11 +252,18 @@ public final class ZappMessagingSDK: ObservableObject {
 
     /// Derive the chat identity from the wallet's BIP-39 seed phrase.
     ///
-    /// The seed is passed through, never stored: the worklet persists the derived
-    /// identity in `identity.json` inside its data dir, and the identity is always
-    /// re-derivable from the wallet. This SDK deliberately keeps no copy of the
-    /// wallet seed — Android keeps none either, and a second at-rest copy would be
-    /// a strictly larger blast radius than the wallet itself.
+    /// What is stored: the worklet derives the chat keypair from the phrase and
+    /// persists the 32 bytes of BIP-39 entropy — enough to reconstruct the whole
+    /// mnemonic — in `identity.json` inside its data dir, so the identity can be
+    /// reloaded and the phrase re-exported. That file is encrypted at rest
+    /// (XSalsa20-Poly1305) under a random key `IdentityFileKeyStore` keeps in
+    /// the Keychain as a non-syncing, this-device-only item. If the Keychain is
+    /// unavailable when the worklet starts, the core falls back to writing the
+    /// entropy in plaintext; if the key is lost later, the file becomes
+    /// unreadable and the user restores from the phrase again. The stored
+    /// entropy is equivalent to the wallet seed, so the data dir deserves the
+    /// same care as the wallet's own storage; the phrase itself is never kept
+    /// by this SDK in any other form.
     ///
     /// Idempotent for the same seed. A *different* seed destructively clears the
     /// chat and contact stores (see core/lib/ipc-handler.js).
@@ -241,7 +281,7 @@ public final class ZappMessagingSDK: ObservableObject {
         }
 
         let restoredIdentity = ZMIdentity(publicKey: publicKey, displayName: displayName)
-        self.identity = restoredIdentity
+        publishIdentity(restoredIdentity)
 
         do {
             try await refreshConversations()
@@ -249,7 +289,8 @@ public final class ZappMessagingSDK: ObservableObject {
         } catch {
             // The identity restore has already succeeded and is durable. A
             // transient list failure must not make the host report that restore
-            // itself failed.
+            // itself failed, and the caches were emptied above so it cannot
+            // leave the previous account's data published either.
             ZMLog.warning("SDK", "Post-restore data refresh failed")
         }
 
@@ -314,7 +355,10 @@ public final class ZappMessagingSDK: ObservableObject {
     
     /// Refresh conversations from core
     public func refreshConversations() async throws {
-        conversations = try await ipcBridge.listConversations()
+        let generation = accountGeneration
+        let latest = try await ipcBridge.listConversations()
+        guard generation == accountGeneration else { return }
+        conversations = latest
     }
     
     /// Leave a group conversation
@@ -480,7 +524,10 @@ public final class ZappMessagingSDK: ObservableObject {
     
     /// Refresh contacts from core
     public func refreshContacts() async throws {
-        contacts = try await ipcBridge.listContacts()
+        let generation = accountGeneration
+        let latest = try await ipcBridge.listContacts()
+        guard generation == accountGeneration else { return }
+        contacts = latest
     }
     
     /// Update a contact
@@ -735,16 +782,14 @@ public final class ZappMessagingSDK: ObservableObject {
                 peerStatus.send((conversationId: conversationId, peerId: peerId, status: status))
             }
 
-        // The core emits `media.transfer_complete` for BOTH directions and
-        // distinguishes them by `mediaLocalPath`: present means a download landed.
-        // There is no `media.download_complete` event — listening for one is why
-        // received media never surfaced.
+        // Both media events are inbound only: the core emits them as received
+        // chunks land and once the stored file's hash verifies (see
+        // core/API.md). Nothing is emitted for outbound sends.
         case "media.transfer_complete":
-            guard let mediaId = payload["mediaId"] as? String else { break }
+            guard let mediaId = payload["mediaId"] as? String,
+                  let localPath = payload["mediaLocalPath"] as? String else { break }
+            mediaDownloadComplete.send((mediaId: mediaId, filePath: localPath))
             mediaTransferComplete.send(mediaId)
-            if let localPath = payload["mediaLocalPath"] as? String {
-                mediaDownloadComplete.send((mediaId: mediaId, filePath: localPath))
-            }
 
         case "media.transfer_progress":
             if let mediaId = payload["mediaId"] as? String,

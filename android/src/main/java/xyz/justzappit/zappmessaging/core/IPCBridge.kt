@@ -9,14 +9,20 @@ import xyz.justzappit.zappmessaging.models.*
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 
+/** The byte sink a request is written to; [BareWorkletManager] in production. */
+internal interface IPCTransport {
+    suspend fun sendData(data: ByteArray)
+}
+
 /**
  * Handles NDJSON IPC protocol communication with the JavaScript worklet.
  * Equivalent to iOS IPCBridge.swift.
  *
  * Manages request/response correlation, NDJSON framing (buffering partial
  * reads, splitting on newlines), and event dispatch to registered listeners.
+ * Framing state belongs to one transport session: see [beginSession].
  */
-class IPCBridge {
+internal class IPCBridge {
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -25,14 +31,16 @@ class IPCBridge {
 
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<JsonObject>>()
     private val eventHandlers = mutableListOf<(String, JsonObject) -> Unit>()
-    // Raw bytes, decoded per complete line (see handleIncomingData). A prior
-    // StringBuilder decoded each pipe read as its own UTF-8 string, corrupting
-    // any multi-byte character split across two reads (emoji -> U+FFFD).
+    // Raw bytes, decoded once a complete line is available, so a UTF-8 code
+    // point may span two pipe reads.
     private var receiveBuffer = ByteArray(0)
     // True while dropping the remainder of a single over-cap frame, up to its
     // next newline, so one huge frame can't take the whole stream down.
     private var skippingOversized = false
-    private var workletManager: BareWorkletManager? = null
+    // Identifies the byte stream the framing state belongs to. Bytes presented
+    // with an older token come from a reader that was stopped, and are dropped.
+    private var sessionToken = 0
+    private var transport: IPCTransport? = null
 
     private val bufferLock = Any()
 
@@ -44,11 +52,15 @@ class IPCBridge {
     private val maxLineBytes = 16 * 1024 * 1024
 
     /**
-     * Set the worklet manager for sending data.
+     * Set the transport requests are written to.
      */
-    fun setWorkletManager(manager: BareWorkletManager) {
-        this.workletManager = manager
+    fun setTransport(transport: IPCTransport) {
+        this.transport = transport
     }
+
+    /** Requests still waiting for a response, timeout, or cancellation. */
+    val pendingRequestCount: Int
+        get() = pendingRequests.size
 
     // ── Request / Response ──────────────────────────────────────────────
 
@@ -77,34 +89,57 @@ class IPCBridge {
         val requestBytes = requestJson.toByteArray(StandardCharsets.UTF_8)
 
         try {
-            workletManager?.sendData(requestBytes)
+            transport?.sendData(requestBytes)
                 ?: throw ZMError.NotInitialized()
         } catch (e: Exception) {
             pendingRequests.remove(request.id)
             throw e
         }
 
-        // Wait for response with timeout
+        // The entry is removed on every exit, including the caller's own
+        // cancellation, so an abandoned request cannot linger until shutdown.
         return try {
             withTimeout(timeoutMs) {
                 deferred.await()
             }
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-            pendingRequests.remove(request.id)
             throw ZMError.IpcTimeout()
+        } finally {
+            pendingRequests.remove(request.id, deferred)
         }
     }
 
     // ── Incoming Data Handling ───────────────────────────────────────────
 
     /**
+     * Start a new transport session and return its token.
+     *
+     * Every in-flight request fails, and any partial frame left over from the
+     * previous byte stream is dropped, so a restarted worklet's first line is
+     * never glued onto the tail of the old one. [handleIncomingData] ignores
+     * bytes carrying an older token, which is what keeps a late callback from
+     * the stopped reader from re-introducing stale bytes.
+     */
+    fun beginSession(): Int {
+        val token = synchronized(bufferLock) {
+            receiveBuffer = ByteArray(0)
+            skippingOversized = false
+            ++sessionToken
+        }
+        cancelAllPendingRequests()
+        return token
+    }
+
+    /**
      * Handle incoming raw bytes from the worklet.
-     * Called by [BareWorkletManager] on the IPC readable callback.
+     * Called by [BareWorkletManager] on the IPC readable callback with the
+     * token its session was started with.
      *
      * Buffers partial data and processes complete NDJSON lines.
      */
-    fun handleIncomingData(bytes: ByteArray) {
+    fun handleIncomingData(bytes: ByteArray, session: Int) {
         synchronized(bufferLock) {
+            if (session != sessionToken) return
             receiveBuffer += bytes
 
             // Process every complete newline-delimited frame. Each line's bytes
@@ -140,9 +175,8 @@ class IPCBridge {
             }
 
             // An un-terminated frame past the cap: drop just this frame and skip
-            // to its next newline, preserving the rest of the stream. Previously
-            // the whole buffer was cleared — killing every in-flight request and
-            // deterministically bricking a media-heavy conversation on retry.
+            // to its next newline. Clearing the whole buffer instead would drop
+            // every in-flight response behind it.
             if (receiveBuffer.size > maxLineBytes) {
                 ZMLog.warning(TAG) { "Unterminated oversized IPC frame skipped" }
                 skippingOversized = true
@@ -237,7 +271,7 @@ class IPCBridge {
      */
     fun cancelAllPendingRequests() {
         val error = ZMError.NotInitialized()
-        for ((id, deferred) in pendingRequests) {
+        for ((_, deferred) in pendingRequests) {
             deferred.completeExceptionally(error)
         }
         pendingRequests.clear()
@@ -323,7 +357,13 @@ class IPCBridge {
         val publicKey = data["publicKey"]?.jsonPrimitive?.contentOrNull ?: return null
         val name = data["name"]?.jsonPrimitive?.contentOrNull ?: return null
         val addedAt = data["addedAt"]?.jsonPrimitive?.longOrNull ?: System.currentTimeMillis()
-        return ZMContact(publicKey = publicKey, name = name, addedAt = addedAt)
+        return ZMContact(
+            publicKey = publicKey,
+            name = name,
+            addedAt = addedAt,
+            walletAddress = data["walletAddress"]?.jsonPrimitive?.contentOrNull,
+            addressType = data["addressType"]?.jsonPrimitive?.contentOrNull
+        )
     }
 
     /**
