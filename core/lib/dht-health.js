@@ -16,8 +16,10 @@
  */
 
 const EventEmitter = require('bare-events')
+const config = require('./config')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-function diag (...args) { /* no-op; dht-health logging is event-based */ }
+const diag = createDiagnosticLogger('DHT')
 
 const HealthStatus = {
   HEALTHY: 'healthy',
@@ -28,14 +30,14 @@ const HealthStatus = {
 class DHTHealthMonitor extends EventEmitter {
   /**
    * @param {Object} options
-   * @param {number} options.checkInterval - ms between checks (default 120 000 — 2 min)
-   * @param {number} options.checkTimeout  - ms to wait for dht.ready (default 8 000)
+   * @param {number} options.checkInterval - ms between checks (default config.DHT_CHECK_INTERVAL_MS)
+   * @param {number} options.checkTimeout  - ms to wait for dht.ready (default config.DHT_CHECK_TIMEOUT_MS)
    */
   constructor(options = {}) {
     super()
 
-    this.checkInterval = options.checkInterval || 120000  // 2 minutes
-    this.checkTimeout = options.checkTimeout || 8000      // 8 seconds
+    this.checkInterval = options.checkInterval || config.DHT_CHECK_INTERVAL_MS
+    this.checkTimeout = options.checkTimeout || config.DHT_CHECK_TIMEOUT_MS
 
     // External references (set via setSwarm / setPeerCountFn)
     this._swarm = null

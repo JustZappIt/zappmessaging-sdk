@@ -16,7 +16,7 @@ function framingHarness (maxBytes = 64) {
 
   const lines = []
   const errors = []
-  handler._processLine = line => lines.push(line)
+  handler._processLine = async line => { lines.push(line) }
   handler.pushEvent = (type, payload) => errors.push({ type, payload })
   return { handler, lines, errors }
 }

@@ -150,10 +150,7 @@ class P2PManager extends EventEmitter {
     this._replayWindowMs = 5 * 60 * 1000
 
     // DHT health monitor — uses the main swarm, no temp instances
-    this.healthMonitor = new DHTHealthMonitor({
-      checkInterval: 120000,  // 2 minutes
-      checkTimeout: 8000
-    })
+    this.healthMonitor = new DHTHealthMonitor()
     this.healthMonitor.setPeerCountFn(() => this.peerCount)
 
     // Set up health monitoring event handlers
@@ -162,7 +159,8 @@ class P2PManager extends EventEmitter {
     // Heartbeat interval handle
     this._heartbeatInterval = null
 
-    // Per-peer rate limiting (H10)
+    // Per-peer rate limiting: one fixed window per peer for messages and one
+    // for media requests, so a single chatty peer cannot starve the rest.
     this._peerMessageCounts = new Map() // peerKeyHex -> { count, windowStart }
     this._peerMediaRequestCounts = new Map()
     this._peerRateLimit = config.PEER_RATE_LIMIT_PER_MIN
@@ -199,11 +197,6 @@ class P2PManager extends EventEmitter {
     entry.count++
     return entry.count > MAX_MEDIA_REQUESTS_PER_MINUTE
   }
-
-  /**
-   * Set up DHT health monitoring event handlers (Phase 2)
-   * @private
-   */
 
   /**
    * May the authenticated peer announce a core for this conversation?
@@ -497,10 +490,10 @@ class P2PManager extends EventEmitter {
         // Why probe-then-seed works:
         //   - dht.ping() is a direct UDP packet — no routing table required.
         //     It works even when DHT is not yet bootstrapped (double-NAT case).
-        //   - If the gateway IS phone1 running Zapp, the response seeds phone2's
-        //     routing table with phone1's internet-connected DHT entries, enabling
-        //     phone2 to reach the VPS and register with the blind peer even though
-        //     phone2's direct internet UDP is blocked by double-NAT.
+        //   - If the gateway is a phone running Zapp, the response seeds this
+        //     node's routing table with that phone's internet-connected DHT
+        //     entries, so it can reach the VPS and register with the blind
+        //     peer even though its own internet UDP is blocked by double-NAT.
         //   - If the gateway is a regular router, the ping times out (~2s) and
         //     we log and skip — zero impact on normal-network operation.
         //
@@ -1237,7 +1230,6 @@ class P2PManager extends EventEmitter {
     // Handle incoming JSON messages via framed socket
     framed.onMessage = async (message) => {
       try {
-        // Rate limit check (H10)
         if (this._isRateLimited(peerId)) {
           return // silently drop; diag already logged
         }
@@ -2336,8 +2328,7 @@ class P2PManager extends EventEmitter {
   }
 
   /**
-   * Stop the P2P manager and cleanup all connections
-   * Includes Phase 2: DHT health monitoring cleanup
+   * Stop the P2P manager, its DHT health monitor, and every connection.
    */
   async stop() {
     if (this.swarm) {

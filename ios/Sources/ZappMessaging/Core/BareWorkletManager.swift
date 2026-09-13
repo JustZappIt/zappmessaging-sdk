@@ -7,8 +7,10 @@
 
 import Foundation
 
-/// Manages the JavaScript worklet lifecycle
-actor BareWorkletManager {
+/// Manages the JavaScript worklet lifecycle. Each worklet start opens a new
+/// bridge session and each stop ends it, so bytes from a stopped reader can
+/// never land in the next worklet's frame buffer.
+actor BareWorkletManager: IPCTransport {
     private var worklet: ZMBareWorklet?
     private var isRunning = false
     private var ipcBridge: IPCBridge?
@@ -37,22 +39,24 @@ actor BareWorkletManager {
         self.config = config
         self.ipcBridge = ipcBridge
 
-        try startWorklet(config: config, ipcBridge: ipcBridge)
+        try await startWorklet(config: config, ipcBridge: ipcBridge)
         isRunning = true
         restartAttempts = 0
         if isSuspended { worklet?.suspend() }
         ZMLog.debug("BareWorkletManager", "Worklet started")
     }
 
-    private func startWorklet(config: ZappMessagingConfig, ipcBridge: IPCBridge) throws {
+    private func startWorklet(config: ZappMessagingConfig, ipcBridge: IPCBridge) async throws {
+        let session = await ipcBridge.beginSession()
 
         // Create and start BareKit worklet
         let nextWorklet = ZMBareWorklet()
         worklet = nextWorklet
 
-        // Set up IPC data handler
+        // The reader presents the session it was started with; the bridge
+        // drops anything from a session that has since ended.
         nextWorklet.onIPC = { [weak self] data in
-            await self?.forwardIncomingData(data)
+            await self?.forwardIncomingData(data, session: session)
         }
         nextWorklet.onTerminalFailure = { [weak self] error in
             Task { await self?.recoverFromTerminalFailure(error) }
@@ -72,11 +76,12 @@ actor BareWorkletManager {
 
     /// Serial actor delivery preserves the byte stream's order and avoids spawning one
     /// unbounded task per IPC read during media transfers.
-    private func forwardIncomingData(_ data: Data) async {
-        await ipcBridge?.handleIncomingData(data)
+    private func forwardIncomingData(_ data: Data, session: UInt64) async {
+        await ipcBridge?.handleIncomingData(data, session: session)
     }
     
-    /// Stop the JavaScript worklet
+    /// Stop the JavaScript worklet. Ending the bridge session fails every
+    /// in-flight request and discards any partial frame from the old stream.
     func stop() async {
         lifecycleGeneration &+= 1
         isRunning = false
@@ -85,6 +90,7 @@ actor BareWorkletManager {
         worklet?.stop()
         worklet = nil
         
+        _ = await ipcBridge?.beginSession()
         ipcBridge = nil
         config = nil
         isSuspended = false
@@ -155,7 +161,7 @@ actor BareWorkletManager {
         restartAttempts += 1
         ZMLog.warning("BareWorkletManager", "Restarting after terminal IPC failure")
         do {
-            try startWorklet(config: config, ipcBridge: ipcBridge)
+            try await startWorklet(config: config, ipcBridge: ipcBridge)
             isRunning = true
             if isSuspended { worklet?.suspend() }
             try await ipcBridge.negotiateProtocol()

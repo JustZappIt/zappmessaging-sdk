@@ -8,6 +8,7 @@
 const EventEmitter = require('bare-events')
 const b4a = require('b4a')
 const config = require('./config')
+const { createDiagnosticLogger } = require('./diagnostics')
 
 const CHUNK_SIZE = config.MEDIA_CHUNK_SIZE
 const DEFAULT_MAX_MEDIA_BYTES = config.MEDIA_MAX_BYTES
@@ -16,7 +17,7 @@ const DEFAULT_TRANSFER_TIMEOUT_MS = 60000
 const DEFAULT_MAX_CONCURRENT_SENDS = 2
 const DEFAULT_MAX_QUEUED_SENDS = 64
 
-function diag (...args) { /* no-op; media-transfer errors are non-fatal */ }
+const diag = createDiagnosticLogger('MEDIA')
 
 function positiveIntegerOption (value, fallback, name) {
   if (value === undefined) return fallback

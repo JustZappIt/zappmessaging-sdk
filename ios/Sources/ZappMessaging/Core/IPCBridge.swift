@@ -7,7 +7,13 @@
 
 import Foundation
 
-/// Handles IPC communication with JavaScript worklet using NDJSON protocol
+/// The byte sink a request is written to; `BareWorkletManager` in production.
+protocol IPCTransport: AnyObject, Sendable {
+    func sendData(_ data: Data) async throws
+}
+
+/// Handles IPC communication with JavaScript worklet using NDJSON protocol.
+/// Framing state belongs to one transport session: see `beginSession()`.
 actor IPCBridge {
     private var pendingRequests: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var timeoutTasks: [String: Task<Void, Never>] = [:]
@@ -16,7 +22,10 @@ actor IPCBridge {
     // True while dropping the remainder of a single over-cap frame, up to its
     // next newline, so one huge frame can't take the whole stream down.
     private var skippingOversizedLine = false
-    private weak var workletManager: BareWorkletManager?
+    // Identifies the byte stream the framing state belongs to. Data presented
+    // with an older token comes from a reader that was stopped, and is dropped.
+    private var sessionToken: UInt64 = 0
+    private weak var transport: (any IPCTransport)?
 
     /// Per-frame ceiling. Any larger NDJSON line is skipped while the rest of
     /// the stream is preserved. Generous because frames are small now that
@@ -39,14 +48,22 @@ actor IPCBridge {
         encoder.outputFormatting = .sortedKeys
     }
 
-    /// Set the worklet manager for sending data
-    func setWorkletManager(_ manager: BareWorkletManager) {
-        self.workletManager = manager
+    /// Set the transport requests are written to.
+    func setTransport(_ transport: any IPCTransport) {
+        self.transport = transport
     }
+
+    /// Requests still waiting for a response, timeout, or cancellation.
+    var pendingRequestCount: Int { pendingRequests.count }
 
     // MARK: - Request/Response
 
-    /// Send a request and wait for response
+    /// Send a request and wait for its response.
+    ///
+    /// Exactly one of response, timeout, send failure, caller cancellation, or
+    /// session end settles the request; cancelling the calling task releases
+    /// it immediately with `CancellationError` instead of waiting out the
+    /// timeout.
     func sendRequest(
         type: String,
         payload: [String: Any] = [:],
@@ -55,28 +72,41 @@ actor IPCBridge {
         let request = IPCRequest(type: type, payload: payload)
         let requestData = try encoder.encode(request)
         let framedRequest = requestData + Data([0x0A])
+        let requestID = request.id
 
-        return try await withCheckedThrowingContinuation { continuation in
-            pendingRequests[request.id] = continuation
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pendingRequests[requestID] = continuation
 
-            // Held so a completed request can cancel it. Without this every
-            // request leaked a live 30s timer until it fired.
-            timeoutTasks[request.id] = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                await self?.timeOut(request.id)
+                // Held so a completed request can cancel it; otherwise every
+                // request keeps a live timer until it fires.
+                timeoutTasks[requestID] = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    await self?.settle(requestID, with: .failure(ZMError.ipcTimeout))
+                }
+
+                Task { [weak self] in
+                    await self?.sendToWorklet(framedRequest, requestID: requestID)
+                }
+
+                // The cancellation handler may already have run, before the
+                // entry existed for it to remove.
+                if Task.isCancelled {
+                    settle(requestID, with: .failure(CancellationError()))
+                }
             }
-
-            Task { [weak self] in
-                await self?.sendToWorklet(framedRequest, requestID: request.id)
-            }
+        } onCancel: {
+            Task { await self.settle(requestID, with: .failure(CancellationError())) }
         }
     }
 
-    private func timeOut(_ id: String) {
-        timeoutTasks.removeValue(forKey: id)
-        guard let pending = pendingRequests.removeValue(forKey: id) else { return }
-        pending.resume(throwing: ZMError.ipcTimeout)
+    /// Settle a request at most once: only the caller that removes the pending
+    /// entry resumes the continuation, so the completion paths cannot race.
+    private func settle(_ id: String, with result: Result<[String: Any], Error>) {
+        timeoutTasks.removeValue(forKey: id)?.cancel()
+        guard let continuation = pendingRequests.removeValue(forKey: id) else { return }
+        continuation.resume(with: result)
     }
 
     /// Negotiate the wire protocol with the worklet.
@@ -103,24 +133,33 @@ actor IPCBridge {
     /// Fail every in-flight request. Called on shutdown so callers awaiting a
     /// response get an error instead of hanging until their timeout.
     func cancelAllPendingRequests(error: Error = ZMError.notInitialized) {
-        for task in timeoutTasks.values {
-            task.cancel()
+        for id in Array(pendingRequests.keys) {
+            settle(id, with: .failure(error))
         }
-        timeoutTasks.removeAll()
+    }
 
-        let pending = pendingRequests
-        pendingRequests.removeAll()
-        for continuation in pending.values {
-            continuation.resume(throwing: error)
-        }
+    /// Start a new transport session and return its token.
+    ///
+    /// Every in-flight request fails, and any partial frame left over from the
+    /// previous byte stream is dropped, so a restarted worklet's first line is
+    /// never glued onto the tail of the old one. `handleIncomingData` ignores
+    /// data carrying an older token, which is what keeps a late callback from
+    /// the stopped reader from re-introducing stale bytes.
+    func beginSession() -> UInt64 {
+        receiveBuffer.removeAll(keepingCapacity: false)
+        skippingOversizedLine = false
+        sessionToken &+= 1
+        cancelAllPendingRequests()
+        return sessionToken
     }
 
     func clearEventHandlers() {
         eventHandler = nil
     }
 
-    /// Handle incoming data from worklet
-    func handleIncomingData(_ data: Data) {
+    /// Handle incoming data from the worklet reader started with `session`.
+    func handleIncomingData(_ data: Data, session: UInt64) {
+        guard session == sessionToken else { return }
         receiveBuffer.append(data)
 
         // Process all complete newline-delimited messages
@@ -154,9 +193,8 @@ actor IPCBridge {
         }
 
         // An un-terminated frame past the cap: drop just this frame and skip to
-        // its next newline, preserving the rest of the stream. Previously the
-        // whole buffer was cleared — killing every in-flight request and
-        // deterministically bricking a media-heavy conversation on retry.
+        // its next newline. Clearing the whole buffer instead would drop every
+        // in-flight response behind it.
         if receiveBuffer.count > maxLineBytes {
             ZMLog.warning("IPCBridge", "Unterminated oversized IPC frame skipped")
             skippingOversizedLine = true
@@ -184,19 +222,12 @@ actor IPCBridge {
     }
 
     private func handleResponse(_ response: IPCResponse) {
-        timeoutTasks.removeValue(forKey: response.id)?.cancel()
-
-        guard let continuation = pendingRequests.removeValue(forKey: response.id) else {
-            return
-        }
-
         if response.success {
-            let data = response.data?.mapValues { $0.value } ?? [:]
-            continuation.resume(returning: data)
+            settle(response.id, with: .success(response.data?.mapValues { $0.value } ?? [:]))
         } else {
             let errorCode = ZMErrorCode(rawValue: response.error?.code ?? "ERROR")
             let errorMessage = response.error?.message ?? "Unknown error"
-            continuation.resume(throwing: ZMError.ipcError(code: errorCode, message: errorMessage))
+            settle(response.id, with: .failure(ZMError.ipcError(code: errorCode, message: errorMessage)))
         }
     }
 
@@ -219,12 +250,10 @@ actor IPCBridge {
     /// the transport rejects it.
     private func sendToWorklet(_ data: Data, requestID: String) async {
         do {
-            guard let workletManager else { throw ZMError.notInitialized }
-            try await workletManager.sendData(data)
+            guard let transport else { throw ZMError.notInitialized }
+            try await transport.sendData(data)
         } catch {
-            timeoutTasks.removeValue(forKey: requestID)?.cancel()
-            guard let continuation = pendingRequests.removeValue(forKey: requestID) else { return }
-            continuation.resume(throwing: error)
+            settle(requestID, with: .failure(error))
         }
     }
 }
@@ -327,10 +356,17 @@ extension IPCBridge {
         return await hydrateThumbnails(conversationId: conversationId, messages: messages, raw: raw)
     }
 
+    /// Max concurrent message.get_thumbnail fetches while hydrating a list;
+    /// matches the Android facade.
+    static let thumbnailFetchConcurrency = 6
+
     /// message.list omits inline base64 thumbnails (they can push the frame past
     /// the IPC receive cap). Re-fetch each stripped thumbnail via
     /// message.get_thumbnail so the returned model matches the pre-strip
-    /// behaviour and callers need no changes.
+    /// behaviour and callers need no changes. Fetches run with bounded
+    /// concurrency inside a task group, so a list of unanswered thumbnails
+    /// costs a few request timeouts rather than one per message, and
+    /// cancelling the caller cancels every outstanding fetch.
     private func hydrateThumbnails(
         conversationId: String,
         messages: [ZMMessage],
@@ -344,9 +380,19 @@ extension IPCBridge {
         if needing.isEmpty { return messages }
 
         var thumbnails: [String: String] = [:]
-        for id in needing {
-            if let thumb = try? await fetchThumbnail(conversationId: conversationId, messageId: id) {
-                thumbnails[id] = thumb
+        await withTaskGroup(of: (String, String?).self) { group in
+            func fetch(_ id: String) {
+                group.addTask {
+                    (id, try? await self.fetchThumbnail(conversationId: conversationId, messageId: id))
+                }
+            }
+            var remaining = ArraySlice(needing)
+            for id in remaining.prefix(Self.thumbnailFetchConcurrency) { fetch(id) }
+            remaining = remaining.dropFirst(Self.thumbnailFetchConcurrency)
+
+            for await (id, thumb) in group {
+                if let thumb { thumbnails[id] = thumb }
+                if let next = remaining.popFirst() { fetch(next) }
             }
         }
 

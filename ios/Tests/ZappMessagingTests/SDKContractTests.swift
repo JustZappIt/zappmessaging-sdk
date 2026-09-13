@@ -197,10 +197,11 @@ final class SDKContractTests: XCTestCase {
     /// `protocol.init` readiness probe that replaced a blind 500ms sleep — and
     /// derives a golden-vector identity.
     ///
-    /// This is also the standing check that the facade does not touch the
-    /// Keychain: a host-less test bundle has no keychain entitlement, so if
-    /// `restoreFromSeedPhrase` ever starts writing one again, this fails with
-    /// `errSecMissingEntitlement (-34018)`.
+    /// The facade does use the Keychain: the worklet manager mints the
+    /// identity-file encryption key there at start. A host-less test bundle
+    /// has no keychain entitlement, so that write fails and the worklet keeps
+    /// the plaintext identity format — which this test tolerates, and which
+    /// is why it must never be read as proof that no Keychain access happens.
     @MainActor
     func testFacadeBootsAndDerivesGoldenVector() async throws {
         let container = FileManager.default.temporaryDirectory
@@ -288,8 +289,9 @@ final class SDKContractTests: XCTestCase {
         let frame = Data(#"{"type":"test.event","payload":{"text":"hello 😀"},"timestamp":1}"#.utf8) + Data([0x0A])
         let emojiStart = try XCTUnwrap(frame.range(of: Data("😀".utf8))?.lowerBound)
 
-        await bridge.handleIncomingData(Data(frame[..<(emojiStart + 2)]))
-        await bridge.handleIncomingData(Data(frame[(emojiStart + 2)...]))
+        let session = await bridge.beginSession()
+        await bridge.handleIncomingData(Data(frame[..<(emojiStart + 2)]), session: session)
+        await bridge.handleIncomingData(Data(frame[(emojiStart + 2)...]), session: session)
 
         await fulfillment(of: [delivered], timeout: 1.0)
     }
@@ -309,7 +311,8 @@ final class SDKContractTests: XCTestCase {
         let valid = Data(#"{"type":"valid.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A])
         XCTAssertGreaterThan(huge.count - 1, 128)
 
-        await bridge.handleIncomingData(huge + valid)
+        let session = await bridge.beginSession()
+        await bridge.handleIncomingData(huge + valid, session: session)
 
         await fulfillment(of: [oversized, delivered], timeout: 0.2)
     }
@@ -329,8 +332,9 @@ final class SDKContractTests: XCTestCase {
         let valid = Data(#"{"type":"valid.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A])
         XCTAssertGreaterThan(huge.count, 129)
 
-        await bridge.handleIncomingData(Data(huge.prefix(129)))
-        await bridge.handleIncomingData(Data(huge.dropFirst(129)) + Data([0x0A]) + valid)
+        let session = await bridge.beginSession()
+        await bridge.handleIncomingData(Data(huge.prefix(129)), session: session)
+        await bridge.handleIncomingData(Data(huge.dropFirst(129)) + Data([0x0A]) + valid, session: session)
 
         await fulfillment(of: [oversized, delivered], timeout: 0.2)
     }
@@ -358,8 +362,97 @@ final class SDKContractTests: XCTestCase {
         await bridge.setEventHandler { _, _ in currentHandler.fulfill() }
 
         let frame = Data(#"{"type":"test.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A])
-        await bridge.handleIncomingData(frame)
+        let session = await bridge.beginSession()
+        await bridge.handleIncomingData(frame, session: session)
 
         await fulfillment(of: [staleHandler, currentHandler], timeout: 0.2)
+    }
+
+    // MARK: - Transport sessions and cancellation
+
+    /// Accepts every write so a request stays pending until the test settles it.
+    private actor StubTransport: IPCTransport {
+        func sendData(_ data: Data) async throws {}
+    }
+
+    func testNewSessionDropsPartialFrameFromPreviousStream() async {
+        let bridge = IPCBridge()
+        let delivered = expectation(description: "first event of the new session is delivered")
+        await bridge.setEventHandler { type, _ in
+            if type == "test.event" { delivered.fulfill() }
+        }
+
+        let first = await bridge.beginSession()
+        await bridge.handleIncomingData(Data(#"{"type":"#.utf8), session: first)
+
+        let second = await bridge.beginSession()
+        let valid = Data(#"{"type":"test.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A])
+        await bridge.handleIncomingData(valid, session: second)
+
+        await fulfillment(of: [delivered], timeout: 0.2)
+    }
+
+    func testBytesFromAStoppedReaderAreIgnored() async {
+        let bridge = IPCBridge()
+        let stale = expectation(description: "stale-session event is not delivered")
+        stale.isInverted = true
+        let live = expectation(description: "live-session event is delivered")
+        await bridge.setEventHandler { type, _ in
+            if type == "stale.event" { stale.fulfill() }
+            if type == "live.event" { live.fulfill() }
+        }
+
+        let staleSession = await bridge.beginSession()
+        let liveSession = await bridge.beginSession()
+        await bridge.handleIncomingData(
+            Data(#"{"type":"stale.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A]), session: staleSession)
+        // A stale partial prefix must not poison the live stream either.
+        await bridge.handleIncomingData(Data(#"{"type":"#.utf8), session: staleSession)
+        await bridge.handleIncomingData(
+            Data(#"{"type":"live.event","payload":{},"timestamp":1}"#.utf8) + Data([0x0A]), session: liveSession)
+
+        await fulfillment(of: [stale, live], timeout: 0.2)
+    }
+
+    func testCancelledRequestIsReleasedImmediately() async throws {
+        let bridge = IPCBridge()
+        let transport = StubTransport()
+        await bridge.setTransport(transport)
+        _ = await bridge.beginSession()
+
+        let began = Date()
+        let request = Task { try await bridge.sendRequest(type: "test.wait", timeout: 5.0) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let pendingBeforeCancel = await bridge.pendingRequestCount
+        XCTAssertEqual(pendingBeforeCancel, 1)
+
+        request.cancel()
+        do {
+            _ = try await request.value
+            XCTFail("A cancelled request must not wait for its timeout")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(began), 1.0)
+        }
+        let pendingAfterCancel = await bridge.pendingRequestCount
+        XCTAssertEqual(pendingAfterCancel, 0)
+    }
+
+    func testBeginSessionFailsInFlightRequests() async throws {
+        let bridge = IPCBridge()
+        await bridge.setTransport(StubTransport())
+        _ = await bridge.beginSession()
+
+        let request = Task { try await bridge.sendRequest(type: "test.wait", timeout: 5.0) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        _ = await bridge.beginSession()
+
+        do {
+            _ = try await request.value
+            XCTFail("Ending the session must fail the in-flight request")
+        } catch ZMError.notInitialized {
+            // Expected.
+        }
+        let pending = await bridge.pendingRequestCount
+        XCTAssertEqual(pending, 0)
     }
 }

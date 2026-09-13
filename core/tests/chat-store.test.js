@@ -449,3 +449,40 @@ test('addMessage heals a misordered legacy file before chronological insert', as
 
   await store.deleteConversation(conv.id)
 })
+
+test('clearAll attempts every file, then reports the failure with memory reloaded from disk', async () => {
+  const store = new ChatStore()
+  const conv = await store.createConversation('direct', ['wipe-a', 'wipe-b'], { displayName: 'Wipe' })
+  await store.addMessage(conv.id, { content: 'hello', senderId: 'wipe-a', contentType: 'text/plain' })
+  const indexPath = path.join(store.storagePath, 'index.json')
+  const messagesPath = path.join(store.storagePath, `${conv.id}.json`)
+  assert.ok(fs.existsSync(indexPath) && fs.existsSync(messagesPath))
+
+  const realUnlink = fs.unlinkSync
+  fs.unlinkSync = file => {
+    if (file === indexPath) throw Object.assign(new Error('simulated I/O failure'), { code: 'EIO' })
+    return realUnlink(file)
+  }
+  try {
+    await assert.rejects(store.clearAll(), { code: 'EIO' })
+  } finally {
+    fs.unlinkSync = realUnlink
+  }
+
+  assert.strictEqual(fs.existsSync(messagesPath), false, 'the deletable files must still be removed')
+  assert.ok(fs.existsSync(indexPath))
+  assert.ok(store.conversations.has(conv.id), 'memory must match the surviving index')
+
+  await store.clearAll()
+  assert.strictEqual(store.conversations.size, 0)
+  assert.strictEqual(fs.existsSync(indexPath), false)
+})
+
+test('clearAll treats a missing chats directory as already clean', async () => {
+  const store = new ChatStore()
+  await store.clearAll()
+  fs.rmSync(store.storagePath, { recursive: true, force: true })
+  await store.clearAll()
+  assert.strictEqual(store.conversations.size, 0)
+  store.ensureStorageDir()
+})

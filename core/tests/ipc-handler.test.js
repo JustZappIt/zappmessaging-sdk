@@ -99,3 +99,193 @@ test('relay status persistence failure does not fail an otherwise durable send',
     }
   ]])
 })
+
+function envelopeHarness () {
+  const handler = Object.create(IPCHandler.prototype)
+  const responses = []
+  const events = []
+  handler.sendResponse = (id, success, data, error) => responses.push({ id, success, data, error })
+  handler.pushEvent = (type, payload) => events.push({ type, payload })
+  handler.routeMessage = async (type, payload) => ({ echoed: type, payload })
+  return { handler, responses, events }
+}
+
+test('a line that is valid JSON but not a request envelope is dropped with a controlled event', async () => {
+  const { handler, responses, events } = envelopeHarness()
+
+  for (const line of ['null', '42', '"text"', '[]', '{}', '{"id":7,"type":"identity.get"}']) {
+    await assert.doesNotReject(handler._processLine(line))
+  }
+
+  assert.strictEqual(responses.length, 0)
+  assert.strictEqual(events.length, 6)
+  assert.ok(events.every(e => e.type === 'ipc.error' && e.payload.code === 'INVALID_ENVELOPE'))
+})
+
+test('unparsable IPC input reports MALFORMED_FRAME instead of rejecting', async () => {
+  const { handler, responses, events } = envelopeHarness()
+  await assert.doesNotReject(handler._processLine('{not json'))
+  assert.strictEqual(responses.length, 0)
+  assert.deepStrictEqual(events.map(e => e.payload.code), ['MALFORMED_FRAME'])
+})
+
+test('a request with an id but an invalid type or payload gets an error response', async () => {
+  const { handler, responses } = envelopeHarness()
+
+  await handler._processLine(JSON.stringify({ id: 'r1', type: 5 }))
+  await handler._processLine(JSON.stringify({ id: 'r2', type: 'identity.get', payload: 'nope' }))
+  await handler._processLine(JSON.stringify({ id: 'r3', type: 'identity.get', payload: [1] }))
+
+  assert.deepStrictEqual(responses.map(r => [r.id, r.success, r.error.code]), [
+    ['r1', false, 'INVALID_ENVELOPE'],
+    ['r2', false, 'INVALID_ENVELOPE'],
+    ['r3', false, 'INVALID_ENVELOPE']
+  ])
+})
+
+test('a well-formed request is routed and a null payload defaults to an empty object', async () => {
+  const { handler, responses } = envelopeHarness()
+  await handler._processLine(JSON.stringify({ id: 'ok', type: 'identity.get', payload: null }))
+  assert.deepStrictEqual(responses, [
+    { id: 'ok', success: true, data: { echoed: 'identity.get', payload: {} }, error: null }
+  ])
+})
+
+test('a response that cannot be written is downgraded to an error response', async () => {
+  const { handler, responses } = envelopeHarness()
+  let attempts = 0
+  handler.sendResponse = (id, success, data, error) => {
+    attempts++
+    if (success) throw new Error('pipe closed')
+    responses.push({ id, success, error })
+  }
+  await assert.doesNotReject(handler._processLine(JSON.stringify({ id: 'w', type: 'x.y' })))
+  assert.strictEqual(attempts, 2)
+  assert.deepStrictEqual(responses, [{ id: 'w', success: false, error: { code: 'RESPONSE_FAILED', message: 'Response could not be delivered' } }])
+})
+
+test('_handleIPCData never surfaces an unhandled rejection for a bad frame', async () => {
+  const { handler, events } = envelopeHarness()
+  handler._recvBuf = Buffer.alloc(0)
+  handler._skippingOversizedFrame = false
+  handler._maxRecvBufSize = 1024
+
+  const rejections = []
+  const onRejection = reason => rejections.push(reason)
+  process.on('unhandledRejection', onRejection)
+  try {
+    handler._handleIPCData(Buffer.from('null\n{"id":"a","type":"identity.get"}\n'))
+    await new Promise(resolve => setImmediate(resolve))
+  } finally {
+    process.off('unhandledRejection', onRejection)
+  }
+
+  assert.deepStrictEqual(rejections, [])
+  assert.deepStrictEqual(events.map(e => e.payload.code), ['INVALID_ENVELOPE'])
+})
+
+function identityHarness ({ wipeFailure = null, installFailure = null } = {}) {
+  const handler = Object.create(IPCHandler.prototype)
+  const calls = []
+  handler.readReceiptsEnabled = false
+  handler.ensureBlindMirror = async () => { calls.push('mirror') }
+  handler.p2pManager = {
+    stop: async () => { calls.push('stop') },
+    start: async keyPair => { calls.push('start:' + keyPair) }
+  }
+  handler.chatStore = {
+    clearAll: async () => {
+      calls.push('chat.clear')
+      if (wipeFailure) throw wipeFailure
+    }
+  }
+  handler.contactStore = { clearAll: async () => { calls.push('contacts.clear') } }
+  handler.identity = {
+    keyPair: 'old-key',
+    publicKeyHex: 'old-key',
+    displayName: 'Old',
+    exportMnemonic: () => 'words',
+    create: async displayName => {
+      calls.push('install')
+      if (installFailure) throw installFailure
+      handler.identity.keyPair = 'new-key'
+      handler.identity.publicKeyHex = 'new-key'
+      handler.identity.displayName = displayName
+    },
+    restoreFromMnemonic: async (phrase, displayName) => {
+      calls.push('install')
+      handler.identity.keyPair = 'restored-key'
+      handler.identity.publicKeyHex = GOLDEN_PUBLIC_KEY
+      handler.identity.displayName = displayName
+    }
+  }
+  return { handler, calls }
+}
+
+const GOLDEN_PHRASE = 'abandon '.repeat(23) + 'art'
+const GOLDEN_PUBLIC_KEY = '7afa7190d9f5daeaa45d9650ed3ce7c0973bb0e35f7361bf858389a8cf1c3f3c'
+
+test('identity.create wipes both stores before installing and starting the new key', async () => {
+  const { handler, calls } = identityHarness()
+  const result = await handler.handleIdentity('create', { displayName: 'New' })
+  assert.deepStrictEqual(calls, ['stop', 'chat.clear', 'contacts.clear', 'install', 'start:new-key', 'mirror'])
+  assert.deepStrictEqual(result, { publicKey: 'new-key', displayName: 'New', seedPhrase: 'words' })
+  assert.strictEqual(handler.readReceiptsEnabled, true)
+})
+
+test('a failed wipe aborts the identity change and brings the previous identity back online', async () => {
+  const failure = Object.assign(new Error('simulated permission failure'), { code: 'EACCES' })
+  const { handler, calls } = identityHarness({ wipeFailure: failure })
+
+  await assert.rejects(handler.handleIdentity('create', { displayName: 'New' }), { code: 'EACCES' })
+
+  // The contact store is still attempted, the new key is never installed, and
+  // the old key's transport is restored so the caller can retry.
+  assert.deepStrictEqual(calls, ['stop', 'chat.clear', 'contacts.clear', 'start:old-key', 'mirror'])
+  assert.strictEqual(handler.identity.publicKeyHex, 'old-key')
+  assert.strictEqual(handler.readReceiptsEnabled, false, 'the previous preference is restored')
+})
+
+test('a failed install after a successful wipe restarts the previous identity', async () => {
+  const { handler, calls } = identityHarness({ installFailure: new Error('disk full') })
+  await assert.rejects(handler.handleIdentity('create', { displayName: 'New' }), /disk full/)
+  assert.deepStrictEqual(calls, ['stop', 'chat.clear', 'contacts.clear', 'install', 'start:old-key', 'mirror'])
+})
+
+test('restore rejects a malformed phrase before anything destructive happens', async () => {
+  const { handler, calls } = identityHarness()
+  await assert.rejects(
+    handler.handleMigration('restore_from_seed_phrase', { seedPhrase: 'not a phrase', displayName: 'x' }),
+    /24 words/
+  )
+  assert.deepStrictEqual(calls, [])
+  assert.strictEqual(handler.identity.publicKeyHex, 'old-key')
+})
+
+test('restore of a different seed wipes both stores; the same seed is idempotent', async () => {
+  const { handler, calls } = identityHarness()
+
+  const first = await handler.handleMigration('restore_from_seed_phrase', { seedPhrase: GOLDEN_PHRASE, displayName: 'Golden' })
+  assert.deepStrictEqual(first, { publicKey: GOLDEN_PUBLIC_KEY, displayName: 'Golden' })
+  assert.deepStrictEqual(calls, ['stop', 'chat.clear', 'contacts.clear', 'install', 'start:restored-key', 'mirror'])
+
+  calls.length = 0
+  const again = await handler.handleMigration('restore_from_seed_phrase', { seedPhrase: GOLDEN_PHRASE, displayName: 'Renamed' })
+  assert.deepStrictEqual(again, { publicKey: GOLDEN_PUBLIC_KEY, displayName: 'Golden' })
+  assert.deepStrictEqual(calls, ['mirror'], 'a same-seed republish must not stop, wipe, or reinstall')
+})
+
+test('contacts.update rejects malformed payloads before touching the store', async () => {
+  const handler = Object.create(IPCHandler.prototype)
+  let touched = false
+  handler.contactStore = { updateContact: async () => { touched = true } }
+
+  await assert.rejects(handler.handleContacts('update', { publicKey: ownKey, updates: null }), /Invalid updates/)
+  await assert.rejects(handler.handleContacts('update', { publicKey: ownKey, updates: ['name'] }), /Invalid updates/)
+  await assert.rejects(handler.handleContacts('update', { publicKey: ownKey, updates: { name: 42 } }), /Invalid name/)
+  await assert.rejects(handler.handleContacts('update', { publicKey: 'short', updates: { name: 'ok' } }), /Invalid publicKey/)
+  assert.strictEqual(touched, false)
+
+  assert.deepStrictEqual(await handler.handleContacts('update', { publicKey: ownKey, updates: { name: 'ok' } }), { success: true })
+  assert.strictEqual(touched, true)
+})

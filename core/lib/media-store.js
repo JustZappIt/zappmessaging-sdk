@@ -10,8 +10,9 @@ const path = require('bare-path')
 const crypto = require('hypercore-crypto')
 const b4a = require('b4a')
 const { getDataDir, ensureDir } = require('./storage')
+const { createDiagnosticLogger } = require('./diagnostics')
 
-function diag (...args) { /* no-op; media-store errors are non-fatal */ }
+const diag = createDiagnosticLogger('MEDIA')
 
 class MediaStore {
   constructor() {

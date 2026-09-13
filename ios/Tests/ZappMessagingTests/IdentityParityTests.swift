@@ -70,7 +70,7 @@ final class IdentityParityTests: XCTestCase {
 
         let bridge = IPCBridge()
         let manager = BareWorkletManager()
-        await bridge.setWorkletManager(manager)
+        await bridge.setTransport(manager)
 
         // No blind-peer keys / bootstrap nodes: derivation is offline and must
         // not depend on the network. If it ever does, that is a bug worth failing on.

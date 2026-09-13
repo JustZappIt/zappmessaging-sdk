@@ -16,6 +16,7 @@
 
 const b4a = require('b4a')
 const EventEmitter = require('bare-events')
+const config = require('./config')
 
 const MSG_TYPE_JSON = 0x01
 const MSG_TYPE_CHUNK = 0x02
@@ -29,7 +30,7 @@ class FramedSocket {
     this._recvBuf = b4a.alloc(0)
     this._destroyed = false
     this._legacyMode = false
-    this._legacyBuf = ''
+    this._legacyBuf = b4a.alloc(0)
 
     // Callbacks
     this.onMessage = null // (parsedJSON) => {}
@@ -65,14 +66,16 @@ class FramedSocket {
   }
 
   _handleLegacy(data) {
-    // Legacy mode: NDJSON-style parsing for backward compatibility
-    this._legacyBuf += b4a.toString(data)
+    // Legacy peers send newline-delimited JSON with no length prefix. Buffer
+    // bytes, not decoded text, so a UTF-8 code point split across reads is
+    // decoded whole once its line is complete.
+    this._legacyBuf = b4a.concat([this._legacyBuf, data])
 
-    // Process all complete newline-delimited messages
     let newlineIdx
-    while ((newlineIdx = this._legacyBuf.indexOf('\n')) !== -1) {
-      const line = this._legacyBuf.substring(0, newlineIdx).trim()
-      this._legacyBuf = this._legacyBuf.substring(newlineIdx + 1)
+    while ((newlineIdx = b4a.indexOf(this._legacyBuf, 0x0a)) !== -1) {
+      const lineBytes = this._legacyBuf.subarray(0, newlineIdx)
+      this._legacyBuf = this._legacyBuf.subarray(newlineIdx + 1)
+      const line = b4a.toString(lineBytes, 'utf8').trim()
       if (line.length === 0) continue
       try {
         const message = JSON.parse(line)
@@ -82,20 +85,20 @@ class FramedSocket {
       }
     }
 
-    // Try parsing remaining buffer as a complete JSON object (no trailing newline)
+    // A frame without a trailing newline is accepted once it parses as a
+    // complete document; until then every byte is kept.
     if (this._legacyBuf.length > 0) {
       try {
-        const message = JSON.parse(this._legacyBuf)
-        this._legacyBuf = ''
+        const message = JSON.parse(b4a.toString(this._legacyBuf, 'utf8'))
+        this._legacyBuf = b4a.alloc(0)
         if (this.onMessage) this.onMessage(message)
       } catch (_) {
         // Incomplete — keep buffering
       }
     }
 
-    // Safety: discard if buffer grows too large
-    if (this._legacyBuf.length > 10 * 1024 * 1024) {
-      this._legacyBuf = ''
+    if (this._legacyBuf.length > config.SOCKET_LEGACY_BUF_LIMIT) {
+      this._legacyBuf = b4a.alloc(0)
     }
   }
 
@@ -103,8 +106,7 @@ class FramedSocket {
     while (this._recvBuf.length >= 4) {
       const len = this._recvBuf.readUInt32BE(0)
 
-      // Safety: reject absurdly large frames (>50MB)
-      if (len > 50 * 1024 * 1024) {
+      if (len > config.SOCKET_FRAME_MAX_LEN) {
         if (this.onError) this.onError(new Error('Frame too large: ' + len))
         this._recvBuf = b4a.alloc(0)
         return
@@ -258,6 +260,7 @@ class FramedSocket {
   destroy() {
     this._destroyed = true
     this._recvBuf = b4a.alloc(0)
+    this._legacyBuf = b4a.alloc(0)
   }
 }
 
