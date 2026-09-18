@@ -44,6 +44,11 @@ data class ZMMessage(
     val replyToSenderName: String? = null,
     /** Content preview of the replied-to message */
     val replyToContent: String? = null,
+    /**
+     * MIME type of the replied-to message. Null from clients that predate the field,
+     * which readers treat as a text quote.
+     */
+    val replyToContentType: String? = null,
     /** Persisted outgoing delivery state ("queued", "sent", "delivered", or "read") */
     val status: String? = null
 )

@@ -155,9 +155,10 @@ test('malformed replicated records never persist or block the following valid re
     message('bad-content', { content: {} }),
     message('../bad-id'), message('bad-media', { mediaId: '../secret' }),
     message('bad-reply', { replyToContent: {} }),
+    message('bad-reply-type', { replyToContentType: 'not a mime type' }),
     message('too-large', { content: 'x'.repeat(256 * 1024 + 1) }),
     { type: 'group_renamed', newName: {} }, { type: '__future_control' },
-    message('valid', { senderId: OUTSIDER, isFromMe: true, status: 'read', mediaLocalPath: '/private', mediaTransferState: 'complete' })
+    message('valid', { senderId: OUTSIDER, isFromMe: true, status: 'read', mediaLocalPath: '/private', mediaTransferState: 'complete', replyToId: 'quoted', replyToContentType: 'image/jpeg' })
   ]
   const manager = drainHarness(receiver)
   await manager._drainRemoteCore(conv.id, OWNER, CORE, core(records))
@@ -168,6 +169,7 @@ test('malformed replicated records never persist or block the following valid re
   assert.equal(rows[0].isFromMe, false)
   assert.equal(rows[0].mediaLocalPath, null)
   assert.equal(rows[0].status, null)
+  assert.equal(rows[0].replyToContentType, 'image/jpeg')
   assert.equal(events.filter(e => e.type === 'message').length, 1)
 })
 

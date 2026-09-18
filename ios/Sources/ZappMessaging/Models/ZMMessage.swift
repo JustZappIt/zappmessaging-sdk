@@ -66,6 +66,10 @@ public struct ZMMessage: Codable, Identifiable, Equatable, Sendable {
     /// Content preview of the replied-to message, denormalised at send time
     public let replyToContent: String?
 
+    /// MIME type of the replied-to message, denormalised at send time. `nil` from clients
+    /// that predate the field, which readers treat as a text quote.
+    public let replyToContentType: String?
+
     public init(
         id: String,
         conversationId: String,
@@ -85,7 +89,8 @@ public struct ZMMessage: Codable, Identifiable, Equatable, Sendable {
         status: String? = nil,
         replyToId: String? = nil,
         replyToSenderName: String? = nil,
-        replyToContent: String? = nil
+        replyToContent: String? = nil,
+        replyToContentType: String? = nil
     ) {
         self.id = id
         self.conversationId = conversationId
@@ -106,6 +111,7 @@ public struct ZMMessage: Codable, Identifiable, Equatable, Sendable {
         self.replyToId = replyToId
         self.replyToSenderName = replyToSenderName
         self.replyToContent = replyToContent
+        self.replyToContentType = replyToContentType
     }
 }
 
@@ -132,7 +138,8 @@ public extension ZMMessage {
             status: status,
             replyToId: replyToId,
             replyToSenderName: replyToSenderName,
-            replyToContent: replyToContent
+            replyToContent: replyToContent,
+            replyToContentType: replyToContentType
         )
     }
 }

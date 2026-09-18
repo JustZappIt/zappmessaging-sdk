@@ -486,3 +486,28 @@ test('clearAll treats a missing chats directory as already clean', async () => {
   assert.strictEqual(store.conversations.size, 0)
   store.ensureStorageDir()
 })
+
+test('addMessage persists the quoted message type and reloads it from disk', async () => {
+  const store = new ChatStore()
+  const conv = await store.createConversation('direct', ['p1'])
+
+  const reply = await store.addMessage(conv.id, {
+    senderId: 'p1',
+    content: 'nice shot',
+    replyToId: 'original',
+    replyToSenderName: 'alice',
+    replyToContent: 'beach',
+    replyToContentType: 'image/jpeg'
+  })
+  assert.strictEqual(reply.replyToContentType, 'image/jpeg')
+
+  // A record from a client that predates the field reads back as a text quote.
+  const legacy = await store.addMessage(conv.id, { senderId: 'p1', content: 'ok', replyToId: 'original' })
+  assert.strictEqual(legacy.replyToContentType, null)
+
+  const reloaded = await store.getMessages(conv.id)
+  assert.strictEqual(reloaded.find(m => m.id === reply.id).replyToContentType, 'image/jpeg')
+  assert.strictEqual(reloaded.find(m => m.id === legacy.id).replyToContentType, null)
+
+  await store.deleteConversation(conv.id)
+})
