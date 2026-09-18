@@ -80,7 +80,8 @@ enum ZMParse {
             status: data["status"] as? String,
             replyToId: data["replyToId"] as? String,
             replyToSenderName: data["replyToSenderName"] as? String,
-            replyToContent: data["replyToContent"] as? String
+            replyToContent: data["replyToContent"] as? String,
+            replyToContentType: data["replyToContentType"] as? String
         )
     }
 

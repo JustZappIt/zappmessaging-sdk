@@ -491,6 +491,10 @@ class ChatStore {
       replyToId: messageData.replyToId || null,
       replyToSenderName: messageData.replyToSenderName || null,
       replyToContent: messageData.replyToContent || null,
+      // MIME type of the quoted message, so a client can label a quoted photo,
+      // file or payment request instead of echoing its raw body. Absent on
+      // records from older clients, which the UI reads as a text quote.
+      replyToContentType: messageData.replyToContentType || null,
       status: messageData.status || (messageData.isFromMe ? 'queued' : null)
     }
 

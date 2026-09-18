@@ -493,6 +493,7 @@ public final class ZappMessagingSDK: ObservableObject {
             sendPayload["replyToId"] = replyTo.id
             sendPayload["replyToSenderName"] = replyTo.senderName
             sendPayload["replyToContent"] = replyTo.content
+            sendPayload["replyToContentType"] = replyTo.contentType
         }
 
         let response = try await ipcBridge.sendRequest(type: "media.send_message", payload: sendPayload)
