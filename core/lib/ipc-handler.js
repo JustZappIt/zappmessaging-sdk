@@ -26,6 +26,15 @@ const { createDiagnosticLogger } = require('./diagnostics')
 const PROTOCOL_VERSION = '1.0'
 const SUPPORTED_FEATURES = ['messaging', 'groups', 'media', 'blind_peer', 'contacts', 'payments', 'read_receipts', 'group_links']
 const MAX_LINK_CHARS = 16 * 1024
+// Announced by each member in each group it belongs to, so the owner knows
+// who understands removal and a new group secret.
+const GROUP_ADMIN_FEATURE = 'group_admin_v1'
+const CAPS_VERSION = 1
+const MAX_PAST_GROUP_IDS = 4
+
+function groupTopicHex (groupId) {
+  return b4a.toString(deriveGroupChatTopic(groupId), 'hex')
+}
 
 const diag = createDiagnosticLogger('IPC')
 
@@ -93,6 +102,9 @@ class IPCHandler {
     this.p2pManager.on('group_member_added', (data, senderPeerId) => {
       this._handleGroupMemberAdded(data, senderPeerId)
     })
+    this.p2pManager.on('group_member_removed', (data, senderPeerId) => {
+      this._handleGroupMemberRemoved(data, senderPeerId)
+    })
 
     // Group invite links. The service holds the protocol; this handler gives
     // it the mailbox transport and the owner's add member path.
@@ -132,7 +144,8 @@ class IPCHandler {
     const handlers = {
       direct_invite: '_handleDirectInvite', group_invite: '_handleGroupInvite',
       group_leave: '_handleGroupLeave', group_deleted: '_handleGroupDeleted',
-      group_renamed: '_handleGroupRenamed', group_member_added: '_handleGroupMemberAdded'
+      group_renamed: '_handleGroupRenamed', group_member_added: '_handleGroupMemberAdded',
+      group_member_removed: '_handleGroupMemberRemoved'
     }
     const method = handlers[record.type]
     if (!method) return
@@ -774,6 +787,19 @@ class IPCHandler {
         return { success: true, participants: updatedParticipants }
       }
 
+      case 'remove_member': {
+        const key = (payload.publicKey || '').toLowerCase().replace(/^0x/, '')
+        if (!isValidPublicKey(key)) throw new IPCRequestError('INVALID_KEY', 'publicKey is required')
+        return await this._removeMember(payload.conversationId, key, { resetLink: payload.resetLink !== false })
+      }
+
+      case 'removal_status': {
+        const conv = await this.chatStore.getConversation(payload.conversationId)
+        if (!conv || conv.type !== 'group') throw new IPCRequestError('CONVERSATION_NOT_FOUND', 'Group not found')
+        const olderMembers = this._normalizedParticipants(conv).filter(k => !this._supportsGroupAdmin(conv.id, k))
+        return { olderMemberCount: olderMembers.length }
+      }
+
       case 'get_messages': {
         const offset = payload.offset || 0
         const limit = payload.limit || 50
@@ -877,6 +903,7 @@ class IPCHandler {
   _enrichConversation(conversation) {
     const enriched = { ...conversation }
     delete enriched.appliedControls
+    delete enriched.pastGroupIds
     if (enriched.type === 'group') {
       enriched.isOwner = enriched.creatorKey === this.identity.publicKeyHex
     }
@@ -1143,6 +1170,9 @@ class IPCHandler {
         return true // rejected: terminal, nothing to retry
       }
 
+      // The owner gave a group we are in a new secret.
+      if (inviteData.rekeyOf) return await this._applyRekey(inviteData, claimedSender, normalizedParticipants)
+
       const existing = [...this.chatStore.conversations.values()].find(conv =>
         conv.type === 'group' && conv.groupId === groupId.toLowerCase())
       if (existing && ((existing.creatorKey || '').toLowerCase() !== authenticatedPeer ||
@@ -1193,6 +1223,7 @@ class IPCHandler {
 
       // An admission through a group invite link completes our request.
       if (inviteData.viaLink) this.groupLinks.onGroupInviteApplied(inviteData, conversation)
+      this.announceGroupCaps(conversation.id)
 
       diag('Accepted group invite with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
     } catch (error) {
@@ -1200,6 +1231,268 @@ class IPCHandler {
       diag('Failed to handle group invite: ' + (error.stack || error.message || error))
     }
     return !failed
+  }
+
+  // ── Member removal and a new group secret ────────────────────────────────
+
+  _supportsGroupAdmin (conversationId, memberKey) {
+    const features = this.groupLinks.store.memberCaps(conversationId)[memberKey]
+    return Array.isArray(features) && features.includes(GROUP_ADMIN_FEATURE)
+  }
+
+  /**
+   * Owner only. Stage 1 takes the member out; stage 2 gives the group a new
+   * secret the removed member never sees, so they neither receive nor send
+   * anything more in it.
+   */
+  async _removeMember (conversationId, removedKey, { resetLink = true } = {}) {
+    const conv = await this.chatStore.getConversation(conversationId)
+    if (!conv || conv.type !== 'group' || this.chatStore.hasLeftConversation(conversationId)) {
+      throw new IPCRequestError('CONVERSATION_NOT_FOUND', 'Group not found')
+    }
+    const myKey = this.identity.publicKeyHex.toLowerCase()
+    if ((conv.creatorKey || '').toLowerCase() !== myKey) {
+      throw new IPCRequestError('NOT_GROUP_OWNER', 'Only the group owner can remove members')
+    }
+    if (removedKey === myKey) throw new IPCRequestError('INVALID_KEY', 'The owner cannot remove themselves')
+    const participants = this._normalizedParticipants(conv)
+    if (!participants.includes(removedKey)) throw new IPCRequestError('NOT_A_MEMBER', 'Not a member of this group')
+
+    // Stage 1. The record goes into the core under the current secret, which
+    // the removed member can still read, before that core is retired.
+    const remaining = participants.filter(k => k !== removedKey)
+    await this.chatStore.updateConversation(conv.id, { participantIds: remaining })
+    this.groupLinks.recordRemoval(conv.id, removedKey)
+    this.groupLinks.forgetRequest(conv.id, removedKey)
+    try {
+      await this.p2pManager.sendToConversationDurably(conv.id, { type: 'group_member_removed', removedKey })
+    } catch (err) {
+      diag('Removal record not persisted: ' + (err.message || err))
+    }
+    await this._forgetMember(conv.id, removedKey)
+
+    // Stage 2.
+    const { olderMemberCount } = await this._rekeyGroup(conv.id)
+
+    if (resetLink) {
+      const entry = this.groupLinks.store.ownerEntry(conv.id)
+      if (entry && entry.current) this.groupLinks.resetLink(conv.id)
+    }
+    return { success: true, participants: remaining, olderMemberCount }
+  }
+
+  async _forgetMember (conversationId, memberKey, closeOptions = {}) {
+    if (typeof this.p2pManager.removeGroupParticipant === 'function') {
+      this.p2pManager.removeGroupParticipant(conversationId, memberKey)
+    }
+    if (this.hypercoreManager) await this.hypercoreManager.removeRemoteCore(conversationId, memberKey, closeOptions)
+    if (this.blindMirror && typeof this.blindMirror.removeRemoteCore === 'function') {
+      this.blindMirror.removeRemoteCore(conversationId, memberKey)
+    }
+  }
+
+  /**
+   * Owner: give the group a new secret. Members whose app announced it
+   * understands this get the new secret now; the rest when it does.
+   * @returns {Promise<{olderMemberCount: number}>}
+   */
+  async _rekeyGroup (conversationId) {
+    const conv = await this.chatStore.getConversation(conversationId)
+    const oldGroupId = conv.groupId
+    const oldEpoch = Number.isSafeInteger(conv.groupEpoch) ? conv.groupEpoch : 0
+    // Our current core must be open so its end can be marked.
+    if (this.hypercoreManager) await this.hypercoreManager.getOrCreateLocalCore(conversationId)
+    await this.chatStore.updateConversation(conversationId, {
+      groupId: b4a.toString(crypto.randomBytes(32), 'hex'),
+      groupEpoch: oldEpoch + 1,
+      pastGroupIds: [{ groupId: oldGroupId, epoch: oldEpoch }, ...(conv.pastGroupIds || [])].slice(0, MAX_PAST_GROUP_IDS)
+    })
+    await this._switchToNewGroupSecret(conversationId, oldGroupId, oldEpoch + 1)
+
+    const updated = await this.chatStore.getConversation(conversationId)
+    const participants = this._normalizedParticipants(updated)
+    let olderMemberCount = 0
+    for (const key of participants) {
+      if (this._supportsGroupAdmin(conversationId, key)) {
+        await this.p2pManager.sendInvite(key, this._rekeyInvite(updated, participants, oldGroupId))
+      } else {
+        this.groupLinks.store.deferRekey(conversationId, key, oldGroupId)
+        olderMemberCount++
+      }
+    }
+    this.groupLinks.store.save()
+    this.pushEvent('conversation.rekeyed', { conversationId })
+    return { olderMemberCount }
+  }
+
+  _rekeyInvite (conv, participants, fromGroupId) {
+    return this._ownerGroupInvite(conv, participants, {
+      rekeyOf: groupTopicHex(fromGroupId),
+      groupEpoch: conv.groupEpoch
+    })
+  }
+
+  /**
+   * Shared by owner and members once conv.groupId holds the new secret: retire
+   * the old cores, move to the new topic, and mark where our old core ended.
+   */
+  async _switchToNewGroupSecret (conversationId, previousGroupId, epoch) {
+    const previous = this.hypercoreManager
+      ? this.hypercoreManager.rekeyConversation(conversationId, previousGroupId)
+      : { prevCoreKey: null, prevLength: 0 }
+    await this.p2pManager.switchGroupTopic(conversationId)
+    if (this.hypercoreManager) {
+      await this.hypercoreManager.appendMessage(conversationId, {
+        type: '__epoch', epoch, prevCoreKey: previous.prevCoreKey, prevLength: previous.prevLength
+      })
+    }
+  }
+
+  /**
+   * Member: the owner gave the group a new secret. Same conversation, same
+   * history; new topic, new cores, and only the members the owner lists.
+   * @returns {Promise<boolean>} always finished with
+   */
+  async _applyRekey (inviteData, sender, normalizedParticipants) {
+    const newGroupId = inviteData.groupId.toLowerCase()
+    const myKey = this.identity.publicKeyHex.toLowerCase()
+    const conv = [...this.chatStore.conversations.values()].find(c => c.type === 'group' &&
+      (c.groupId === newGroupId || groupTopicHex(c.groupId) === inviteData.rekeyOf))
+    if (!conv || this.chatStore.hasLeftConversation(conv.id) || conv.removedAt) return true
+    if ((conv.creatorKey || '').toLowerCase() !== sender) return true
+
+    if (conv.groupId === newGroupId) {
+      // Delivered twice: make sure we are on the new topic and have the owner's core.
+      await this.p2pManager.joinGroupConversation(conv.id, conv.groupId, [myKey, ...conv.participantIds])
+      if (inviteData.localCoreKey) await this.p2pManager.openRemoteCore(conv.id, sender, inviteData.localCoreKey)
+      return true
+    }
+    const oldEpoch = Number.isSafeInteger(conv.groupEpoch) ? conv.groupEpoch : 0
+    if (!(inviteData.groupEpoch > oldEpoch)) return true
+
+    const oldGroupId = conv.groupId
+    const oldParticipants = this._normalizedParticipants(conv)
+    const participants = normalizedParticipants.filter(k => k !== myKey)
+    if (this.hypercoreManager) await this.hypercoreManager.getOrCreateLocalCore(conv.id)
+    await this.chatStore.updateConversation(conv.id, {
+      groupId: newGroupId,
+      groupEpoch: inviteData.groupEpoch,
+      pastGroupIds: [{ groupId: oldGroupId, epoch: oldEpoch }, ...(conv.pastGroupIds || [])].slice(0, MAX_PAST_GROUP_IDS),
+      participantIds: participants,
+      displayName: inviteData.groupName || conv.displayName
+    })
+    for (const key of oldParticipants) {
+      if (!participants.includes(key)) await this._forgetMember(conv.id, key)
+    }
+    await this._switchToNewGroupSecret(conv.id, oldGroupId, inviteData.groupEpoch)
+    if (inviteData.localCoreKey) await this.p2pManager.openRemoteCore(conv.id, sender, inviteData.localCoreKey)
+    this.pushEvent('conversation.rekeyed', { conversationId: conv.id })
+    diag('Group moved to a new secret: ' + conv.id.substring(0, 12))
+    return true
+  }
+
+  /** The owner removed someone, possibly us. */
+  async _handleGroupMemberRemoved (data, senderPeerId, closeOptions = {}) {
+    try {
+      try { data = normalizePeerRecord({ ...data, type: 'group_member_removed' }, senderPeerId) } catch (err) {
+        if (err.code === 'INVALID_PEER_RECORD') return true
+        throw err
+      }
+      const conversationId = data.groupTopicHex ? this._conversationForGroupTopic(data.groupTopicHex) : null
+      if (!conversationId) return
+      const conversation = await this.chatStore.getConversation(conversationId)
+      if (!conversation || conversation.type !== 'group') return
+      const sender = (senderPeerId || '').toLowerCase()
+      if (!this._isConversationParticipant(conversation, sender) ||
+          (conversation.creatorKey || '').toLowerCase() !== sender) {
+        diag('Rejecting group_member_removed from non-owner ' + sender.substring(0, 12))
+        return
+      }
+      const removed = data.removedKey
+      if (removed === this.identity.publicKeyHex.toLowerCase()) {
+        if (conversation.removedAt) return
+        await this.chatStore.updateConversation(conversationId, { removedAt: Date.now() })
+        await this.p2pManager.leaveConversation(conversationId)
+        if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId, closeOptions)
+        if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
+        this.pushEvent('conversation.removed_from_group', { conversationId })
+        diag('Removed from group ' + conversationId.substring(0, 12))
+        return
+      }
+      if (!this._isConversationParticipant(conversation, removed)) return
+      await this.chatStore.updateConversation(conversationId, {
+        participantIds: this._normalizedParticipants(conversation).filter(k => k !== removed)
+      })
+      await this._forgetMember(conversationId, removed, closeOptions)
+      this.pushEvent('conversation.member_removed', { conversationId, removedKey: removed })
+    } catch (error) {
+      diag('Failed to handle group member removed: ' + (error.stack || error.message || error))
+      return false
+    }
+  }
+
+  /**
+   * A member said which group features its app understands. The owner uses
+   * it to hand a waiting member the group's current secret. The returned
+   * promise is for tests; callers do not wait on the network.
+   */
+  onMemberCaps (conversationId, memberKey, features) {
+    const key = (memberKey || '').toLowerCase()
+    this.groupLinks.store.setMemberCaps(conversationId, key, features)
+    this.groupLinks.store.save()
+    if (!features.includes(GROUP_ADMIN_FEATURE)) return Promise.resolve(false)
+    return this._sendDeferredRekey(conversationId, key)
+      .catch(err => { diag('Deferred group secret not sent: ' + (err.message || err)); return false })
+  }
+
+  /**
+   * Hand one waiting member the group's current secret. The wait is cleared
+   * only once a transport took the invite; otherwise the next start retries.
+   */
+  async _sendDeferredRekey (conversationId, key) {
+    const fromGroupId = this.groupLinks.store.pendingRekey(conversationId)[key]
+    if (!fromGroupId) return false
+    const conv = await this.chatStore.getConversation(conversationId)
+    const myKey = (this.identity.publicKeyHex || '').toLowerCase()
+    const participants = conv ? this._normalizedParticipants(conv) : []
+    if (!conv || (conv.creatorKey || '').toLowerCase() !== myKey || !participants.includes(key)) {
+      this.groupLinks.store.clearPendingRekey(conversationId, key)
+      this.groupLinks.store.save()
+      return false
+    }
+    const sent = await this.p2pManager.sendInvite(key, this._rekeyInvite(conv, participants, fromGroupId))
+    if (sent) {
+      this.groupLinks.store.clearPendingRekey(conversationId, key)
+      this.groupLinks.store.save()
+    }
+    return sent
+  }
+
+  /** At start: retry every waiting member who has already announced support. */
+  async retryDeferredRekeys () {
+    const pendingAll = this.groupLinks.store.state.pendingRekey || {}
+    for (const [conversationId, pending] of Object.entries(pendingAll)) {
+      for (const key of Object.keys(pending)) {
+        if (!this._supportsGroupAdmin(conversationId, key)) continue
+        await this._sendDeferredRekey(conversationId, key).catch(() => false)
+      }
+    }
+  }
+
+  /** Tell the group, once per group, which group features this app understands. */
+  announceGroupCaps (conversationId) {
+    try {
+      const store = this.groupLinks.store
+      if (store.capsAnnounced(conversationId) >= CAPS_VERSION) return
+      const conv = this.chatStore.conversations.get(conversationId)
+      if (!conv || conv.type !== 'group' || conv.removedAt || this.chatStore.hasLeftConversation(conversationId)) return
+      if ((conv.creatorKey || '').toLowerCase() === (this.identity.publicKeyHex || '').toLowerCase()) return
+      this.p2pManager.sendToConversation(conversationId, { type: '__caps', v: 1, features: [GROUP_ADMIN_FEATURE] })
+      store.markCapsAnnounced(conversationId, CAPS_VERSION)
+      store.save()
+    } catch (err) {
+      diag('Capability announcement failed: ' + (err.message || err))
+    }
   }
 
   /**
@@ -1644,6 +1937,9 @@ class IPCHandler {
     if (!conversation) {
       throw new IPCRequestError('CONVERSATION_NOT_FOUND', 'Conversation not found')
     }
+    if (conversation.type === 'group' && conversation.removedAt) {
+      throw new IPCRequestError('REMOVED_FROM_GROUP', 'You were removed from this group')
+    }
     if (conversation.type !== 'direct') return conversation
 
     const ownKey = this.identity.publicKeyHex.toLowerCase().replace(/^0x/, '')
@@ -1705,7 +2001,9 @@ class IPCHandler {
         const conversation = await this.chatStore.getConversation(payload.conversationId)
         if (!conversation) return { success: false }
 
-        if (conversation.type === 'group' && conversation.groupId) {
+        if (conversation.type === 'group' && conversation.removedAt) {
+          return { success: false }
+        } else if (conversation.type === 'group' && conversation.groupId) {
           // Group: join shared group topic
           const allKeys = [this.identity.publicKeyHex, ...conversation.participantIds]
           await this.p2pManager.joinGroupConversation(payload.conversationId, conversation.groupId, allKeys)

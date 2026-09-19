@@ -16,6 +16,10 @@
  *   joinedVia:  conversationId -> linkIds this device joined it with
  *   removed:    conversationId -> keys the owner removed from that group
  *   memberCaps: conversationId -> { memberKey: [feature, ...] }
+ *   pendingRekey: conversationId -> { memberKey: groupId they were last sent }
+ *     members on an older app who get the group's new secret once they
+ *     announce they understand it
+ *   capsAnnounced: conversationId -> version this device announced there
  *   blockedKeys: keys the app has blocked, pushed down by the native side
  */
 
@@ -28,7 +32,7 @@ const diag = createDiagnosticLogger('GLINK')
 const FILE_VERSION = 1
 
 function emptyState () {
-  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, blockedKeys: [] }
+  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, pendingRekey: {}, capsAnnounced: {}, blockedKeys: [] }
 }
 
 function isObject (value) {
@@ -55,7 +59,7 @@ class GroupLinkStore {
       return
     }
     const state = emptyState()
-    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps']) {
+    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps', 'pendingRekey', 'capsAnnounced']) {
       if (isObject(stored[key])) state[key] = stored[key]
     }
     if (Array.isArray(stored.blockedKeys)) state.blockedKeys = stored.blockedKeys.filter(k => typeof k === 'string')
@@ -140,6 +144,32 @@ class GroupLinkStore {
     this.state.memberCaps[conversationId] = caps
   }
 
+  pendingRekey (conversationId) {
+    return this.state.pendingRekey[conversationId] || {}
+  }
+
+  /** Remember the secret a member was last on; the first one wins across rekeys. */
+  deferRekey (conversationId, memberKey, fromGroupId) {
+    const pending = this.pendingRekey(conversationId)
+    if (!pending[memberKey]) pending[memberKey] = fromGroupId
+    this.state.pendingRekey[conversationId] = pending
+  }
+
+  clearPendingRekey (conversationId, memberKey) {
+    const pending = this.state.pendingRekey[conversationId]
+    if (!pending) return
+    delete pending[memberKey]
+    if (Object.keys(pending).length === 0) delete this.state.pendingRekey[conversationId]
+  }
+
+  capsAnnounced (conversationId) {
+    return this.state.capsAnnounced[conversationId] || 0
+  }
+
+  markCapsAnnounced (conversationId, version) {
+    this.state.capsAnnounced[conversationId] = version
+  }
+
   // ── Blocked keys ─────────────────────────────────────────────────────────
 
   setBlockedKeys (keys) {
@@ -155,6 +185,8 @@ class GroupLinkStore {
     delete this.state.joinedVia[conversationId]
     delete this.state.removed[conversationId]
     delete this.state.memberCaps[conversationId]
+    delete this.state.pendingRekey[conversationId]
+    delete this.state.capsAnnounced[conversationId]
   }
 }
 

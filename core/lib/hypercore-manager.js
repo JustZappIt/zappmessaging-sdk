@@ -37,6 +37,8 @@ const diag = createDiagnosticLogger('HC')
 
 const DRAIN_RETRY_BASE_MS = 250
 const DRAIN_RETRY_MAX_MS = 30000
+// How long a core from before a new group secret is still read.
+const RETIRING_KEEP_MS = 30 * 24 * 60 * 60 * 1000
 
 function isPermanentDecodeError (err) {
   return !!err && err.code === 'DECODING_ERROR'
@@ -84,6 +86,16 @@ class HypercoreManager extends EventEmitter {
     // Both callbacks are synchronous: getIdentityKeyPair() → {publicKey,
     // secretKey}|null, getConversation(id) → conversation record|null.
     this._keyContext = null
+    // A group that got a new secret: the other members' cores from before it,
+    // still read with the old key until each is read to where its writer
+    // moved on. conversationId -> Map<coreKeyHex, {peerKeyHex, core, groupId, targetLength, since}>
+    this._retiring = new Map()
+    // Our own cores from before a new group secret, kept open this session so
+    // anything not yet uploaded to the blind peer still goes out.
+    this._retiredLocalCores = []
+    // Retiring cores read to their end: conversationId -> Set<coreKeyHex>. A
+    // stale announcement of one must never replace a member's current core.
+    this._finishedRetiring = new Map()
   }
 
   /**
@@ -132,8 +144,10 @@ class HypercoreManager extends EventEmitter {
    *
    * @param {string} conversationId
    * @param {number} epoch - Key epoch for rotation
+   * @param {string|null} groupIdOverride - a group's earlier secret, for cores
+   *   written before the owner gave the group a new one
    */
-  deriveEncryptionKey (conversationId, epoch = 0) {
+  deriveEncryptionKey (conversationId, epoch = 0, groupIdOverride = null) {
     if (!this._keyContext) {
       throw new Error('deriveEncryptionKey: key context not configured')
     }
@@ -143,7 +157,7 @@ class HypercoreManager extends EventEmitter {
     }
 
     if (conv.type === 'group') {
-      return conversationKeys.deriveGroupKey(conv.groupId, epoch)
+      return conversationKeys.deriveGroupKey(groupIdOverride || conv.groupId, epoch)
     }
 
     // Direct chat: ECDH with the single remote participant.
@@ -223,6 +237,17 @@ class HypercoreManager extends EventEmitter {
   }
 
   /**
+   * A group that got a new secret writes to new cores, so its core names
+   * carry the group epoch. Epoch 0 keeps the original name, which is what
+   * every existing conversation uses.
+   */
+  _localCoreName (prefix, conversationId) {
+    const conv = this._keyContext && this._keyContext.getConversation(conversationId)
+    const epoch = conv && conv.type === 'group' && Number.isSafeInteger(conv.groupEpoch) ? conv.groupEpoch : 0
+    return prefix + conversationId + (epoch > 0 ? '-e' + epoch : '')
+  }
+
+  /**
    * Get or create the local writable Hypercore for a conversation.
    */
   async getOrCreateLocalCore (conversationId) {
@@ -233,7 +258,7 @@ class HypercoreManager extends EventEmitter {
 
     const encKey = this.deriveEncryptionKey(conversationId)
     const core = this.store.get({
-      name: 'zapp-local-' + conversationId,
+      name: this._localCoreName('zapp-local-', conversationId),
       encryptionKey: encKey,
       valueEncoding: 'json'
     })
@@ -258,7 +283,7 @@ class HypercoreManager extends EventEmitter {
 
     const encKey = this.deriveEncryptionKey(conversationId)
     const core = this.store.get({
-      name: 'zapp-media-' + conversationId,
+      name: this._localCoreName('zapp-media-', conversationId),
       encryptionKey: encKey,
       valueEncoding: 'binary'
     })
@@ -275,7 +300,7 @@ class HypercoreManager extends EventEmitter {
    * caller closes the session once its blocks are down, so media cores stay
    * open only while an image is in flight.
    */
-  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex) {
+  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex, groupIdOverride = null) {
     if (!this._ready) throw new Error('HypercoreManager not initialized')
     this._assertRemoteCoreAuthorized(conversationId, peerKeyHex)
     if (!/^[0-9a-f]{64}$/i.test(coreKeyHex || '')) throw new Error('remote media core rejected: invalid key')
@@ -284,7 +309,7 @@ class HypercoreManager extends EventEmitter {
     // message core: neither one of our writers nor a peer's log we replicate.
     if (this._isMessageCoreKey(normalizedCoreKey)) throw new Error('remote media core rejected: message core')
 
-    const encKey = this.deriveEncryptionKey(conversationId)
+    const encKey = this.deriveEncryptionKey(conversationId, 0, groupIdOverride)
     const core = this.store.get({
       key: b4a.from(normalizedCoreKey, 'hex'),
       encryptionKey: encKey,
@@ -307,6 +332,9 @@ class HypercoreManager extends EventEmitter {
         if ((remoteKey || '').toLowerCase() === coreKeyHex) return true
       }
     }
+    for (const retiring of this._retiring.values()) {
+      if (retiring.has(coreKeyHex)) return true
+    }
     return false
   }
 
@@ -319,6 +347,14 @@ class HypercoreManager extends EventEmitter {
     this._assertRemoteCoreAuthorized(conversationId, peerKeyHex)
 
     const normalizedCoreKey = (coreKeyHex || '').toLowerCase()
+
+    // A member still on the group's old secret announces its old core. That
+    // core is already being read as a retiring core; it must not replace the
+    // writer we know for the current secret.
+    const retiring = this._retiring.get(conversationId)
+    if (retiring && retiring.has(normalizedCoreKey)) return retiring.get(normalizedCoreKey).core
+    const finished = this._finishedRetiring.get(conversationId)
+    if (finished && finished.has(normalizedCoreKey)) return null
 
     if (!this.remoteCores.has(conversationId)) {
       this.remoteCores.set(conversationId, new Map())
@@ -517,6 +553,12 @@ class HypercoreManager extends EventEmitter {
       }
 
       if (state.cancelled || this._closed) throw new Error('remote drain cancelled')
+      if (message && message.type === '__epoch') {
+        // Where this writer's previous core ends. Bookkeeping only, never a row.
+        this._onEpochMarker(conversationId, peerKeyHex, message)
+        i++
+        continue
+      }
       if (message) {
         if (!this._remoteMessageSink) throw new Error('remote message sink unavailable')
         try {
@@ -543,6 +585,7 @@ class HypercoreManager extends EventEmitter {
     // coalesced delivery watermark are durable. A crash earlier replays the
     // whole batch; ChatStore and receipt watermarks are idempotent.
     this._setProcessedCursor(conversationId, coreKeyHex, target, fork)
+    this._scheduleRetiringCheck(conversationId, coreKeyHex)
   }
 
   _cancelRemoteDrain (core) {
@@ -564,6 +607,112 @@ class HypercoreManager extends EventEmitter {
     if (chain && waitForDrain) await chain
     this._drainChains.delete(core)
     this._drainStates.delete(core)
+  }
+
+  /**
+   * The group now has a new secret (conv.groupId and conv.groupEpoch were
+   * already updated). Our own old cores leave the active maps but stay open
+   * this session; every other member's current core becomes a retiring core,
+   * still read with the old key, until its writer says where it ended.
+   *
+   * @param {string} conversationId
+   * @param {string} previousGroupId the secret those cores were written under
+   * @returns {{prevCoreKey: string|null, prevLength: number}} where our own
+   *   old core ends, for the marker at the start of our new core
+   */
+  rekeyConversation (conversationId, previousGroupId) {
+    let prevCoreKey = null
+    let prevLength = 0
+    for (const cores of [this.localCores, this.localMediaCores]) {
+      const old = cores.get(conversationId)
+      if (!old) continue
+      if (cores === this.localCores) {
+        prevCoreKey = b4a.toString(old.key, 'hex')
+        prevLength = old.length
+      }
+      this._retiredLocalCores.push(old)
+      cores.delete(conversationId)
+    }
+
+    const remotes = this.remoteCores.get(conversationId)
+    const keyMap = this._coreKeyIndex.get(conversationId)
+    if (remotes) {
+      if (!this._retiring.has(conversationId)) this._retiring.set(conversationId, new Map())
+      const retiring = this._retiring.get(conversationId)
+      for (const [peerKeyHex, core] of remotes) {
+        const coreKeyHex = ((keyMap && keyMap.get(peerKeyHex)) || b4a.toString(core.key, 'hex')).toLowerCase()
+        retiring.set(coreKeyHex, { peerKeyHex, core, groupId: previousGroupId, targetLength: null, since: Date.now() })
+      }
+      this.remoteCores.delete(conversationId)
+    }
+    this._coreKeyIndex.delete(conversationId)
+    this.saveCoreKeyIndex()
+    this.emit('push-topics-changed')
+    diag('Rekeyed conv=' + conversationId.substring(0, 12) +
+      ' retiring=' + (this._retiring.get(conversationId)?.size || 0))
+    return { prevCoreKey, prevLength }
+  }
+
+  /** The epoch marker a writer puts first in its core for a new group secret. */
+  _onEpochMarker (conversationId, peerKeyHex, marker) {
+    const retiring = this._retiring.get(conversationId)
+    const prevKey = typeof marker.prevCoreKey === 'string' ? marker.prevCoreKey.toLowerCase() : null
+    if (!retiring || !prevKey || !retiring.has(prevKey)) return
+    const entry = retiring.get(prevKey)
+    if ((entry.peerKeyHex || '').toLowerCase() !== (peerKeyHex || '').toLowerCase()) return
+    if (!Number.isSafeInteger(marker.prevLength) || marker.prevLength < 0) return
+    entry.targetLength = marker.prevLength
+    this.saveCoreKeyIndex()
+    this._scheduleRetiringCheck(conversationId, prevKey)
+  }
+
+  _scheduleRetiringCheck (conversationId, coreKeyHex) {
+    const retiring = this._retiring.get(conversationId)
+    if (!retiring || !retiring.has(coreKeyHex)) return
+    // Outside the drain that called us: finishing closes this very core.
+    Promise.resolve().then(() => this._maybeFinishRetiring(conversationId, coreKeyHex)).catch(() => {})
+  }
+
+  async _maybeFinishRetiring (conversationId, coreKeyHex) {
+    const retiring = this._retiring.get(conversationId)
+    const entry = retiring && retiring.get(coreKeyHex)
+    if (!entry || entry.targetLength === null) return false
+    const cursor = this._getProcessedCursor(conversationId, coreKeyHex, coreFork(entry.core))
+    if (cursor < entry.targetLength) return false
+    retiring.delete(coreKeyHex)
+    if (retiring.size === 0) this._retiring.delete(conversationId)
+    this._markFinishedRetiring(conversationId, coreKeyHex)
+    await this._closeRemoteCore(entry.core, { waitForDrain: false })
+    this._deleteProcessedCursor(conversationId, coreKeyHex)
+    this.saveCoreKeyIndex()
+    diag('Retiring core read to its end conv=' + conversationId.substring(0, 12))
+    return true
+  }
+
+  _markFinishedRetiring (conversationId, coreKeyHex) {
+    if (!this._finishedRetiring.has(conversationId)) this._finishedRetiring.set(conversationId, new Set())
+    const finished = this._finishedRetiring.get(conversationId)
+    finished.add(coreKeyHex)
+    // Bounded: only a handful of epochs per group ever exist.
+    while (finished.size > 64) finished.delete(finished.values().next().value)
+  }
+
+  /** Reopen a retiring core after a restart, with the key it was written under. */
+  async _openRetiringCore (conversationId, coreKeyHex, entry) {
+    const encKey = this.deriveEncryptionKey(conversationId, 0, entry.groupId)
+    const core = this.store.get({ key: b4a.from(coreKeyHex, 'hex'), encryptionKey: encKey, valueEncoding: 'json' })
+    await core.ready()
+    if (!this._retiring.has(conversationId)) this._retiring.set(conversationId, new Map())
+    this._retiring.get(conversationId).set(coreKeyHex, { ...entry, core })
+    this._watchRemoteCore(conversationId, entry.peerKeyHex, coreKeyHex, core)
+    this._drainRemoteCore(conversationId, entry.peerKeyHex, coreKeyHex, core)
+    return core
+  }
+
+  /** Retiring cores of a conversation, for tests and diagnostics. */
+  retiringCores (conversationId) {
+    const retiring = this._retiring.get(conversationId)
+    return retiring ? [...retiring.entries()].map(([coreKeyHex, e]) => ({ coreKeyHex, peerKeyHex: e.peerKeyHex, targetLength: e.targetLength })) : []
   }
 
   /**
@@ -607,6 +756,12 @@ class HypercoreManager extends EventEmitter {
       }
       this.remoteCores.delete(conversationId)
     }
+    const retiring = this._retiring.get(conversationId)
+    if (retiring) {
+      for (const entry of retiring.values()) await this._closeRemoteCore(entry.core, options)
+      this._retiring.delete(conversationId)
+    }
+    this._finishedRetiring.delete(conversationId)
     this._coreKeyIndex.delete(conversationId)
     this._localReferrerIndex.delete(conversationId)
     this._remoteReferrerIndex.delete(conversationId)
@@ -638,6 +793,19 @@ class HypercoreManager extends EventEmitter {
         keyMap.delete(storedPeer)
       }
       if (keyMap.size === 0) this._coreKeyIndex.delete(conversationId)
+    }
+
+    // A removed member's cores from earlier group secrets go too.
+    const retiring = this._retiring.get(conversationId)
+    if (retiring) {
+      for (const [coreKeyHex, entry] of retiring) {
+        if ((entry.peerKeyHex || '').toLowerCase() !== peer) continue
+        await this._closeRemoteCore(entry.core, options)
+        this._deleteProcessedCursor(conversationId, coreKeyHex)
+        retiring.delete(coreKeyHex)
+        removed = true
+      }
+      if (retiring.size === 0) this._retiring.delete(conversationId)
     }
 
     const refMap = this._remoteReferrerIndex.get(conversationId)
@@ -750,7 +918,16 @@ class HypercoreManager extends EventEmitter {
           cursors[convId][coreKey] = cursor
         }
       }
-      const data = { version: 3, remotes, localReferrers, remoteReferrers, cursors }
+      const retiring = {}
+      for (const [convId, entries] of this._retiring) {
+        retiring[convId] = {}
+        for (const [coreKey, e] of entries) {
+          retiring[convId][coreKey] = { peer: e.peerKeyHex, groupId: e.groupId, targetLength: e.targetLength, since: e.since }
+        }
+      }
+      const finishedRetiring = {}
+      for (const [convId, keys] of this._finishedRetiring) finishedRetiring[convId] = [...keys]
+      const data = { version: 3, remotes, localReferrers, remoteReferrers, cursors, retiring, finishedRetiring }
       writeJSON(path.join(this._getDataDir(), 'corekeys.json'), data)
       diag('Saved core key index: ' + Object.keys(remotes).length + ' conversation(s)')
     } catch (err) {
@@ -820,13 +997,36 @@ class HypercoreManager extends EventEmitter {
       let count = 0
       for (const [convId, keys] of Object.entries(remoteData)) {
         if (convId === 'version' || convId === 'localReferrers' ||
-            convId === 'remoteReferrers' || convId === 'cursors') continue
+            convId === 'remoteReferrers' || convId === 'cursors' || convId === 'retiring' ||
+            convId === 'finishedRetiring') continue
         for (const [peerKey, coreKey] of Object.entries(keys)) {
           try {
             await this.openRemoteCore(convId, peerKey, coreKey, this.getRemoteCoreReferrer(convId, peerKey))
             count++
           } catch (err) {
             diag('Failed to reopen remote core: ' + (err.message || err))
+          }
+        }
+      }
+      for (const [convId, keys] of Object.entries((data && data.finishedRetiring) || {})) {
+        if (!Array.isArray(keys)) continue
+        for (const key of keys) if (typeof key === 'string') this._markFinishedRetiring(convId, key.toLowerCase())
+      }
+      // Retiring cores are kept for at most RETIRING_KEEP_MS; a writer that
+      // never says where its old core ended (an old build) is read until then.
+      for (const [convId, entries] of Object.entries((data && data.retiring) || {})) {
+        for (const [coreKey, e] of Object.entries(entries || {})) {
+          if (!e || typeof e.peer !== 'string' || typeof e.groupId !== 'string') continue
+          if (!Number.isSafeInteger(e.since) || Date.now() - e.since > RETIRING_KEEP_MS) continue
+          try {
+            await this._openRetiringCore(convId, coreKey.toLowerCase(), {
+              peerKeyHex: e.peer,
+              groupId: e.groupId,
+              targetLength: Number.isSafeInteger(e.targetLength) ? e.targetLength : null,
+              since: e.since
+            })
+          } catch (err) {
+            diag('Failed to reopen retiring core: ' + (err.message || err))
           }
         }
       }
@@ -860,6 +1060,15 @@ class HypercoreManager extends EventEmitter {
         await this._closeRemoteCore(core)
       }
     }
+    for (const [, entries] of this._retiring) {
+      for (const [, entry] of entries) await this._closeRemoteCore(entry.core)
+    }
+    for (const core of this._retiredLocalCores) {
+      try { await core.close() } catch (e) { /* ignore */ }
+    }
+    this._retiring.clear()
+    this._finishedRetiring.clear()
+    this._retiredLocalCores = []
     this.localCores.clear()
     this.localMediaCores.clear()
     this.remoteCores.clear()

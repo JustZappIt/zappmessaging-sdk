@@ -621,10 +621,10 @@ class P2PManager extends EventEmitter {
    * which the caller closes when its fetch is over, or null when it cannot be
    * opened.
    */
-  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex) {
+  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex, groupIdOverride = null) {
     if (!this.hypercoreManager || !coreKeyHex) return null
     try {
-      const core = await this.hypercoreManager.openRemoteMediaCore(conversationId, peerKeyHex, coreKeyHex)
+      const core = await this.hypercoreManager.openRemoteMediaCore(conversationId, peerKeyHex, coreKeyHex, groupIdOverride)
       if (this.blindMirror) {
         this.blindMirror.addRemoteMediaCore(conversationId, coreKeyHex, core, this._remoteCoreReferrer(conversationId))
       }
@@ -981,6 +981,29 @@ class P2PManager extends EventEmitter {
       diag('joinGroupConversation ERROR:', error)
       return false
     }
+  }
+
+  /**
+   * The group has a new secret: stop announcing the old topic and join the
+   * new one. Connections stay up, since other chats may share them; the ones
+   * to remaining members are picked up again by joinGroupConversation.
+   * @returns {Promise<boolean>}
+   */
+  async switchGroupTopic (conversationId) {
+    const entry = this.groupConversations.get(conversationId)
+    if (entry) {
+      try {
+        if (entry.discovery) await entry.discovery.destroy()
+      } catch (error) {
+        diag('Error leaving the previous group topic: ' + (error.message || error))
+      }
+      this.groupTopicToConversation.delete(entry.groupTopicHex)
+      this.groupConversations.delete(conversationId)
+    }
+    const conv = this._getConversation && this._getConversation(conversationId)
+    if (!conv || conv.type !== 'group') return false
+    const self = this.keyPair ? b4a.toString(this.keyPair.publicKey, 'hex') : null
+    return this.joinGroupConversation(conversationId, conv.groupId, [self, ...(conv.participantIds || [])].filter(Boolean))
   }
 
   /**

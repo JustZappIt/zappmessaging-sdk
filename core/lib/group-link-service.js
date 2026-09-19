@@ -715,6 +715,16 @@ class GroupLinkService {
 
   // ── Removal support ──────────────────────────────────────────────────────
 
+  /** Drop a waiting approval request, for example from someone just removed. */
+  forgetRequest (conversationId, joinerKey) {
+    const entry = this.store.ownerEntry(conversationId)
+    if (!entry) return
+    const key = (joinerKey || '').toLowerCase()
+    const before = entry.requests.length
+    entry.requests = entry.requests.filter(r => r.joinerKey !== key)
+    if (entry.requests.length !== before) this.store.save()
+  }
+
   /** Keys the owner removed are never admitted again automatically. */
   recordRemoval (conversationId, memberKey) {
     this.store.addRemovedKey(conversationId, memberKey.toLowerCase())
