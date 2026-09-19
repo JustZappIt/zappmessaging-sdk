@@ -1020,3 +1020,97 @@ test('openRemoteCore reports failure instead of swallowing it', async () => {
   manager.hypercoreManager = { openRemoteCore: async () => ({}) }
   assert.strictEqual(await manager.openRemoteCore('conv-1', 'bb'.repeat(32), 'cc'.repeat(32)), true)
 })
+
+// --- group invite links: mailbox operations as another key ---
+
+function signingKeyPair (seedByte) {
+  return crypto.keyPair(b4a.alloc(32, seedByte))
+}
+
+/**
+ * A manager whose mailbox runs over the host HTTPS path, answered in-process,
+ * so each request body shows which key signed or authenticated it.
+ */
+function managerWithHttpsMailbox (handle, opts = {}) {
+  const config = require('../lib/config')
+  const previousUrl = config.INVITE_MAILBOX_URL
+  config.INVITE_MAILBOX_URL = 'https://mailbox.example/zapp-invite'
+  const requests = []
+  const manager = new P2PManager({
+    ...opts,
+    platformHttp: (request) => {
+      requests.push(request)
+      Promise.resolve(handle(request)).then(response => {
+        manager.completePlatformHttpRequest({ requestId: request.requestId, success: true, response })
+      })
+      return true
+    }
+  })
+  manager.keyPair = signingKeyPair(1)
+  return { manager, requests, restore: () => { config.INVITE_MAILBOX_URL = previousUrl } }
+}
+
+test('putMailboxAs signs the envelope with the given key, not the identity', async () => {
+  const { manager, requests, restore } = managerWithHttpsMailbox(() => ({}))
+  try {
+    const throwaway = signingKeyPair(9)
+    const recipient = b4a.toString(signingKeyPair(7).publicKey, 'hex')
+    assert.strictEqual(await manager.putMailboxAs(throwaway, recipient, { type: 'group_join_request' }), true)
+    const envelope = JSON.parse(requests[0].body.envelope)
+    assert.strictEqual(envelope.sender, b4a.toString(throwaway.publicKey, 'hex'))
+    assert.notStrictEqual(envelope.sender, b4a.toString(manager.keyPair.publicKey, 'hex'))
+    assert.strictEqual(requests[0].body.recipient, recipient)
+  } finally {
+    restore()
+  }
+})
+
+test('drainMailboxAs lists and acknowledges as the given key', async () => {
+  const { manager, requests, restore } = managerWithHttpsMailbox((request) => {
+    if (request.url.endsWith('/list')) return { entries: [], more: false }
+    return {}
+  })
+  try {
+    const rendezvous = signingKeyPair(5)
+    assert.strictEqual(await manager.drainMailboxAs(rendezvous, async () => true), true)
+    assert.strictEqual(requests[0].body.identity, b4a.toString(rendezvous.publicKey, 'hex'))
+  } finally {
+    restore()
+  }
+})
+
+test('a group join result in our mailbox is delivered whatever key signed it', async () => {
+  const { encryptInvite } = require('../lib/invite-mailbox')
+  const linkKey = signingKeyPair(6)
+  const me = signingKeyPair(1)
+  const result = { type: 'group_join_result', v: 1, linkId: '11'.repeat(16), joinerKey: b4a.toString(me.publicKey, 'hex'), status: 'full', sig: '00'.repeat(64) }
+  const envelope = encryptInvite(result, linkKey, b4a.toString(me.publicKey, 'hex'))
+  const delivered = []
+  let listed = false
+  const { manager, restore } = managerWithHttpsMailbox((request) => {
+    if (request.url.endsWith('/list')) {
+      if (listed) return { entries: [], more: false }
+      listed = true
+      return { entries: [{ id: 'e1', envelope }], more: false }
+    }
+    return {}
+  }, { deliverInvite: async (invite, sender) => { delivered.push({ invite, sender }); return true } })
+  try {
+    await manager._drainInviteMailboxesOnce()
+    assert.strictEqual(delivered.length, 1)
+    assert.deepStrictEqual(delivered[0].invite, result)
+    assert.strictEqual(delivered[0].sender, b4a.toString(linkKey.publicKey, 'hex'))
+  } finally {
+    restore()
+  }
+})
+
+test('the auxiliary drain runs after each mailbox drain and its failure is contained', async () => {
+  const manager = new P2PManager()
+  const order = []
+  manager._drainInviteMailboxesOnce = async () => { order.push('own'); return 2 }
+  manager.setAuxiliaryDrain(async () => { order.push('links'); throw new Error('offline') })
+  assert.strictEqual(await manager._drainInviteMailboxes(), 2)
+  assert.deepStrictEqual(order, ['own', 'links'])
+  assert.strictEqual(manager._mailboxDrainInFlight, null)
+})

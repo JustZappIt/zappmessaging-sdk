@@ -18,11 +18,14 @@ const config = require('./config')
 const { IPCRequestError, validateDirectParticipant } = require('./direct-recipient')
 const { isMediaId } = require('./media-id')
 const mediaBlobs = require('./media-blobs')
+const { GroupLinkStore } = require('./group-link-store')
+const { GroupLinkService } = require('./group-link-service')
 const { createDiagnosticLogger } = require('./diagnostics')
 
 // Protocol version — bump when IPC message format changes
 const PROTOCOL_VERSION = '1.0'
-const SUPPORTED_FEATURES = ['messaging', 'groups', 'media', 'blind_peer', 'contacts', 'payments', 'read_receipts']
+const SUPPORTED_FEATURES = ['messaging', 'groups', 'media', 'blind_peer', 'contacts', 'payments', 'read_receipts', 'group_links']
+const MAX_LINK_CHARS = 16 * 1024
 
 const diag = createDiagnosticLogger('IPC')
 
@@ -40,7 +43,7 @@ function isPlainObject(value) {
 }
 
 class IPCHandler {
-  constructor({ identity, chatStore, contactStore, p2pManager, mediaStore, mediaTransfer, blindMirror, hypercoreManager, ensureBlindMirror }) {
+  constructor({ identity, chatStore, contactStore, p2pManager, mediaStore, mediaTransfer, blindMirror, hypercoreManager, ensureBlindMirror, groupLinkStore }) {
     this.identity = identity
     this.chatStore = chatStore
     this.contactStore = contactStore
@@ -90,6 +93,29 @@ class IPCHandler {
     this.p2pManager.on('group_member_added', (data, senderPeerId) => {
       this._handleGroupMemberAdded(data, senderPeerId)
     })
+
+    // Group invite links. The service holds the protocol; this handler gives
+    // it the mailbox transport and the owner's add member path.
+    const p2p = this.p2pManager
+    this.groupLinks = new GroupLinkService({
+      store: groupLinkStore || new GroupLinkStore(),
+      chatStore,
+      identity,
+      transport: {
+        put: (senderKeyPair, recipientHex, record) =>
+          typeof p2p.putMailboxAs === 'function' ? p2p.putMailboxAs(senderKeyPair, recipientHex, record) : false,
+        drain: (keyPair, deliver) =>
+          typeof p2p.drainMailboxAs === 'function' ? p2p.drainMailboxAs(keyPair, deliver) : false,
+        sendInvite: (recipientHex, record) => p2p.sendInvite(recipientHex, record),
+        drainOwn: () => typeof p2p._drainInviteMailboxes === 'function' ? p2p._drainInviteMailboxes() : Promise.resolve()
+      },
+      admit: (conversationId, joinerKey, joinerName, viaLink, options) =>
+        this._admitViaLink(conversationId, joinerKey, joinerName, viaLink, options),
+      emit: (type, payload) => this.pushEvent(type, payload)
+    })
+    if (typeof p2p.setAuxiliaryDrain === 'function') {
+      p2p.setAuxiliaryDrain(() => this.groupLinks.onMailboxDrain())
+    }
   }
 
   _conversationForGroupTopic(topic) {
@@ -287,6 +313,8 @@ class IPCHandler {
         return this.handlePush(action, payload)
       case 'platform':
         return this.handlePlatform(action, payload)
+      case 'group_link':
+        return this.handleGroupLink(action, payload)
       default:
         throw new Error(`Unknown message type: ${type}`)
     }
@@ -310,8 +338,61 @@ class IPCHandler {
     if (invite.type === 'group_invite') {
       return await this._handleGroupInvite(invite, senderKeyHex)
     }
+    if (invite.type === 'group_join_result') {
+      return this.groupLinks.handleJoinResult(invite, senderKeyHex)
+    }
     diag('Discarding unsupported mailbox invite type: ' + invite.type)
     return true
+  }
+
+  /**
+   * Group invite link requests. The link itself (a bearer secret) only leaves
+   * the worklet in the owner's get, enable, update and reset results.
+   */
+  async handleGroupLink (action, payload) {
+    const conversationId = () => {
+      if (!isValidString(payload.conversationId, 256)) throw new IPCRequestError('INVALID_CONVERSATION', 'conversationId is required')
+      return payload.conversationId
+    }
+    const link = () => {
+      if (!isValidString(payload.link, MAX_LINK_CHARS)) throw new IPCRequestError('INVALID_LINK', 'link is required')
+      return payload.link
+    }
+    const options = () => {
+      const out = {}
+      for (const key of ['expiresAt', 'maxJoins', 'includeName', 'approval']) {
+        if (Object.prototype.hasOwnProperty.call(payload, key)) out[key] = payload[key]
+      }
+      return out
+    }
+    const joinerKey = () => {
+      const key = (payload.joinerKey || '').toLowerCase().replace(/^0x/, '')
+      if (!isValidPublicKey(key)) throw new IPCRequestError('INVALID_KEY', 'joinerKey is required')
+      return key
+    }
+    const links = this.groupLinks
+    switch (action) {
+      case 'get': return links.getLink(conversationId())
+      case 'enable': return links.enableLink(conversationId(), options())
+      case 'update': return links.updateLink(conversationId(), options())
+      case 'reset': return links.resetLink(conversationId())
+      case 'disable': return links.disableLink(conversationId())
+      case 'requests': return { requests: links.listRequests(conversationId()) }
+      case 'approve': return await links.approve(conversationId(), joinerKey())
+      case 'decline': return await links.decline(conversationId(), joinerKey())
+      case 'inspect': return links.inspect(link())
+      case 'join': {
+        const name = isValidString(payload.joinerName, 100) ? payload.joinerName : null
+        return await links.join(link(), name)
+      }
+      case 'join_status': return { requests: links.joinStatus() }
+      case 'cancel': {
+        if (!isValidString(payload.linkId, 64)) throw new IPCRequestError('INVALID_LINK_ID', 'linkId is required')
+        return { cancelled: links.cancel(payload.linkId) }
+      }
+      default:
+        throw new Error(`Unknown group_link action: ${action}`)
+    }
   }
 
   /** The identity payload the native side expects. */
@@ -357,7 +438,7 @@ class IPCHandler {
    */
   async _wipeAccountData () {
     let failure = null
-    for (const store of [this.chatStore, this.contactStore]) {
+    for (const store of [this.chatStore, this.contactStore, this.groupLinks && this.groupLinks.store]) {
       if (!store) continue
       try {
         await store.clearAll()
@@ -537,6 +618,12 @@ class IPCHandler {
         return { success: true }
       }
 
+      case 'set_blocked_keys':
+        // Blocking is app policy, kept natively; group link admission needs
+        // to honor it without the app being asked each time.
+        this.groupLinks.setBlockedKeys(payload.keys)
+        return { success: true }
+
       case 'updateWalletAddress':
         if (!isValidPublicKey(payload.publicKey)) throw new Error('Invalid publicKey')
         const updatedContact = await this.contactStore.updateWalletAddress(
@@ -682,29 +769,8 @@ class IPCHandler {
         const newKey = (payload.publicKey || '').toLowerCase().replace(/^0x/, '')
         if (!isValidPublicKey(newKey) || newKey === myKey) throw new Error('Invalid publicKey')
         const newName = (payload.displayName || newKey.substring(0, 8)).trim()
-        const existing = new Set((conv.participantIds || []).map(key =>
-          (key || '').toLowerCase().replace(/^0x/, '')).filter(Boolean))
-        if (existing.has(newKey)) return { success: true, alreadyMember: true }
-        existing.add(newKey)
-        const updatedParticipants = [...existing]
-        await this.chatStore.updateConversation(payload.conversationId, { participantIds: updatedParticipants })
-        const allKeys = [myKey, ...updatedParticipants]
-        await this.p2pManager.joinGroupConversation(conv.id, conv.groupId, allKeys)
-        await this.p2pManager.sendInvite(newKey, {
-          type: 'group_invite',
-          groupId: conv.groupId,
-          groupName: conv.displayName,
-          creatorKey: conv.creatorKey,
-          participants: allKeys,
-          senderKey: myKey,
-          localCoreKey: this.hypercoreManager ? this.hypercoreManager.getLocalCoreKey(conv.id) : null
-        })
-        this.p2pManager.sendToConversation(payload.conversationId, {
-          type: 'group_member_added',
-          newMemberKey: newKey,
-          newMemberName: newName,
-          updatedParticipants: allKeys
-        })
+        if (this._normalizedParticipants(conv).includes(newKey)) return { success: true, alreadyMember: true }
+        const updatedParticipants = await this._addMemberAsOwner(conv, newKey, newName)
         return { success: true, participants: updatedParticipants }
       }
 
@@ -724,6 +790,70 @@ class IPCHandler {
       default:
         throw new Error(`Unknown conversation action: ${action}`)
     }
+  }
+
+  _normalizedParticipants (conv) {
+    return (conv.participantIds || []).map(key => (key || '').toLowerCase().replace(/^0x/, '')).filter(Boolean)
+  }
+
+  /** The group invite the owner sends a member, with optional extra fields. */
+  _ownerGroupInvite (conv, participantKeys, extra = {}) {
+    const myKey = this.identity.publicKeyHex.toLowerCase()
+    return {
+      type: 'group_invite',
+      groupId: conv.groupId,
+      groupName: conv.displayName,
+      creatorKey: conv.creatorKey,
+      participants: [myKey, ...participantKeys],
+      senderKey: myKey,
+      localCoreKey: this.hypercoreManager ? this.hypercoreManager.getLocalCoreKey(conv.id) : null,
+      ...extra
+    }
+  }
+
+  /**
+   * Owner only: add newKey to the group, invite them, and tell the others.
+   * The caller has checked ownership and that newKey is not a member yet.
+   * @returns {Promise<string[]>} the updated participant list (without us)
+   */
+  async _addMemberAsOwner (conv, newKey, newName, { viaLink = null } = {}) {
+    const updatedParticipants = [...new Set([...this._normalizedParticipants(conv), newKey])]
+    await this.chatStore.updateConversation(conv.id, { participantIds: updatedParticipants })
+    const invite = this._ownerGroupInvite(conv, updatedParticipants, viaLink ? { viaLink } : {})
+    await this.p2pManager.joinGroupConversation(conv.id, conv.groupId, invite.participants)
+    await this.p2pManager.sendInvite(newKey, invite)
+    this.p2pManager.sendToConversation(conv.id, {
+      type: 'group_member_added',
+      newMemberKey: newKey,
+      newMemberName: newName,
+      updatedParticipants: invite.participants
+    })
+    return updatedParticipants
+  }
+
+  /**
+   * The group link service's admission hook. With resendOnly the joiner is
+   * already a member and only gets their invite again.
+   * @returns {Promise<boolean>}
+   */
+  async _admitViaLink (conversationId, joinerKey, joinerName, viaLink, { resendOnly = false } = {}) {
+    const conv = await this.chatStore.getConversation(conversationId)
+    if (!conv || conv.type !== 'group') return false
+    const myKey = this.identity.publicKeyHex.toLowerCase()
+    if ((conv.creatorKey || '').toLowerCase() !== myKey) return false
+    const key = (joinerKey || '').toLowerCase()
+    if (!isValidPublicKey(key) || key === myKey) return false
+    const name = (typeof joinerName === 'string' && joinerName.trim()) || key.substring(0, 8)
+    const participants = this._normalizedParticipants(conv)
+    if (resendOnly || participants.includes(key)) {
+      if (!participants.includes(key)) return false
+      await this.p2pManager.sendInvite(key, this._ownerGroupInvite(conv, participants, viaLink ? { viaLink } : {}))
+      return true
+    }
+    await this._addMemberAsOwner(conv, key, name, { viaLink })
+    // The native side did not start this, so it learns of it here.
+    this.pushEvent('conversation.member_added', { conversationId, newMemberKey: key, newMemberName: name })
+    return true
   }
 
   /**
@@ -1061,12 +1191,28 @@ class IPCHandler {
       // Notify Swift/Kotlin UI about the new group
       if (metadataChanged) this.pushEvent('conversation.invite_received', { conversation: this._enrichConversation(conversation) })
 
+      // An admission through a group invite link completes our request.
+      if (inviteData.viaLink) this.groupLinks.onGroupInviteApplied(inviteData, conversation)
+
       diag('Accepted group invite with ' + participants.length + ' members from ' + senderPeerId.substring(0, 12))
     } catch (error) {
       failed = true
       diag('Failed to handle group invite: ' + (error.stack || error.message || error))
     }
     return !failed
+  }
+
+  /**
+   * The group is gone for us: stop its invite link and answer anything still
+   * queued. Not awaited by callers; answering needs the network.
+   */
+  _groupLinksGone (conversationId) {
+    this.groupLinks.onGroupGone(conversationId)
+      .catch(err => diag('Group link cleanup failed: ' + (err.message || err)))
+      .finally(() => {
+        this.groupLinks.store.forgetConversation(conversationId)
+        try { this.groupLinks.store.save() } catch (err) { diag('Group link store save failed: ' + (err.message || err)) }
+      })
   }
 
   /**
@@ -1092,6 +1238,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
+    this._groupLinksGone(conversationId)
     diag('Left group: ' + conversationId.substring(0, 12))
     return { success: true }
   }
@@ -1121,6 +1268,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
+    this._groupLinksGone(conversationId)
     diag('Deleted group: ' + conversationId.substring(0, 12))
     return { success: true }
   }
@@ -1155,6 +1303,7 @@ class IPCHandler {
     if (this.hypercoreManager) await this.hypercoreManager.removeConversation(conversationId)
     if (this.blindMirror) this.blindMirror.removeConversation(conversationId)
 
+    if (conversation.type === 'group') this._groupLinksGone(conversationId)
     diag('Removed conversation: ' + conversationId.substring(0, 12))
     return { success: true }
   }

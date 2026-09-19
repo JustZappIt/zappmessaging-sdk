@@ -103,6 +103,15 @@ function normalizePeerRecord (input, peer) {
         record.groupId = key(input.groupId, 'groupId', true)
         record.creatorKey = key(input.creatorKey, 'creatorKey', true)
         record.participants = keys(input.participants, 'participants')
+        // Set when the owner admitted us through a group invite link. Older
+        // builds never receive it; the admission signature is checked later.
+        if (input.viaLink != null) {
+          if (!object(input.viaLink)) throw new InvalidPeerRecord('viaLink')
+          const { linkId, admitSig } = input.viaLink
+          if (typeof linkId !== 'string' || !/^[0-9a-fA-F]{32}$/.test(linkId)) throw new InvalidPeerRecord('viaLink.linkId')
+          if (typeof admitSig !== 'string' || !/^[0-9a-fA-F]{128}$/.test(admitSig)) throw new InvalidPeerRecord('viaLink.admitSig')
+          record.viaLink = { linkId: linkId.toLowerCase(), admitSig: admitSig.toLowerCase() }
+        }
       }
     } else if (input.type === 'group_renamed') {
       string(input.newName, 'newName', 1024, true)
