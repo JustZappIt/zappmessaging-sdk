@@ -311,7 +311,8 @@ internal class IPCBridge {
             lastMessage = data["lastMessage"]?.jsonPrimitive?.contentOrNull,
             lastMessageTimestamp = data["lastMessageTimestamp"]?.jsonPrimitive?.longOrNull,
             createdAt = data["createdAt"]?.jsonPrimitive?.longOrNull ?: System.currentTimeMillis(),
-            isOwner = data["isOwner"]?.jsonPrimitive?.booleanOrNull
+            isOwner = data["isOwner"]?.jsonPrimitive?.booleanOrNull,
+            removedAt = data["removedAt"]?.jsonPrimitive?.longOrNull
         )
     }
 

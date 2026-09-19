@@ -95,6 +95,27 @@ public final class ZappMessagingSDK: ObservableObject {
     /// Emitted whenever direct-chat inbound push capabilities change.
     public let pushTopicsChanged = PassthroughSubject<Void, Never>()
 
+    /// A request this device made to join through a link changed state.
+    public let groupJoinUpdated = PassthroughSubject<ZMGroupJoinUpdate, Never>()
+
+    /// Owner: someone asked to join through a link that needs approval.
+    public let groupJoinRequestReceived = PassthroughSubject<ZMGroupJoinApprovalRequest, Never>()
+
+    /// Owner: someone joined through the invite link.
+    public let groupLinkMemberJoined = PassthroughSubject<(conversationId: String, memberKey: String, memberName: String), Never>()
+
+    /// Owner: a link switched itself to owner approval.
+    public let groupLinkApprovalSwitched = PassthroughSubject<(conversationId: String, reason: String), Never>()
+
+    /// The owner removed someone else.
+    public let memberRemoved = PassthroughSubject<(conversationId: String, removedKey: String), Never>()
+
+    /// The owner removed us from a group.
+    public let removedFromGroup = PassthroughSubject<String, Never>()
+
+    /// A group moved to a new secret. Nothing changes for the UI.
+    public let groupRekeyed = PassthroughSubject<String, Never>()
+
     /// Failures that arrive asynchronously, after the initiating request has
     /// already returned. Hosts should surface these; logging alone makes a
     /// queued or persistence failure indistinguishable from success in the UI.
@@ -403,6 +424,116 @@ public final class ZappMessagingSDK: ObservableObject {
         }
         _ = try await ipcBridge.sendRequest(type: "conversation.add_member", payload: payload)
         await refreshConversationsAfterMutation(.addMember)
+    }
+
+    /// Owner only: remove a member for good. The group moves to a new secret
+    /// the removed member never sees, so they neither send nor receive in it.
+    /// - Parameter resetLink: also reset the group's invite link, if it has one
+    @discardableResult
+    public func removeMember(conversationId: String, publicKey: String, resetLink: Bool = true) async throws -> ZMRemoveMemberResult {
+        let response = try await ipcBridge.sendRequest(type: "conversation.remove_member", payload: [
+            "conversationId": conversationId,
+            "publicKey": publicKey,
+            "resetLink": resetLink
+        ])
+        await refreshConversationsAfterMutation(.removeMember)
+        return ZMRemoveMemberResult(
+            participants: response["participants"] as? [String] ?? [],
+            olderMemberCount: zmInt(response["olderMemberCount"]) ?? 0
+        )
+    }
+
+    /// Owner: how many members' apps do not understand removal yet.
+    public func olderMemberCount(conversationId: String) async throws -> Int {
+        let response = try await ipcBridge.sendRequest(type: "conversation.removal_status", payload: ["conversationId": conversationId])
+        return zmInt(response["olderMemberCount"]) ?? 0
+    }
+
+    // MARK: - Group invite links
+
+    /// Owner: the group's invite link, with state `.none` when there is none.
+    public func groupLink(conversationId: String) async throws -> ZMGroupLinkInfo {
+        ZMParse.groupLink(from: try await ipcBridge.sendRequest(type: "group_link.get", payload: ["conversationId": conversationId]))
+    }
+
+    /// Owner: turn the link on, creating it when there is none.
+    public func enableGroupLink(conversationId: String, options: ZMGroupLinkOptions = ZMGroupLinkOptions()) async throws -> ZMGroupLinkInfo {
+        ZMParse.groupLink(from: try await ipcBridge.sendRequest(
+            type: "group_link.enable", payload: ZMParse.groupLinkPayload(conversationId: conversationId, options: options)))
+    }
+
+    /// Owner: change expiry, join limit, name or approval.
+    public func updateGroupLink(conversationId: String, options: ZMGroupLinkOptions) async throws -> ZMGroupLinkInfo {
+        ZMParse.groupLink(from: try await ipcBridge.sendRequest(
+            type: "group_link.update", payload: ZMParse.groupLinkPayload(conversationId: conversationId, options: options)))
+    }
+
+    /// Owner: a new link; the old one stops working.
+    public func resetGroupLink(conversationId: String) async throws -> ZMGroupLinkInfo {
+        ZMParse.groupLink(from: try await ipcBridge.sendRequest(type: "group_link.reset", payload: ["conversationId": conversationId]))
+    }
+
+    /// Owner: turn the link off. Turning it on again brings back the same link.
+    public func disableGroupLink(conversationId: String) async throws -> ZMGroupLinkInfo {
+        ZMParse.groupLink(from: try await ipcBridge.sendRequest(type: "group_link.disable", payload: ["conversationId": conversationId]))
+    }
+
+    /// Owner: requests waiting for approval.
+    public func groupJoinRequests(conversationId: String) async throws -> [ZMGroupJoinApprovalRequest] {
+        let response = try await ipcBridge.sendRequest(type: "group_link.requests", payload: ["conversationId": conversationId])
+        let items = response["requests"] as? [[String: Any]] ?? []
+        return items.compactMap { ZMParse.approvalRequest(conversationId: conversationId, from: $0) }
+    }
+
+    /// Owner: let a waiting person in. Returns false when the group is full.
+    @discardableResult
+    public func approveGroupJoinRequest(conversationId: String, joinerKey: String) async throws -> Bool {
+        let response = try await ipcBridge.sendRequest(type: "group_link.approve", payload: [
+            "conversationId": conversationId,
+            "joinerKey": joinerKey
+        ])
+        await refreshConversationsAfterMutation(.approveJoin)
+        return response["status"] as? String == "admitted"
+    }
+
+    /// Owner: decline a waiting person. They are told, and this link then ignores them.
+    public func declineGroupJoinRequest(conversationId: String, joinerKey: String) async throws {
+        _ = try await ipcBridge.sendRequest(type: "group_link.decline", payload: [
+            "conversationId": conversationId,
+            "joinerKey": joinerKey
+        ])
+    }
+
+    /// What a link says about itself, for a preview. Contacts nobody.
+    public func inspectGroupLink(_ link: String) async throws -> ZMGroupLinkInspection {
+        ZMParse.inspection(from: try await ipcBridge.sendRequest(type: "group_link.inspect", payload: ["link": link]))
+    }
+
+    /// Ask to join through a link. The owner admits when their app is next open.
+    public func joinGroupViaLink(_ link: String, joinerName: String? = nil) async throws -> ZMGroupJoinResult {
+        guard identity != nil else { throw ZMError.identityNotFound }
+        var payload: [String: Any] = ["link": link]
+        if let joinerName { payload["joinerName"] = joinerName }
+        return ZMParse.joinResult(from: try await ipcBridge.sendRequest(type: "group_link.join", payload: payload))
+    }
+
+    /// Requests this device made, waiting or recently finished.
+    public func groupJoinStatus() async throws -> [ZMGroupJoinUpdate] {
+        let response = try await ipcBridge.sendRequest(type: "group_link.join_status")
+        return (response["requests"] as? [[String: Any]] ?? []).compactMap { ZMParse.joinUpdate(from: $0) }
+    }
+
+    /// Stop waiting on a request.
+    @discardableResult
+    public func cancelGroupJoin(linkId: String) async throws -> Bool {
+        let response = try await ipcBridge.sendRequest(type: "group_link.cancel", payload: ["linkId": linkId])
+        return response["cancelled"] as? Bool ?? false
+    }
+
+    /// Blocked keys, so that link admission never lets a blocked person in.
+    /// Call at start and whenever the block list changes.
+    public func setBlockedKeys(_ keys: [String]) async throws {
+        _ = try await ipcBridge.sendRequest(type: "contacts.set_blocked_keys", payload: ["keys": keys])
     }
     
     // MARK: - Message Management
@@ -747,6 +878,48 @@ public final class ZappMessagingSDK: ObservableObject {
                 refreshConversationsAfterEvent(.groupRenamed)
             }
             
+        case "group_link.join_updated":
+            if let update = ZMParse.joinUpdate(from: payload) {
+                groupJoinUpdated.send(update)
+            }
+
+        case "group_link.request_received":
+            if let conversationId = payload["conversationId"] as? String,
+               let request = ZMParse.approvalRequest(conversationId: conversationId, from: payload) {
+                groupJoinRequestReceived.send(request)
+            }
+
+        case "group_link.member_joined":
+            if let conversationId = payload["conversationId"] as? String,
+               let memberKey = payload["memberKey"] as? String {
+                let memberName = payload["memberName"] as? String ?? String(memberKey.prefix(8))
+                groupLinkMemberJoined.send((conversationId: conversationId, memberKey: memberKey, memberName: memberName))
+                refreshConversationsAfterEvent(.linkMemberJoined)
+            }
+
+        case "group_link.approval_switched":
+            if let conversationId = payload["conversationId"] as? String {
+                groupLinkApprovalSwitched.send((conversationId: conversationId, reason: payload["reason"] as? String ?? ""))
+            }
+
+        case "conversation.member_removed":
+            if let conversationId = payload["conversationId"] as? String,
+               let removedKey = payload["removedKey"] as? String {
+                memberRemoved.send((conversationId: conversationId, removedKey: removedKey))
+                refreshConversationsAfterEvent(.memberRemoved)
+            }
+
+        case "conversation.removed_from_group":
+            if let conversationId = payload["conversationId"] as? String {
+                removedFromGroup.send(conversationId)
+                refreshConversationsAfterEvent(.removedFromGroup)
+            }
+
+        case "conversation.rekeyed":
+            if let conversationId = payload["conversationId"] as? String {
+                groupRekeyed.send(conversationId)
+            }
+
         case "conversation.member_added":
             if let conversationId = payload["conversationId"] as? String,
                let newMemberKey = payload["newMemberKey"] as? String {

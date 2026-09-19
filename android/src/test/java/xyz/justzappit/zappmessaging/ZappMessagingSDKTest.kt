@@ -23,6 +23,13 @@ import xyz.justzappit.zappmessaging.core.BareWorkletManager
 import xyz.justzappit.zappmessaging.core.IPCBridge
 import xyz.justzappit.zappmessaging.core.IPCTransport
 import xyz.justzappit.zappmessaging.models.ZMError
+import xyz.justzappit.zappmessaging.models.ZMGroupJoinApprovalRequest
+import xyz.justzappit.zappmessaging.models.ZMGroupJoinRequestStatus
+import xyz.justzappit.zappmessaging.models.ZMGroupJoinStatus
+import xyz.justzappit.zappmessaging.models.ZMGroupJoinUpdate
+import xyz.justzappit.zappmessaging.models.ZMGroupLinkApproval
+import xyz.justzappit.zappmessaging.models.ZMGroupLinkOptions
+import xyz.justzappit.zappmessaging.models.ZMGroupLinkState
 import java.nio.charset.StandardCharsets
 
 /**
@@ -37,11 +44,13 @@ class ZappMessagingSDKTest {
         val responses = mutableMapOf<String, () -> JsonObject>()
         val failures = mutableSetOf<String>()
         val parked = mutableListOf<Pair<String, String>>() // (id, type)
+        val sent = mutableListOf<Pair<String, JsonObject>>() // (type, payload)
 
         override suspend fun sendData(data: ByteArray) {
             val request = Json.parseToJsonElement(String(data, StandardCharsets.UTF_8).trimEnd('\n')).jsonObject
             val id = request["id"]!!.jsonPrimitive.content
             val type = request["type"]!!.jsonPrimitive.content
+            sent += type to (request["payload"]?.jsonObject ?: JsonObject(emptyMap()))
             when {
                 type in failures -> deliver("""{"id":"$id","success":false,"error":{"code":"ERROR","message":"scripted failure"}}""")
                 type in responses -> deliver("""{"id":"$id","success":true,"data":${responses.getValue(type)()}}""")
@@ -248,5 +257,121 @@ class ZappMessagingSDKTest {
         assertEquals(listOf("h1" to "/m/h1.jpg"), downloadComplete)
         assertEquals(listOf("h1"), transferComplete)
         jobs.forEach { it.cancel() }
+    }
+
+    // ── Group invite links and removal ────────────────────────────────────
+
+    private fun signedIn(): Pair<ZappMessagingSDK, ScriptedWorklet> {
+        val (sdk, worklet) = sdkWithScript()
+        worklet.responses["migration.restore_from_seed_phrase"] = { identity("aa") }
+        worklet.responses["conversation.list"] = { conversationList() }
+        worklet.responses["contacts.list"] = { contactList() }
+        return sdk to worklet
+    }
+
+    @Test
+    fun theOwnersLinkIsParsedAndNeverPrinted() = runTest {
+        val (sdk, worklet) = signedIn()
+        worklet.responses["group_link.enable"] = {
+            buildJsonObject {
+                put("conversationId", "g1"); put("state", "active"); put("link", "https://join.justzappit.xyz/g/v1#SECRET")
+                put("linkId", "11"); put("joins", 2); put("maxJoins", 5); put("includeName", false)
+                put("approval", "owner"); put("approvalReason", "rate"); put("pendingRequests", 3)
+            }
+        }
+        val info = sdk.enableGroupLink("g1", ZMGroupLinkOptions(maxJoins = 5, approval = ZMGroupLinkApproval.OWNER, clearExpiry = true))
+
+        assertEquals(ZMGroupLinkState.ACTIVE, info.state)
+        assertEquals(ZMGroupLinkApproval.OWNER, info.approval)
+        assertEquals(5, info.maxJoins)
+        assertEquals(3, info.pendingRequests)
+        assertTrue(!info.toString().contains("SECRET"))
+        val payload = worklet.sent.last { it.first == "group_link.enable" }.second
+        assertEquals("owner", payload["approval"]!!.jsonPrimitive.content)
+        assertEquals("5", payload["maxJoins"]!!.jsonPrimitive.content)
+        assertTrue(payload["expiresAt"] is kotlinx.serialization.json.JsonNull)
+        assertNull(payload["includeName"])
+    }
+
+    @Test
+    fun joiningReportsStatusAndNeedsAnIdentity() = runTest {
+        val (sdk, worklet) = signedIn()
+        try {
+            sdk.joinGroupViaLink("https://join.justzappit.xyz/g/v1#x")
+            fail("joining without an identity must fail")
+        } catch (_: ZMError) {
+        }
+        sdk.restoreFromSeedPhrase("seed", "Name")
+        worklet.responses["group_link.join"] = { buildJsonObject { put("status", "already_member"); put("linkId", "l1"); put("conversationId", "g1") } }
+        val result = sdk.joinGroupViaLink("https://join.justzappit.xyz/g/v1#x", "Ana")
+        assertEquals(ZMGroupJoinRequestStatus.ALREADY_MEMBER, result.status)
+        assertEquals("g1", result.conversationId)
+        assertEquals("Ana", worklet.sent.last().second["joinerName"]!!.jsonPrimitive.content)
+
+        worklet.responses["group_link.join"] = { buildJsonObject { put("status", "something_new") } }
+        assertEquals(ZMGroupJoinRequestStatus.MALFORMED, sdk.joinGroupViaLink("x").status)
+    }
+
+    @Test
+    fun groupLinkAndRemovalEventsReachTheirFlows() = runTest {
+        val (sdk, worklet) = signedIn()
+        val updates = mutableListOf<ZMGroupJoinUpdate>()
+        val requests = mutableListOf<ZMGroupJoinApprovalRequest>()
+        val removed = mutableListOf<String>()
+        val memberRemoved = mutableListOf<Pair<String, String>>()
+        val jobs = listOf(
+            collectInto(this, sdk.groupJoinUpdated, updates),
+            collectInto(this, sdk.groupJoinRequestReceived, requests),
+            collectInto(this, sdk.removedFromGroup, removed),
+            collectInto(this, sdk.memberRemoved, memberRemoved),
+        )
+        worklet.event("group_link.join_updated", buildJsonObject { put("linkId", "l1"); put("status", "pending_approval") })
+        worklet.event("group_link.join_updated", buildJsonObject { put("linkId", "l1"); put("status", "joined"); put("conversationId", "g1") })
+        worklet.event("group_link.request_received", buildJsonObject { put("conversationId", "g1"); put("joinerKey", "cd".repeat(32)); put("joinerName", "Ben"); put("previouslyRemoved", true) })
+        worklet.event("conversation.removed_from_group", buildJsonObject { put("conversationId", "g2") })
+        worklet.event("conversation.member_removed", buildJsonObject { put("conversationId", "g1"); put("removedKey", "ef") })
+
+        assertEquals(listOf(ZMGroupJoinStatus.PENDING_APPROVAL, ZMGroupJoinStatus.JOINED), updates.map { it.status })
+        assertTrue(updates.first().status.isWaiting)
+        assertEquals("g1", updates.last().conversationId)
+        assertEquals("Ben", requests.single().joinerName)
+        assertTrue(requests.single().previouslyRemoved)
+        assertEquals(listOf("g2"), removed)
+        assertEquals(listOf("g1" to "ef"), memberRemoved)
+        jobs.forEach { it.cancel() }
+    }
+
+    @Test
+    fun removingAMemberSendsTheKeyAndReportsOlderMembers() = runTest {
+        val (sdk, worklet) = signedIn()
+        worklet.responses["conversation.remove_member"] = {
+            buildJsonObject {
+                put("success", true); put("olderMemberCount", 2)
+                put("participants", buildJsonArray { add(kotlinx.serialization.json.JsonPrimitive("aa")) })
+            }
+        }
+        val result = sdk.removeMember("g1", "ef".repeat(32), resetLink = false)
+        assertEquals(2, result.olderMemberCount)
+        assertEquals(listOf("aa"), result.participants)
+        val payload = worklet.sent.last { it.first == "conversation.remove_member" }.second
+        assertEquals("false", payload["resetLink"]!!.jsonPrimitive.content)
+        assertTrue("the list refreshes after a removal", worklet.sent.any { it.first == "conversation.list" })
+    }
+
+    @Test
+    fun aRemovedGroupCarriesItsRemovalTime() = runTest {
+        val (sdk, worklet) = signedIn()
+        worklet.responses["conversation.list"] = {
+            buildJsonObject {
+                put("conversations", buildJsonArray {
+                    add(buildJsonObject {
+                        put("id", "g1"); put("type", "group"); put("displayName", "Crew"); put("removedAt", 1234)
+                        put("participantIds", buildJsonArray { })
+                    })
+                })
+            }
+        }
+        sdk.refreshConversations()
+        assertEquals(1234L, sdk.conversations.value.single().removedAt)
     }
 }

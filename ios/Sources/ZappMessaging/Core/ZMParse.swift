@@ -47,7 +47,8 @@ enum ZMParse {
             lastMessage: data["lastMessage"] as? String,
             lastMessageTimestamp: zmDate(data["lastMessageTimestamp"]),
             createdAt: zmDate(data["createdAt"]) ?? Date(),
-            isOwner: data["isOwner"] as? Bool
+            isOwner: data["isOwner"] as? Bool,
+            removedAt: zmDate(data["removedAt"])
         )
     }
 
