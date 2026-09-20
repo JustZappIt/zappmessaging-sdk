@@ -38,6 +38,9 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
     
     /// Whether current user is the group owner
     public let isOwner: Bool?
+
+    /// Set when the group owner removed us: history stays, nothing more flows.
+    public let removedAt: Date?
     
     public init(
         id: String,
@@ -49,7 +52,8 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
         lastMessage: String? = nil,
         lastMessageTimestamp: Date? = nil,
         createdAt: Date = Date(),
-        isOwner: Bool? = nil
+        isOwner: Bool? = nil,
+        removedAt: Date? = nil
     ) {
         self.id = id
         self.type = type
@@ -61,6 +65,7 @@ public struct ZMConversation: Codable, Identifiable, Equatable, Sendable {
         self.lastMessageTimestamp = lastMessageTimestamp
         self.createdAt = createdAt
         self.isOwner = isOwner
+        self.removedAt = removedAt
     }
 }
 

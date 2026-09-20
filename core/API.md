@@ -87,7 +87,7 @@ responses instead of failing cleanly.
   "success": true,
   "data": {
     "protocolVersion": "1.0",
-    "features": ["messaging", "groups", "media", "blind_peer", "contacts", "payments", "read_receipts"],
+    "features": ["messaging", "groups", "media", "blind_peer", "contacts", "payments", "read_receipts", "group_links"],
     "compatible": true
   }
 }
@@ -260,6 +260,21 @@ Remove a contact.
   }
 }
 ```
+
+#### `contacts.set_blocked_keys`
+The keys the app has blocked. Group link admission never lets a blocked key in,
+and never tells them why. Send at start and whenever the block list changes.
+
+**Request:**
+```json
+{
+  "type": "contacts.set_blocked_keys",
+  "payload": { "keys": ["def456..."] }
+}
+```
+
+**Response:** `{ "success": true }`. Error `INVALID_KEYS` for anything that is
+not a 64 character hex key.
 
 #### `contacts.updateWalletAddress`
 Set the wallet address on an existing contact. Returns
@@ -478,6 +493,45 @@ announces them to the existing members.
 ```
 
 An already-present member yields `{ "success": true, "alreadyMember": true }`.
+
+#### `conversation.remove_member`
+Owner only. Removes a member for good, in two stages. First a
+`group_member_removed` record goes into the core the removed member can still
+read, and everyone drops them. Then the group moves to a new secret, sent only
+to remaining members, so the removed member neither receives nor sends
+anything more. Members whose app has not announced support yet get the new
+secret once it does, and see no new messages until then.
+
+**Request:**
+```json
+{
+  "type": "conversation.remove_member",
+  "payload": { "conversationId": "conv-abc123", "publicKey": "ghi789...", "resetLink": true }
+}
+```
+
+`resetLink` (default true) also resets the group's invite link, if it has one.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": { "success": true, "participants": ["def456..."], "olderMemberCount": 0 }
+}
+```
+
+Errors: `NOT_GROUP_OWNER`, `NOT_A_MEMBER`, `INVALID_KEY`, `CONVERSATION_NOT_FOUND`.
+
+#### `conversation.removal_status`
+How many members' apps have not announced that they understand removal.
+
+**Request:** `{ "type": "conversation.removal_status", "payload": { "conversationId": "conv-abc123" } }`
+
+**Response:** `{ "success": true, "data": { "olderMemberCount": 1 } }`
+
+A group the owner removed us from carries `removedAt` (epoch millis) in
+`conversation.list` and `conversation.get`. Sending into it fails with
+`REMOVED_FROM_GROUP`.
 
 #### `conversation.get_messages`
 Paginated message history. Unlike `message.list` this reports totals, so it is
@@ -1004,6 +1058,66 @@ The response to `platform.http_response` is `{ "accepted": true }`, or
 (already timed out, or an unknown id). `requestId` is required; omitting it is
 an error.
 
+### 11. Group Invite Links
+
+A link is `https://join.justzappit.xyz/g/v1#<payload>`. The payload carries a
+16 byte bearer secret and a random rendezvous key; never the group secret or
+anyone's identity. The format, the signatures and the shared test vectors are
+specified in `core/lib/group-link.js` and `test/group-link-vectors.json`.
+
+The link string is a bearer secret. It leaves the worklet only in the owner's
+`get`, `enable`, `update` and `reset` results. Never log it.
+
+Owner requests (errors `NOT_GROUP_OWNER`, `CONVERSATION_NOT_FOUND`,
+`INVALID_OPTIONS`):
+
+| Type | Payload | Result |
+|---|---|---|
+| `group_link.get` | `conversationId` | link info, or `{ "state": "none" }` |
+| `group_link.enable` | `conversationId`, optional `expiresAt` (ms or null), `maxJoins` (or null), `includeName`, `approval` (`auto` or `owner`) | link info |
+| `group_link.update` | same options | link info |
+| `group_link.reset` | `conversationId` | link info for a new link; the old one answers `inactive` for 30 days |
+| `group_link.disable` | `conversationId` | link info with `state: "off"` |
+| `group_link.requests` | `conversationId` | `{ "requests": [{ joinerKey, joinerName, requestedAt, receivedAt, previouslyRemoved }] }` |
+| `group_link.approve` | `conversationId`, `joinerKey` | `{ "status": "admitted" }` or `{ "status": "full" }` |
+| `group_link.decline` | `conversationId`, `joinerKey` | `{ "status": "declined" }` |
+
+Link info:
+
+```json
+{
+  "conversationId": "conv-abc123",
+  "state": "active",
+  "link": "https://join.justzappit.xyz/g/v1#AQE...",
+  "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+  "createdAt": 1789800000000,
+  "expiresAt": null,
+  "maxJoins": null,
+  "joins": 0,
+  "includeName": true,
+  "approval": "auto",
+  "approvalReason": null,
+  "pendingRequests": 0
+}
+```
+
+`approvalReason` is `"rate"` after the link switched itself to owner approval,
+which happens after 20 joins in an hour. Link joins stop at 100 members.
+
+Joiner requests:
+
+| Type | Payload | Result |
+|---|---|---|
+| `group_link.inspect` | `link` | `{ status, version, nameHint, expiresAt, linkId }`. `status` is `ok`, `expired`, `malformed`, `unsupported_version` or `newer_format`. Contacts nobody |
+| `group_link.join` | `link`, optional `joinerName` | `{ status, linkId, conversationId }`. `status` is `requested`, `already_requested`, `already_member` (with `conversationId`), or one of the inspect failures. Needs an identity (`NO_IDENTITY`) |
+| `group_link.join_status` | none | `{ "requests": [{ linkId, status, nameHint, createdAt, conversationId }] }` |
+| `group_link.cancel` | `linkId` | `{ "cancelled": true }` |
+
+A join request goes to the blind peer mailbox addressed to the link's
+rendezvous key, under a throwaway envelope key. The owner's app admits it the
+next time it drains its mailboxes: at start, on resume, on every heartbeat,
+and every 10 seconds for 10 minutes after the owner touches the link.
+
 ## Push Events
 
 Events pushed from Core to UI:
@@ -1020,6 +1134,18 @@ Triggered when a direct or group invite is received.
   "timestamp": 1234567890
 }
 ```
+
+### Group invite link events
+
+| Type | Payload | Meaning |
+|---|---|---|
+| `group_link.join_updated` | `linkId`, `status`, `conversationId` | A request this device made changed state: `pending_approval`, `joined` (with `conversationId`), `inactive`, `expired`, `full` or `declined` |
+| `group_link.request_received` | `conversationId`, `joinerKey`, `joinerName`, `previouslyRemoved` | Owner: a request waits for approval |
+| `group_link.member_joined` | `conversationId`, `memberKey`, `memberName` | Owner: someone joined through the link. `conversation.member_added` follows too |
+| `group_link.approval_switched` | `conversationId`, `reason` | Owner: the link switched itself to owner approval |
+| `conversation.member_removed` | `conversationId`, `removedKey` | The owner removed someone else |
+| `conversation.removed_from_group` | `conversationId` | The owner removed us. History stays, nothing more flows |
+| `conversation.rekeyed` | `conversationId` | The group moved to a new secret. Nothing changes for the UI |
 
 ### `conversation.member_left`
 Triggered when a member leaves a group.

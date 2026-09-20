@@ -151,6 +151,34 @@ class ZappMessagingSDK internal constructor(
     /** Emitted whenever direct-chat inbound push capabilities change. */
     val pushTopicsChanged: SharedFlow<Unit> = _pushTopicsChanged.asSharedFlow()
 
+    private val _groupJoinUpdated = MutableSharedFlow<ZMGroupJoinUpdate>(extraBufferCapacity = 16)
+    /** A request this device made to join through a link changed state. */
+    val groupJoinUpdated: SharedFlow<ZMGroupJoinUpdate> = _groupJoinUpdated.asSharedFlow()
+
+    private val _groupJoinRequestReceived = MutableSharedFlow<ZMGroupJoinApprovalRequest>(extraBufferCapacity = 16)
+    /** Owner: someone asked to join through a link that needs approval. */
+    val groupJoinRequestReceived: SharedFlow<ZMGroupJoinApprovalRequest> = _groupJoinRequestReceived.asSharedFlow()
+
+    private val _groupLinkMemberJoined = MutableSharedFlow<Triple<String, String, String>>(extraBufferCapacity = 16)
+    /** Owner: (conversationId, memberKey, memberName) of someone who joined through the link. */
+    val groupLinkMemberJoined: SharedFlow<Triple<String, String, String>> = _groupLinkMemberJoined.asSharedFlow()
+
+    private val _groupLinkApprovalSwitched = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
+    /** Owner: (conversationId, reason) when a link switched itself to owner approval. */
+    val groupLinkApprovalSwitched: SharedFlow<Pair<String, String>> = _groupLinkApprovalSwitched.asSharedFlow()
+
+    private val _memberRemoved = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
+    /** (conversationId, removedKey) when the owner removed someone else. */
+    val memberRemoved: SharedFlow<Pair<String, String>> = _memberRemoved.asSharedFlow()
+
+    private val _removedFromGroup = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    /** conversationId of a group the owner removed us from. */
+    val removedFromGroup: SharedFlow<String> = _removedFromGroup.asSharedFlow()
+
+    private val _groupRekeyed = MutableSharedFlow<String>(extraBufferCapacity = 16)
+    /** conversationId of a group that moved to a new secret. Nothing changes for the UI. */
+    val groupRekeyed: SharedFlow<String> = _groupRekeyed.asSharedFlow()
+
     // ── Private Components ──────────────────────────────────────────────
 
     private var applicationContext: Context? = null
@@ -473,6 +501,173 @@ class ZappMessagingSDK internal constructor(
         }
         ipcBridge.sendRequest("conversation.add_member", payload)
         refreshConversations()
+    }
+
+    /**
+     * Owner only: remove a member for good. The group moves to a new secret
+     * the removed member never sees, so they neither send nor receive in it.
+     *
+     * @param resetLink also reset the group's invite link, if it has one
+     */
+    suspend fun removeMember(conversationId: String, publicKey: String, resetLink: Boolean = true): ZMRemoveMemberResult {
+        val payload = buildJsonObject {
+            put("conversationId", conversationId)
+            put("publicKey", publicKey)
+            put("resetLink", resetLink)
+        }
+        val response = ipcBridge.sendRequest("conversation.remove_member", payload)
+        refreshConversations()
+        return ZMRemoveMemberResult(
+            participants = response["participants"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
+            olderMemberCount = response["olderMemberCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        )
+    }
+
+    /** Owner: how many members' apps do not understand removal yet. */
+    suspend fun olderMemberCount(conversationId: String): Int {
+        val payload = buildJsonObject { put("conversationId", conversationId) }
+        return ipcBridge.sendRequest("conversation.removal_status", payload)["olderMemberCount"]?.jsonPrimitive?.intOrNull ?: 0
+    }
+
+    // ── Group invite links ──────────────────────────────────────────────
+
+    /** Owner: the group's invite link, with state NONE when there is none. */
+    suspend fun getGroupLink(conversationId: String): ZMGroupLinkInfo =
+        parseGroupLink(ipcBridge.sendRequest("group_link.get", buildJsonObject { put("conversationId", conversationId) }))
+
+    /** Owner: turn the link on, creating it when there is none. */
+    suspend fun enableGroupLink(conversationId: String, options: ZMGroupLinkOptions = ZMGroupLinkOptions()): ZMGroupLinkInfo =
+        parseGroupLink(ipcBridge.sendRequest("group_link.enable", groupLinkPayload(conversationId, options)))
+
+    /** Owner: change expiry, join limit, name or approval. */
+    suspend fun updateGroupLink(conversationId: String, options: ZMGroupLinkOptions): ZMGroupLinkInfo =
+        parseGroupLink(ipcBridge.sendRequest("group_link.update", groupLinkPayload(conversationId, options)))
+
+    /** Owner: a new link; the old one stops working. */
+    suspend fun resetGroupLink(conversationId: String): ZMGroupLinkInfo =
+        parseGroupLink(ipcBridge.sendRequest("group_link.reset", buildJsonObject { put("conversationId", conversationId) }))
+
+    /** Owner: turn the link off. Turning it on again brings back the same link. */
+    suspend fun disableGroupLink(conversationId: String): ZMGroupLinkInfo =
+        parseGroupLink(ipcBridge.sendRequest("group_link.disable", buildJsonObject { put("conversationId", conversationId) }))
+
+    /** Owner: requests waiting for approval. */
+    suspend fun groupJoinRequests(conversationId: String): List<ZMGroupJoinApprovalRequest> {
+        val response = ipcBridge.sendRequest("group_link.requests", buildJsonObject { put("conversationId", conversationId) })
+        return response["requests"]?.jsonArray?.mapNotNull { parseApprovalRequest(conversationId, it.jsonObject) } ?: emptyList()
+    }
+
+    /** Owner: let a waiting person in. Returns false when the group is full. */
+    suspend fun approveGroupJoinRequest(conversationId: String, joinerKey: String): Boolean {
+        val response = ipcBridge.sendRequest("group_link.approve", buildJsonObject {
+            put("conversationId", conversationId)
+            put("joinerKey", joinerKey)
+        })
+        refreshConversations()
+        return response["status"]?.jsonPrimitive?.contentOrNull == "admitted"
+    }
+
+    /** Owner: decline a waiting person. They are told, and this link then ignores them. */
+    suspend fun declineGroupJoinRequest(conversationId: String, joinerKey: String) {
+        ipcBridge.sendRequest("group_link.decline", buildJsonObject {
+            put("conversationId", conversationId)
+            put("joinerKey", joinerKey)
+        })
+    }
+
+    /** What a link says about itself, for a preview. Contacts nobody. */
+    suspend fun inspectGroupLink(link: String): ZMGroupLinkInspection {
+        val response = ipcBridge.sendRequest("group_link.inspect", buildJsonObject { put("link", link) })
+        return ZMGroupLinkInspection(
+            status = ZMGroupLinkInspectStatus.fromRaw(response["status"]?.jsonPrimitive?.contentOrNull),
+            nameHint = response["nameHint"]?.jsonPrimitive?.contentOrNull,
+            expiresAt = response["expiresAt"]?.jsonPrimitive?.longOrNull,
+            linkId = response["linkId"]?.jsonPrimitive?.contentOrNull,
+        )
+    }
+
+    /** Ask to join through a link. The owner admits when their app is next open. */
+    suspend fun joinGroupViaLink(link: String, joinerName: String? = null): ZMGroupJoinResult {
+        requireIdentity()
+        val response = ipcBridge.sendRequest("group_link.join", buildJsonObject {
+            put("link", link)
+            joinerName?.let { put("joinerName", it) }
+        })
+        return ZMGroupJoinResult(
+            status = ZMGroupJoinRequestStatus.fromRaw(response["status"]?.jsonPrimitive?.contentOrNull),
+            linkId = response["linkId"]?.jsonPrimitive?.contentOrNull,
+            conversationId = response["conversationId"]?.jsonPrimitive?.contentOrNull,
+        )
+    }
+
+    /** Requests this device made, waiting or recently finished. */
+    suspend fun groupJoinStatus(): List<ZMGroupJoinUpdate> {
+        val response = ipcBridge.sendRequest("group_link.join_status")
+        return response["requests"]?.jsonArray?.mapNotNull { element ->
+            val obj = element.jsonObject
+            val linkId = obj["linkId"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            ZMGroupJoinUpdate(
+                linkId = linkId,
+                status = ZMGroupJoinStatus.fromRaw(obj["status"]?.jsonPrimitive?.contentOrNull),
+                conversationId = obj["conversationId"]?.jsonPrimitive?.contentOrNull,
+                nameHint = obj["nameHint"]?.jsonPrimitive?.contentOrNull,
+            )
+        } ?: emptyList()
+    }
+
+    /** Stop waiting on a request. */
+    suspend fun cancelGroupJoin(linkId: String): Boolean =
+        ipcBridge.sendRequest("group_link.cancel", buildJsonObject { put("linkId", linkId) })["cancelled"]
+            ?.jsonPrimitive?.booleanOrNull ?: false
+
+    /**
+     * Blocked keys, so that link admission never lets a blocked person in.
+     * Call at start and whenever the block list changes.
+     */
+    suspend fun setBlockedKeys(keys: List<String>) {
+        ipcBridge.sendRequest("contacts.set_blocked_keys", buildJsonObject {
+            put("keys", JsonArray(keys.map { JsonPrimitive(it) }))
+        })
+    }
+
+    private fun groupLinkPayload(conversationId: String, options: ZMGroupLinkOptions) = buildJsonObject {
+        put("conversationId", conversationId)
+        when {
+            options.clearExpiry -> put("expiresAt", JsonNull)
+            options.expiresAt != null -> put("expiresAt", options.expiresAt)
+        }
+        when {
+            options.clearMaxJoins -> put("maxJoins", JsonNull)
+            options.maxJoins != null -> put("maxJoins", options.maxJoins)
+        }
+        options.includeName?.let { put("includeName", it) }
+        options.approval?.let { put("approval", it.rawValue) }
+    }
+
+    private fun parseGroupLink(data: JsonObject): ZMGroupLinkInfo = ZMGroupLinkInfo(
+        conversationId = data["conversationId"]?.jsonPrimitive?.contentOrNull ?: "",
+        state = ZMGroupLinkState.fromRaw(data["state"]?.jsonPrimitive?.contentOrNull),
+        link = data["link"]?.jsonPrimitive?.contentOrNull,
+        linkId = data["linkId"]?.jsonPrimitive?.contentOrNull,
+        createdAt = data["createdAt"]?.jsonPrimitive?.longOrNull,
+        expiresAt = data["expiresAt"]?.jsonPrimitive?.longOrNull,
+        maxJoins = data["maxJoins"]?.jsonPrimitive?.intOrNull,
+        joins = data["joins"]?.jsonPrimitive?.intOrNull ?: 0,
+        includeName = data["includeName"]?.jsonPrimitive?.booleanOrNull ?: true,
+        approval = ZMGroupLinkApproval.fromRaw(data["approval"]?.jsonPrimitive?.contentOrNull),
+        approvalReason = data["approvalReason"]?.jsonPrimitive?.contentOrNull,
+        pendingRequests = data["pendingRequests"]?.jsonPrimitive?.intOrNull ?: 0,
+    )
+
+    private fun parseApprovalRequest(conversationId: String, obj: JsonObject): ZMGroupJoinApprovalRequest? {
+        val joinerKey = obj["joinerKey"]?.jsonPrimitive?.contentOrNull ?: return null
+        return ZMGroupJoinApprovalRequest(
+            conversationId = conversationId,
+            joinerKey = joinerKey,
+            joinerName = obj["joinerName"]?.jsonPrimitive?.contentOrNull ?: joinerKey.take(8),
+            requestedAt = obj["requestedAt"]?.jsonPrimitive?.longOrNull,
+            previouslyRemoved = obj["previouslyRemoved"]?.jsonPrimitive?.booleanOrNull ?: false,
+        )
     }
 
     // ── Message Management ──────────────────────────────────────────────
@@ -983,6 +1178,54 @@ class ZappMessagingSDK internal constructor(
                     if (conversationId != null && newMemberKey != null) {
                         _memberAdded.tryEmit(Triple(conversationId, newMemberKey, newMemberName))
                     }
+                }
+
+                "group_link.join_updated" -> {
+                    val linkId = payload["linkId"]?.jsonPrimitive?.contentOrNull
+                    if (linkId != null) {
+                        _groupJoinUpdated.tryEmit(
+                            ZMGroupJoinUpdate(
+                                linkId = linkId,
+                                status = ZMGroupJoinStatus.fromRaw(payload["status"]?.jsonPrimitive?.contentOrNull),
+                                conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull,
+                            )
+                        )
+                    }
+                }
+
+                "group_link.request_received" -> {
+                    val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
+                    val request = conversationId?.let { parseApprovalRequest(it, payload) }
+                    if (request != null) _groupJoinRequestReceived.tryEmit(request)
+                }
+
+                "group_link.member_joined" -> {
+                    val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
+                    val memberKey = payload["memberKey"]?.jsonPrimitive?.contentOrNull
+                    val memberName = payload["memberName"]?.jsonPrimitive?.contentOrNull ?: memberKey?.take(8) ?: ""
+                    if (conversationId != null && memberKey != null) {
+                        _groupLinkMemberJoined.tryEmit(Triple(conversationId, memberKey, memberName))
+                    }
+                }
+
+                "group_link.approval_switched" -> {
+                    val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
+                    val reason = payload["reason"]?.jsonPrimitive?.contentOrNull ?: ""
+                    if (conversationId != null) _groupLinkApprovalSwitched.tryEmit(conversationId to reason)
+                }
+
+                "conversation.member_removed" -> {
+                    val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
+                    val removedKey = payload["removedKey"]?.jsonPrimitive?.contentOrNull
+                    if (conversationId != null && removedKey != null) _memberRemoved.tryEmit(conversationId to removedKey)
+                }
+
+                "conversation.removed_from_group" -> {
+                    payload["conversationId"]?.jsonPrimitive?.contentOrNull?.let { _removedFromGroup.tryEmit(it) }
+                }
+
+                "conversation.rekeyed" -> {
+                    payload["conversationId"]?.jsonPrimitive?.contentOrNull?.let { _groupRekeyed.tryEmit(it) }
                 }
 
                 "message.status" -> {

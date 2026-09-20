@@ -11,7 +11,10 @@ class InvalidPeerRecord extends Error {
 const MAX_CONTENT = 256 * 1024
 const MAX_THUMBNAIL = 1024 * 1024
 const MAX_RECORD = MAX_THUMBNAIL + 2 * MAX_CONTENT
-const GROUP_CONTROLS = new Set(['group_invite', 'group_leave', 'group_deleted', 'group_renamed', 'group_member_added'])
+const GROUP_CONTROLS = new Set(['group_invite', 'group_leave', 'group_deleted', 'group_renamed', 'group_member_added', 'group_member_removed'])
+// Owner only controls: receivers accept them from the group's creator alone.
+const CREATOR_CONTROLS = new Set(['group_invite', 'group_member_added', 'group_deleted', 'group_member_removed'])
+const MAX_CAPS = 16
 function object (value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
@@ -103,10 +106,34 @@ function normalizePeerRecord (input, peer) {
         record.groupId = key(input.groupId, 'groupId', true)
         record.creatorKey = key(input.creatorKey, 'creatorKey', true)
         record.participants = keys(input.participants, 'participants')
+        // Set when the owner admitted us through a group invite link. Older
+        // builds never receive it; the admission signature is checked later.
+        if (input.viaLink != null) {
+          if (!object(input.viaLink)) throw new InvalidPeerRecord('viaLink')
+          const { linkId, admitSig } = input.viaLink
+          if (typeof linkId !== 'string' || !/^[0-9a-fA-F]{32}$/.test(linkId)) throw new InvalidPeerRecord('viaLink.linkId')
+          if (typeof admitSig !== 'string' || !/^[0-9a-fA-F]{128}$/.test(admitSig)) throw new InvalidPeerRecord('viaLink.admitSig')
+          record.viaLink = { linkId: linkId.toLowerCase(), admitSig: admitSig.toLowerCase() }
+        }
+        // Set when the owner gave the group a new secret: the topic of the
+        // secret it replaces, and the new epoch. Older builds drop both.
+        if (input.rekeyOf != null) {
+          record.rekeyOf = key(input.rekeyOf, 'rekeyOf', true)
+          if (!Number.isSafeInteger(input.groupEpoch) || input.groupEpoch < 1 || input.groupEpoch > 0x7fffffff) {
+            throw new InvalidPeerRecord('groupEpoch')
+          }
+          record.groupEpoch = input.groupEpoch
+        }
       }
     } else if (input.type === 'group_renamed') {
       string(input.newName, 'newName', 1024, true)
       record.newName = input.newName
+    } else if (input.type === 'group_member_removed') {
+      record.removedKey = key(input.removedKey, 'removedKey', true)
+    } else if (input.type === '__caps') {
+      if (!Array.isArray(input.features) || input.features.length > MAX_CAPS) throw new InvalidPeerRecord('features')
+      for (const feature of input.features) identifier(feature, 'feature', true)
+      record.features = [...new Set(input.features)]
     } else if (input.type === 'group_member_added') {
       record.newMemberKey = key(input.newMemberKey, 'newMemberKey', true)
       record.updatedParticipants = keys(input.updatedParticipants, 'updatedParticipants')
@@ -136,4 +163,4 @@ function controlKey (record, peer) {
   // operation from transport redelivery after an intervening state change.
   return crypto.createHash('sha256').update(JSON.stringify([peer, record.id])).digest('hex')
 }
-module.exports = { InvalidPeerRecord, normalizePeerRecord, validateMessage, controlKey, GROUP_CONTROLS, MEDIA_DESCRIPTOR_FIELDS }
+module.exports = { InvalidPeerRecord, normalizePeerRecord, validateMessage, controlKey, GROUP_CONTROLS, CREATOR_CONTROLS, MEDIA_DESCRIPTOR_FIELDS }

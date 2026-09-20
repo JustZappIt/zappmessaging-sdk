@@ -1,0 +1,175 @@
+{
+  "about": "Group invite link v1 vectors. Normative for every implementation (SDK, landing page). See docs/group-invite-links design section 1.",
+  "inputs": {
+    "secretHex": "000102030405060708090a0b0c0d0e0f",
+    "rendezvousSeedHex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "joinerSeedHex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "ownerSeedHex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "groupIdHex": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "derived": {
+    "linkIdHex": "c096cd088d6ad169ccc50645be0a96f8",
+    "proofPublicKeyHex": "7bda9dca9a4f5184fe97efc1089bdd7ed6c0a81aa88c77284784dfc64e97b979",
+    "topicHex": "fcddfc1f59730df1b661d645a6bdb29da2b4a36897150a3a3dd74fa1446f9d00",
+    "rendezvousPublicKeyHex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "joinerPublicKeyHex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "ownerPublicKeyHex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce"
+  },
+  "links": [
+    {
+      "id": "minimal",
+      "nameHint": null,
+      "expiresAt": null,
+      "payloadHex": "0100000102030405060708090a0b0c0d0e0fd04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873711efae52",
+      "link": "https://join.justzappit.xyz/g/v1#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "handoff": "xyz.justzappit.zapp://g/v1/AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S"
+    },
+    {
+      "id": "with_name",
+      "nameHint": "Hiking Crew",
+      "expiresAt": null,
+      "payloadHex": "0101000102030405060708090a0b0c0d0e0fd04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370b48696b696e672043726577a5ba6594",
+      "link": "https://join.justzappit.xyz/g/v1#AQEAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcLSGlraW5nIENyZXelumWU",
+      "handoff": "xyz.justzappit.zapp://g/v1/AQEAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcLSGlraW5nIENyZXelumWU"
+    },
+    {
+      "id": "with_expiry_and_name",
+      "nameHint": "Café Crew",
+      "expiresAt": 1790000000,
+      "payloadHex": "0103000102030405060708090a0b0c0d0e0fd04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787376ab13b800a436166c3a920437265772d3bfe7c",
+      "link": "https://join.justzappit.xyz/g/v1#AQMAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzdqsTuACkNhZsOpIENyZXctO_58",
+      "handoff": "xyz.justzappit.zapp://g/v1/AQMAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzdqsTuACkNhZsOpIENyZXctO_58"
+    },
+    {
+      "id": "with_name_A",
+      "nameHint": "A",
+      "expiresAt": null,
+      "payloadHex": "0101000102030405060708090a0b0c0d0e0fd04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737014143fdf877",
+      "link": "https://join.justzappit.xyz/g/v1#AQEAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcBQUP9-Hc",
+      "handoff": "xyz.justzappit.zapp://g/v1/AQEAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcBQUP9-Hc"
+    },
+    {
+      "id": "with_expiry",
+      "nameHint": null,
+      "expiresAt": 4102444800,
+      "payloadHex": "0102000102030405060708090a0b0c0d0e0fd04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737f4865700f22ced85",
+      "link": "https://join.justzappit.xyz/g/v1#AQIAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzf0hlcA8izthQ",
+      "handoff": "xyz.justzappit.zapp://g/v1/AQIAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzf0hlcA8izthQ"
+    }
+  ],
+  "invalid": [
+    {
+      "id": "bad_checksum",
+      "link": "https://join.justzappit.xyz/g/v1#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765T",
+      "error": "MALFORMED"
+    },
+    {
+      "id": "version_2",
+      "link": "https://join.justzappit.xyz/g/v1#AgAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzd5Cy5C",
+      "error": "UNSUPPORTED_VERSION"
+    },
+    {
+      "id": "reserved_flag",
+      "link": "https://join.justzappit.xyz/g/v1#AQQAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzd_Jijy",
+      "error": "NEWER_FORMAT"
+    },
+    {
+      "id": "one_byte_short",
+      "link": "https://join.justzappit.xyz/g/v1#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR764",
+      "error": "MALFORMED"
+    },
+    {
+      "id": "padded",
+      "link": "https://join.justzappit.xyz/g/v1#AQEAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcBQUP9-Hc=",
+      "error": "MALFORMED"
+    },
+    {
+      "id": "wrong_host",
+      "link": "https://gift.justzappit.xyz/g/v1#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "error": "MALFORMED"
+    },
+    {
+      "id": "path_v2",
+      "link": "https://join.justzappit.xyz/g/v2#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "error": "UNSUPPORTED_VERSION"
+    },
+    {
+      "id": "no_fragment",
+      "link": "https://join.justzappit.xyz/g/v1",
+      "error": "MALFORMED"
+    },
+    {
+      "id": "whitespace",
+      "link": "https://join.justzappit.xyz/g/v1#A QAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "error": "MALFORMED"
+    }
+  ],
+  "accepted_variants": [
+    {
+      "id": "query_ignored",
+      "link": "https://join.justzappit.xyz/g/v1?fbclid=abc#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "sameAs": "minimal"
+    },
+    {
+      "id": "host_case",
+      "link": "https://JOIN.JustZappIt.xyz/g/v1#AQAAAQIDBAUGBwgJCgsMDQ4P0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzcR765S",
+      "sameAs": "minimal"
+    }
+  ],
+  "request": {
+    "type": "group_join_request",
+    "v": 1,
+    "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+    "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "joinerName": "Ana",
+    "requestedAt": 1789800000000,
+    "nonce": "55555555555555555555555555555555",
+    "linkSig": "85535f60705e5c3764d50864da016cbd460a1dd3ca6b08392c33744df04e4f5cb2dde11923c4ea8f90f2082ce25b433480f8ece621b23f663beb136ad7c50d08",
+    "joinerSig": "ecd3cf47ce8f6b9ea2d8df292194913e9b4ace189ac030c1b87c47d76eeab6f5e7e2c79e882ca464601f0dab21307a9005f5424db31d174da96f32e664237607"
+  },
+  "admit": {
+    "admitSig": "431f7cdcf3584c92c33a06e569d29199c6951c18b770fdf3712e04da949b96494626cf55b6c98c7ba2fb999f21955e3f94b8a0b7b86d593caea35403888a4000"
+  },
+  "results": [
+    {
+      "type": "group_join_result",
+      "v": 1,
+      "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+      "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "status": "inactive",
+      "sig": "485cd784f7532b2fa4709457fa8a8a5f669134d4199bb4a49e224dd4620ef05bb418d784e1262cf97ddac2fcda9628d7ec2c2e3b4f6f568524030c5ef0a18b0f"
+    },
+    {
+      "type": "group_join_result",
+      "v": 1,
+      "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+      "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "status": "expired",
+      "sig": "268a4ec8ff044861d004ece3902e9627f0145e40b6653e3f689706bef0b6d326a7f6a1cb857732432e8b2419b43d61d56df78e9194ab8b8d2e43ee2e2b7b0a0e"
+    },
+    {
+      "type": "group_join_result",
+      "v": 1,
+      "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+      "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "status": "full",
+      "sig": "c977698338bc5eaca5a96a74dd510f9c9d91e7c9598459bc7cc8375e4e1cd95077cde40325dcf3cd6f6a8a3ce37c04d32fb4822a637f301a023f1a8272b48704"
+    },
+    {
+      "type": "group_join_result",
+      "v": 1,
+      "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+      "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "status": "declined",
+      "sig": "0eb88e0256e1b510008c8fa9b3fd037ed930e9f6bac749a1be2f83c7ca3e9b277811ece1e08d8a4270ed698647d526c26410744b9b8bff18c862c47468d5050b"
+    },
+    {
+      "type": "group_join_result",
+      "v": 1,
+      "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+      "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "status": "pending_approval",
+      "sig": "1e4570dd42ec90fff6b4da50a3b52d9d0b203f2f6e34621861bbed6e20a527eb80a5156d9a2b711e4b612f7f861f42117440021a0c5b27010f829947954c060e"
+    }
+  ]
+}

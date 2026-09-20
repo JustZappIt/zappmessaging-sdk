@@ -308,26 +308,40 @@ class MediaRequests {
   // range is cleared and the session closed on the way out in every case.
   async _fetch (mediaId, entry, fetch) {
     const { conversationId, senderId, descriptor } = entry
-    const { p2pManager, mediaStore } = this._deps()
+    const { p2pManager, mediaStore, chatStore } = this._deps()
+    // An image sent before the group got a new secret was written under an
+    // earlier one. A wrong key reads as noise that fails the hash, so the
+    // current secret is tried first and each earlier one after it.
+    const conv = chatStore && chatStore.conversations && chatStore.conversations.get(conversationId)
+    const earlier = (conv && conv.type === 'group' && Array.isArray(conv.pastGroupIds))
+      ? conv.pastGroupIds.map(p => p.groupId)
+      : []
+    const keys = [null, ...earlier]
     let core = null
     try {
-      core = await p2pManager.openRemoteMediaCore(conversationId, senderId, descriptor.coreKey)
-      if (!core) throw rejected('media core unavailable')
-      if (fetch.cancelled) return null
-      fetch.core = core
-      let downloaded = 0
-      const download = mediaBlobs.download(core, descriptor, {
-        timeoutMs: this._fetchTimeoutMs,
-        onBlock: () => {
-          downloaded++
-          this._pushEvent('media.transfer_progress', { mediaId, progress: downloaded / descriptor.n })
-        }
-      })
-      fetch.cancel = download.cancel
-      const bytes = await download.bytes
-      if (fetch.cancelled) return null
-      if (b4a.toString(mediaStore.hash(bytes), 'hex') !== mediaId) throw rejected('media core bytes do not hash to mediaId')
-      return bytes
+      for (let attempt = 0; attempt < keys.length; attempt++) {
+        core = await p2pManager.openRemoteMediaCore(conversationId, senderId, descriptor.coreKey, keys[attempt])
+        if (!core) throw rejected('media core unavailable')
+        if (fetch.cancelled) return null
+        fetch.core = core
+        let downloaded = 0
+        const download = mediaBlobs.download(core, descriptor, {
+          timeoutMs: this._fetchTimeoutMs,
+          onBlock: () => {
+            downloaded++
+            this._pushEvent('media.transfer_progress', { mediaId, progress: downloaded / descriptor.n })
+          }
+        })
+        fetch.cancel = download.cancel
+        const bytes = await download.bytes
+        if (fetch.cancelled) return null
+        if (b4a.toString(mediaStore.hash(bytes), 'hex') === mediaId) return bytes
+        if (attempt === keys.length - 1) throw rejected('media core bytes do not hash to mediaId')
+        // Close this session before opening the next with another key.
+        await core.close().catch(() => {})
+        core = null
+      }
+      return null
     } catch (err) {
       if (fetch.cancelled) return null
       if (err.code === 'MEDIA_RANGE_INVALID') {
