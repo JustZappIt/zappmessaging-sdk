@@ -50,6 +50,34 @@ public struct ZMGroupLinkInfo: Equatable, Sendable, CustomStringConvertible, Cus
 
     public var description: String { "ZMGroupLinkInfo(conversationId: \(conversationId), state: \(state), link: <redacted>)" }
     public var debugDescription: String { description }
+
+    public init(
+        conversationId: String,
+        state: ZMGroupLinkState,
+        link: String? = nil,
+        linkId: String? = nil,
+        createdAt: Date? = nil,
+        expiresAt: Date? = nil,
+        maxJoins: Int? = nil,
+        joins: Int = 0,
+        includeName: Bool = true,
+        approval: ZMGroupLinkApproval = .auto,
+        approvalReason: String? = nil,
+        pendingRequests: Int = 0
+    ) {
+        self.conversationId = conversationId
+        self.state = state
+        self.link = link
+        self.linkId = linkId
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.maxJoins = maxJoins
+        self.joins = joins
+        self.includeName = includeName
+        self.approval = approval
+        self.approvalReason = approvalReason
+        self.pendingRequests = pendingRequests
+    }
 }
 
 /// Options for enabling or updating a link. Only set fields are sent;
@@ -91,6 +119,18 @@ public enum ZMGroupLinkInspectStatus: String, Equatable, Sendable {
 
 /// What a link says about itself, read without contacting anyone.
 public struct ZMGroupLinkInspection: Equatable, Sendable {
+    public init(
+        status: ZMGroupLinkInspectStatus,
+        nameHint: String? = nil,
+        expiresAt: Date? = nil,
+        linkId: String? = nil
+    ) {
+        self.status = status
+        self.nameHint = nameHint
+        self.expiresAt = expiresAt
+        self.linkId = linkId
+    }
+
     public let status: ZMGroupLinkInspectStatus
     public let nameHint: String?
     /// A hint only; the owner enforces the real expiry.
@@ -113,6 +153,12 @@ public enum ZMGroupJoinRequestStatus: String, Equatable, Sendable {
 
 /// The answer to asking to join.
 public struct ZMGroupJoinResult: Equatable, Sendable {
+    public init(status: ZMGroupJoinRequestStatus, linkId: String? = nil, conversationId: String? = nil) {
+        self.status = status
+        self.linkId = linkId
+        self.conversationId = conversationId
+    }
+
     public let status: ZMGroupJoinRequestStatus
     public let linkId: String?
     /// Set when already a member.
@@ -137,6 +183,18 @@ public enum ZMGroupJoinStatus: String, Equatable, Sendable {
 }
 
 public struct ZMGroupJoinUpdate: Equatable, Sendable {
+    public init(
+        linkId: String,
+        status: ZMGroupJoinStatus,
+        conversationId: String? = nil,
+        nameHint: String? = nil
+    ) {
+        self.linkId = linkId
+        self.status = status
+        self.conversationId = conversationId
+        self.nameHint = nameHint
+    }
+
     public let linkId: String
     public let status: ZMGroupJoinStatus
     public let conversationId: String?
@@ -145,6 +203,20 @@ public struct ZMGroupJoinUpdate: Equatable, Sendable {
 
 /// A request waiting for the owner, in approval mode.
 public struct ZMGroupJoinApprovalRequest: Equatable, Sendable, Identifiable {
+    public init(
+        conversationId: String,
+        joinerKey: String,
+        joinerName: String,
+        requestedAt: Date? = nil,
+        previouslyRemoved: Bool = false
+    ) {
+        self.conversationId = conversationId
+        self.joinerKey = joinerKey
+        self.joinerName = joinerName
+        self.requestedAt = requestedAt
+        self.previouslyRemoved = previouslyRemoved
+    }
+
     public var id: String { joinerKey }
     public let conversationId: String
     public let joinerKey: String
@@ -155,6 +227,11 @@ public struct ZMGroupJoinApprovalRequest: Equatable, Sendable, Identifiable {
 }
 
 public struct ZMRemoveMemberResult: Equatable, Sendable {
+    public init(participants: [String], olderMemberCount: Int) {
+        self.participants = participants
+        self.olderMemberCount = olderMemberCount
+    }
+
     public let participants: [String]
     /// Members whose app does not understand removal yet. They see new
     /// messages once they update.
