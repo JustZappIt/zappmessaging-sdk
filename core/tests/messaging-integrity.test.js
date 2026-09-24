@@ -155,7 +155,6 @@ test('malformed replicated records never persist or block the following valid re
     message('bad-content', { content: {} }),
     message('../bad-id'), message('bad-media', { mediaId: '../secret' }),
     message('bad-reply', { replyToContent: {} }),
-    message('bad-reply-type', { replyToContentType: 'not a mime type' }),
     message('too-large', { content: 'x'.repeat(256 * 1024 + 1) }),
     { type: 'group_renamed', newName: {} }, { type: '__future_control' },
     message('valid', { senderId: OUTSIDER, isFromMe: true, status: 'read', mediaLocalPath: '/private', mediaTransferState: 'complete', replyToId: 'quoted', replyToContentType: 'image/jpeg' })
@@ -171,6 +170,17 @@ test('malformed replicated records never persist or block the following valid re
   assert.equal(rows[0].status, null)
   assert.equal(rows[0].replyToContentType, 'image/jpeg')
   assert.equal(events.filter(e => e.type === 'message').length, 1)
+})
+
+test('a malformed quoted type is cleared and the reply still persists', async t => {
+  const { store, conv, receiver } = await harness(t)
+  const manager = drainHarness(receiver)
+  const reply = message('reply', { replyToId: 'quoted', replyToContentType: 'not a mime type' })
+  await manager._drainRemoteCore(conv.id, OWNER, CORE, core([reply]))
+  const rows = await store.getMessages(conv.id)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].replyToId, 'quoted')
+  assert.equal(rows[0].replyToContentType, null)
 })
 
 for (const failure of ['message', 'index']) {

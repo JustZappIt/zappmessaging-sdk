@@ -505,6 +505,10 @@ test('addMessage persists the quoted message type and reloads it from disk', asy
   const legacy = await store.addMessage(conv.id, { senderId: 'p1', content: 'ok', replyToId: 'original' })
   assert.strictEqual(legacy.replyToContentType, null)
 
+  // A malformed hint is cleared rather than failing the send.
+  const garbled = await store.addMessage(conv.id, { senderId: 'p1', content: 'ok', replyToId: 'original', replyToContentType: 'not a mime type' })
+  assert.strictEqual(garbled.replyToContentType, null)
+
   const reloaded = await store.getMessages(conv.id)
   assert.strictEqual(reloaded.find(m => m.id === reply.id).replyToContentType, 'image/jpeg')
   assert.strictEqual(reloaded.find(m => m.id === legacy.id).replyToContentType, null)
