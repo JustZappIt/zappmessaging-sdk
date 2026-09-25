@@ -500,7 +500,10 @@ Owner only. Removes a member for good, in two stages. First a
 read, and everyone drops them. Then the group moves to a new secret, sent only
 to remaining members, so the removed member neither receives nor sends
 anything more. Members whose app has not announced support yet get the new
-secret once it does, and see no new messages until then.
+secret once it does, and see no new messages until then. A new secret that no
+connection or mailbox took is kept on disk and tried again on mailbox drains
+(a minute after failing, doubling up to half an hour) and at every start. Link
+admissions are delivered the same way.
 
 **Request:**
 ```json
@@ -1113,6 +1116,16 @@ Joiner requests:
 | `group_link.join_status` | none | `{ "requests": [{ linkId, status, nameHint, createdAt, conversationId }] }` |
 | `group_link.cancel` | `linkId` | `{ "cancelled": true }` |
 
+Cancelling a waiting request keeps it as `cancelled`, and this device then
+refuses any admission the owner sends for it, however late. It also leaves a
+signed withdrawal in the link's mailbox, retried until delivered. The owner's
+app drops the request if it is still waiting for approval
+(`group_link.request_withdrawn`). If the owner already let the joiner in, the
+owner's app takes them out again and moves the group to a new secret
+(`conversation.member_removed`), since the admission carried the old one. A
+joiner taken out this way is not marked as removed, so asking again later is
+an ordinary request.
+
 A join request goes to the blind peer mailbox addressed to the link's
 rendezvous key, under a throwaway envelope key. The owner's app admits it the
 next time it drains its mailboxes: at start, on resume, on every heartbeat,
@@ -1139,8 +1152,9 @@ Triggered when a direct or group invite is received.
 
 | Type | Payload | Meaning |
 |---|---|---|
-| `group_link.join_updated` | `linkId`, `status`, `conversationId` | A request this device made changed state: `pending_approval`, `joined` (with `conversationId`), `inactive`, `expired`, `full` or `declined` |
+| `group_link.join_updated` | `linkId`, `status`, `conversationId` | A request this device made changed state: `pending_approval`, `joined` (with `conversationId`), `inactive`, `expired`, `full`, `declined` or `cancelled` |
 | `group_link.request_received` | `conversationId`, `joinerKey`, `joinerName`, `previouslyRemoved` | Owner: a request waits for approval |
+| `group_link.request_withdrawn` | `conversationId`, `joinerKey` | Owner: a request waiting for approval was taken back. Load the requests again |
 | `group_link.member_joined` | `conversationId`, `memberKey`, `memberName` | Owner: someone joined through the link. `conversation.member_added` follows too |
 | `group_link.approval_switched` | `conversationId`, `reason` | Owner: the link switched itself to owner approval |
 | `conversation.member_removed` | `conversationId`, `removedKey` | The owner removed someone else |

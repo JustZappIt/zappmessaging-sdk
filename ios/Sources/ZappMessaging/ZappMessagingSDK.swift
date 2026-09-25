@@ -101,6 +101,9 @@ public final class ZappMessagingSDK: ObservableObject {
     /// Owner: someone asked to join through a link that needs approval.
     public let groupJoinRequestReceived = PassthroughSubject<ZMGroupJoinApprovalRequest, Never>()
 
+    /// Owner: a waiting request was taken back.
+    public let groupJoinRequestWithdrawn = PassthroughSubject<(conversationId: String, joinerKey: String), Never>()
+
     /// Owner: someone joined through the invite link.
     public let groupLinkMemberJoined = PassthroughSubject<(conversationId: String, memberKey: String, memberName: String), Never>()
 
@@ -887,6 +890,12 @@ public final class ZappMessagingSDK: ObservableObject {
             if let conversationId = payload["conversationId"] as? String,
                let request = ZMParse.approvalRequest(conversationId: conversationId, from: payload) {
                 groupJoinRequestReceived.send(request)
+            }
+
+        case "group_link.request_withdrawn":
+            if let conversationId = payload["conversationId"] as? String,
+               let joinerKey = payload["joinerKey"] as? String {
+                groupJoinRequestWithdrawn.send((conversationId: conversationId, joinerKey: joinerKey))
             }
 
         case "group_link.member_joined":

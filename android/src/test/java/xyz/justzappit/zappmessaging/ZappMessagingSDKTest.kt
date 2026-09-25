@@ -317,17 +317,20 @@ class ZappMessagingSDKTest {
         val (sdk, worklet) = signedIn()
         val updates = mutableListOf<ZMGroupJoinUpdate>()
         val requests = mutableListOf<ZMGroupJoinApprovalRequest>()
+        val withdrawn = mutableListOf<Pair<String, String>>()
         val removed = mutableListOf<String>()
         val memberRemoved = mutableListOf<Pair<String, String>>()
         val jobs = listOf(
             collectInto(this, sdk.groupJoinUpdated, updates),
             collectInto(this, sdk.groupJoinRequestReceived, requests),
+            collectInto(this, sdk.groupJoinRequestWithdrawn, withdrawn),
             collectInto(this, sdk.removedFromGroup, removed),
             collectInto(this, sdk.memberRemoved, memberRemoved),
         )
         worklet.event("group_link.join_updated", buildJsonObject { put("linkId", "l1"); put("status", "pending_approval") })
         worklet.event("group_link.join_updated", buildJsonObject { put("linkId", "l1"); put("status", "joined"); put("conversationId", "g1") })
         worklet.event("group_link.request_received", buildJsonObject { put("conversationId", "g1"); put("joinerKey", "cd".repeat(32)); put("joinerName", "Ben"); put("previouslyRemoved", true) })
+        worklet.event("group_link.request_withdrawn", buildJsonObject { put("conversationId", "g1"); put("joinerKey", "cd") })
         worklet.event("conversation.removed_from_group", buildJsonObject { put("conversationId", "g2") })
         worklet.event("conversation.member_removed", buildJsonObject { put("conversationId", "g1"); put("removedKey", "ef") })
 
@@ -336,6 +339,7 @@ class ZappMessagingSDKTest {
         assertEquals("g1", updates.last().conversationId)
         assertEquals("Ben", requests.single().joinerName)
         assertTrue(requests.single().previouslyRemoved)
+        assertEquals(listOf("g1" to "cd"), withdrawn)
         assertEquals(listOf("g2"), removed)
         assertEquals(listOf("g1" to "ef"), memberRemoved)
         jobs.forEach { it.cancel() }

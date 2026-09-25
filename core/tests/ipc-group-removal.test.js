@@ -65,7 +65,8 @@ function harness ({ me = OWNER, conversation }) {
     switchGroupTopic: async (id) => { localCore = 'core-e' + chatStore.conversations.get(id).groupEpoch; log.push(['switch', chatStore.conversations.get(id).groupId]); return true },
     joinGroupConversation: async () => { log.push(['join']); return true },
     openRemoteCore: async (id, peer, key) => { log.push(['open', peer, key]); return true },
-    leaveConversation: async (id) => { log.push(['leave', id]) }
+    leaveConversation: async (id) => { log.push(['leave', id]) },
+    setAuxiliaryDrain: (fn) => { p2pManager.auxiliaryDrain = fn }
   })
   const hypercoreManager = {
     getLocalCoreKey: () => 'cc'.repeat(31) + localCore.slice(-1).padStart(2, '0'),
@@ -163,6 +164,97 @@ test('a deferred secret that no transport took stays waiting and is retried at s
   assert.strictEqual(invites(h.log).filter(e => e[1] === BEN).length, 1)
 })
 
+test('a new secret no transport took is kept on disk and sent at the next start', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  const realSend = h.handler.p2pManager.sendInvite
+  h.handler.p2pManager.sendInvite = async () => false
+  const result = await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL })
+  assert.strictEqual(result.olderMemberCount, 1, 'only Ben is on an older app')
+  const onDisk = new GroupLinkStore({ filePath: h.handler.groupLinks.store.filePath })
+  assert.deepStrictEqual(onDisk.pendingRekey('g1'), { [ANA]: G0, [BEN]: G0 }, 'Ana waits too until her invite is taken')
+
+  h.handler.p2pManager.sendInvite = realSend
+  await h.handler.retryDeferredRekeys()
+  const sent = invites(h.log)
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(sent[0][1], ANA)
+  assert.strictEqual(sent[0][2].rekeyOf, topic(G0))
+  assert.strictEqual(sent[0][2].groupId, h.conv.groupId)
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 })
+})
+
+test('members are recorded as waiting before the group changes secret', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  let waitingAtSwitch = null
+  const realSwitch = h.handler.p2pManager.switchGroupTopic
+  h.handler.p2pManager.switchGroupTopic = async (id) => {
+    waitingAtSwitch = new GroupLinkStore({ filePath: h.handler.groupLinks.store.filePath }).pendingRekey('g1')
+    return realSwitch(id)
+  }
+  await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL })
+  assert.deepStrictEqual(waitingAtSwitch, { [ANA]: G0, [BEN]: G0 })
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 }, 'Ana\'s invite was taken')
+})
+
+test('a secret still waiting from before the app stopped mid-rekey is not sent', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  h.handler.groupLinks.store.deferRekey('g1', ANA, G0)
+  await h.handler.retryDeferredRekeys()
+  assert.strictEqual(invites(h.log).length, 0, 'the group never left G0')
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), {})
+})
+
+test('a joiner who withdrew after being let in is taken out, with a new secret, but not marked removed', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.enableLink('g1', { approval: 'auto' })
+  const linkBefore = h.handler.groupLinks.getLink('g1').link
+  await h.handler._withdrawLinkMember('g1', CAL)
+  assert.deepStrictEqual(h.conv.participantIds, [ANA, BEN])
+  assert.deepStrictEqual(h.log.find(e => e[0] === 'durable'), ['durable', 'group_member_removed', CAL])
+  assert.notStrictEqual(h.conv.groupId, G0, 'they were sent the secret, so it changes')
+  assert.ok(!h.handler.groupLinks.store.removedKeys('g1').includes(CAL))
+  assert.strictEqual(h.handler.groupLinks.getLink('g1').link, linkBefore, 'the link stays')
+  assert.deepStrictEqual(h.events.find(e => e.type === 'conversation.member_removed').payload, { conversationId: 'g1', removedKey: CAL })
+
+  // Nothing to do for someone who is not a member.
+  const before = h.log.length
+  await h.handler._withdrawLinkMember('g1', CAL)
+  assert.strictEqual(h.log.length, before)
+})
+
+test('a new secret that failed is retried on mailbox drains, spaced out, without queueing copies', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  const p2p = h.handler.p2pManager
+  const realSend = p2p.sendInvite
+  p2p.sendInvite = async () => false
+  await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL })
+  p2p.sendInvite = realSend
+
+  const resent = []
+  let online = false
+  p2p.resendInvite = async (key, invite) => { resent.push(key); return online }
+  await p2p.auxiliaryDrain()
+  assert.deepStrictEqual(resent, [ANA], 'Ben has not announced support, so he is not tried')
+  await p2p.auxiliaryDrain()
+  assert.deepStrictEqual(resent, [ANA], 'not again before its wait is over')
+  assert.strictEqual(h.handler._deliveryRetry.get('rekey:g1:' + ANA).delay, 60 * 1000)
+
+  h.handler._deliveryRetry.get('rekey:g1:' + ANA).dueAt = 0
+  await p2p.auxiliaryDrain()
+  assert.strictEqual(h.handler._deliveryRetry.get('rekey:g1:' + ANA).delay, 2 * 60 * 1000, 'waits twice as long')
+
+  online = true
+  h.handler._deliveryRetry.get('rekey:g1:' + ANA).dueAt = 0
+  await p2p.auxiliaryDrain()
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 })
+  assert.strictEqual(h.handler._deliveryRetry.size, 0)
+  assert.strictEqual(invites(h.log).length, 0, 'retries never go through the queueing sendInvite')
+})
+
 test('only the owner removes, and only members', async () => {
   const memberView = harness({ me: ANA, conversation: { ...ownerGroup(), participantIds: [OWNER, BEN] } })
   await assert.rejects(memberView.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: BEN }), e => e.code === 'NOT_GROUP_OWNER')
@@ -201,6 +293,17 @@ test('a member moves the same conversation to the new secret', async () => {
   // An older epoch is ignored.
   await h.handler._handleGroupInvite(rekeyInvite({ groupId: 'c1'.repeat(32), rekeyOf: topic('b1'.repeat(32)), groupEpoch: 1 }), OWNER)
   assert.strictEqual(h.conv.groupId, 'b1'.repeat(32))
+})
+
+test('a retried rekey naming a secret the member already moved past still lands', async () => {
+  const G1 = 'b1'.repeat(32)
+  const h = harness({ me: ANA, conversation: { id: 'local-7', type: 'group', groupId: G1, groupEpoch: 1, pastGroupIds: [{ groupId: G0, epoch: 0 }], creatorKey: OWNER, participantIds: [OWNER, BEN] } })
+  await h.handler._handleGroupInvite(rekeyInvite({ groupId: 'c1'.repeat(32), rekeyOf: topic(G0), groupEpoch: 2 }), OWNER)
+  assert.strictEqual(h.conv.groupId, 'c1'.repeat(32))
+  assert.strictEqual(h.conv.groupEpoch, 2)
+  // An old one naming the same past secret does not move it back.
+  await h.handler._handleGroupInvite(rekeyInvite({ groupId: G1, rekeyOf: topic(G0), groupEpoch: 1 }), OWNER)
+  assert.strictEqual(h.conv.groupId, 'c1'.repeat(32))
 })
 
 test('a rekey from anyone but the creator is ignored', async () => {

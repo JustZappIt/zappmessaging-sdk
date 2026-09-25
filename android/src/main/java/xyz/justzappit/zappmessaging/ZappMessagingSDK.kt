@@ -159,6 +159,10 @@ class ZappMessagingSDK internal constructor(
     /** Owner: someone asked to join through a link that needs approval. */
     val groupJoinRequestReceived: SharedFlow<ZMGroupJoinApprovalRequest> = _groupJoinRequestReceived.asSharedFlow()
 
+    private val _groupJoinRequestWithdrawn = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
+    /** Owner: (conversationId, joinerKey) when a waiting request was taken back. */
+    val groupJoinRequestWithdrawn: SharedFlow<Pair<String, String>> = _groupJoinRequestWithdrawn.asSharedFlow()
+
     private val _groupLinkMemberJoined = MutableSharedFlow<Triple<String, String, String>>(extraBufferCapacity = 16)
     /** Owner: (conversationId, memberKey, memberName) of someone who joined through the link. */
     val groupLinkMemberJoined: SharedFlow<Triple<String, String, String>> = _groupLinkMemberJoined.asSharedFlow()
@@ -1197,6 +1201,12 @@ class ZappMessagingSDK internal constructor(
                     val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
                     val request = conversationId?.let { parseApprovalRequest(it, payload) }
                     if (request != null) _groupJoinRequestReceived.tryEmit(request)
+                }
+
+                "group_link.request_withdrawn" -> {
+                    val conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull
+                    val joinerKey = payload["joinerKey"]?.jsonPrimitive?.contentOrNull
+                    if (conversationId != null && joinerKey != null) _groupJoinRequestWithdrawn.tryEmit(conversationId to joinerKey)
                 }
 
                 "group_link.member_joined" -> {

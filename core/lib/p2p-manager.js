@@ -2044,15 +2044,7 @@ class P2PManager extends EventEmitter {
     // Try sending via existing connections first. A write that did not land must
     // fall through to the mailbox below, not report the invite as sent: this is
     // the only path that carries the core key.
-    try {
-      const framed = this._firstLiveFramed(this.allPeerConnections.get(peerPublicKeyHex))
-      if (framed && framed.writeJSON(inviteData)) {
-        diag('Sent invite to', peerPublicKeyHex.substring(0, 12), 'via existing connection')
-        return true
-      }
-    } catch (e) {
-      diag('Failed to send via existing connection:', e.message)
-    }
+    if (this._writeInviteLive(peerPublicKeyHex, inviteData)) return true
 
     // Store as pending invite (delivered when peer connects)
     if (!this.pendingInvites.has(peerPublicKeyHex)) {
@@ -2107,6 +2099,36 @@ class P2PManager extends EventEmitter {
     }
 
     return false // invite is pending
+  }
+
+  _writeInviteLive (peerPublicKeyHex, inviteData) {
+    try {
+      const framed = this._firstLiveFramed(this.allPeerConnections.get(peerPublicKeyHex))
+      if (framed && framed.writeJSON(inviteData)) {
+        diag('Sent invite to', peerPublicKeyHex.substring(0, 12), 'via existing connection')
+        return true
+      }
+    } catch (e) {
+      diag('Failed to send via existing connection:', e.message)
+    }
+    return false
+  }
+
+  /**
+   * Try an invite again over a live connection or the mailbox only. Unlike
+   * sendInvite it queues nothing in memory: the caller keeps the invite and
+   * already has an earlier copy queued for when the peer connects.
+   * @returns {Promise<boolean>} whether a transport took it
+   */
+  async resendInvite (peerPublicKeyHex, inviteData) {
+    if (!this.swarm) return false
+    if (this._writeInviteLive(peerPublicKeyHex, inviteData)) return true
+    try {
+      return await this._putInviteMailbox(peerPublicKeyHex, inviteData)
+    } catch (e) {
+      diag('Invite mailbox put failed for ' + peerPublicKeyHex.substring(0, 12) + ': ' + (e.message || e))
+      return false
+    }
   }
 
   /**

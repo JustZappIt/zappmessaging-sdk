@@ -58,7 +58,8 @@ const TAG = Object.freeze({
   requestLink: 'zapp/group-link/v1/request/link',
   requestJoiner: 'zapp/group-link/v1/request/joiner',
   admit: 'zapp/group-link/v1/admit',
-  result: 'zapp/group-link/v1/result'
+  result: 'zapp/group-link/v1/result',
+  withdraw: 'zapp/group-link/v1/withdraw'
 })
 
 class GroupLinkError extends Error {
@@ -494,6 +495,38 @@ function verifyJoinResult (result, rendezvousPublicKey) {
   return verify(TAG.result, resultMessage(f, result.status), result.sig, rendezvousPublicKey)
 }
 
+function withdrawMessage ({ rendezvousPublicKey, linkId, joinerKey, nonce }) {
+  return b4a.concat([rendezvousPublicKey, linkId, joinerKey, nonce])
+}
+
+/**
+ * Joiner side: takes back one request, named by its nonce, after the link
+ * secret is gone. Signed by the joiner's identity, so only they can.
+ */
+function createJoinWithdrawal ({ request, rendezvousPublicKey, joinerKeyPair }) {
+  const linkId = hexKey(request.linkId, LINK_ID_BYTES)
+  const nonce = hexKey(request.nonce, NONCE_BYTES)
+  const joinerKey = joinerKeyPair.publicKey
+  if (!linkId || !nonce) throw new TypeError('not a join request')
+  return {
+    type: 'group_join_withdraw',
+    v: 1,
+    linkId: b4a.toString(linkId, 'hex'),
+    joinerKey: b4a.toString(joinerKey, 'hex'),
+    nonce: b4a.toString(nonce, 'hex'),
+    sig: b4a.toString(sign(TAG.withdraw, withdrawMessage({ rendezvousPublicKey, linkId, joinerKey, nonce }), joinerKeyPair.secretKey), 'hex')
+  }
+}
+
+function verifyJoinWithdrawal (withdrawal, rendezvousPublicKey) {
+  if (!withdrawal || withdrawal.type !== 'group_join_withdraw' || withdrawal.v !== 1) return false
+  const linkId = hexKey(withdrawal.linkId, LINK_ID_BYTES)
+  const joinerKey = hexKey(withdrawal.joinerKey, KEY_BYTES)
+  const nonce = hexKey(withdrawal.nonce, NONCE_BYTES)
+  if (!linkId || !joinerKey || !nonce || !b4a.isBuffer(rendezvousPublicKey)) return false
+  return verify(TAG.withdraw, withdrawMessage({ rendezvousPublicKey, linkId, joinerKey, nonce }), withdrawal.sig, joinerKey)
+}
+
 module.exports = {
   VERSION,
   LINK_HOST,
@@ -523,5 +556,7 @@ module.exports = {
   signAdmit,
   verifyAdmit,
   createJoinResult,
-  verifyJoinResult
+  verifyJoinResult,
+  createJoinWithdrawal,
+  verifyJoinWithdrawal
 }

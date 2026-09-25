@@ -198,6 +198,21 @@ test('admission and result signatures reproduce and verify only under the link k
   assert.throws(() => gl.createJoinResult(rendezvous, { linkId: fields.linkId, joinerKey: fields.joinerKey, status: 'maybe' }), TypeError)
 })
 
+test('the withdrawal vector reproduces, and verifies only as the joiner for that request', () => {
+  const withdrawal = gl.createJoinWithdrawal({ request: vectors.request, rendezvousPublicKey: rendezvous.publicKey, joinerKeyPair: joiner })
+  assert.deepStrictEqual(withdrawal, vectors.withdraw)
+  assert.ok(gl.verifyJoinWithdrawal(withdrawal, rendezvous.publicKey))
+
+  // Nobody else can take a request back for the joiner.
+  const other = keyPair()
+  const forged = gl.createJoinWithdrawal({ request: vectors.request, rendezvousPublicKey: rendezvous.publicKey, joinerKeyPair: other })
+  assert.ok(!gl.verifyJoinWithdrawal({ ...forged, joinerKey: withdrawal.joinerKey }, rendezvous.publicKey))
+  for (const [field, value] of [['nonce', '66'.repeat(16)], ['linkId', '00'.repeat(16)], ['v', 2], ['sig', 'zz']]) {
+    assert.ok(!gl.verifyJoinWithdrawal({ ...withdrawal, [field]: value }, rendezvous.publicKey), field)
+  }
+  assert.ok(!gl.verifyJoinWithdrawal(withdrawal, other.publicKey), 'bound to the link\'s rendezvous key')
+})
+
 test('fresh link material is consistent with itself', () => {
   const material = gl.createLinkMaterial()
   const link = gl.buildLink({ secret: material.secret, rendezvousPublicKey: material.rendezvous.publicKey, nameHint: 'Book club' })

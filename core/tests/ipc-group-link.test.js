@@ -34,8 +34,8 @@ const PEER = hex(keyPairFrom(2).publicKey)
 const NEWCOMER = hex(keyPairFrom(3).publicKey)
 const GROUP_ID = 'ab'.repeat(32)
 
-function makeHarness ({ conversations = {} } = {}) {
-  const calls = { invites: [], broadcasts: [], events: [], updated: [] }
+function makeHarness ({ conversations = {}, keyPair = MY_KP, storePath = null } = {}) {
+  const calls = { invites: [], broadcasts: [], events: [], updated: [], joins: [] }
   const chatStore = {
     conversations: new Map(Object.entries(conversations)),
     leftConversations: new Set(),
@@ -59,18 +59,18 @@ function makeHarness ({ conversations = {} } = {}) {
   const p2pManager = new EventEmitter()
   p2pManager.groupTopicToConversation = new Map()
   p2pManager.groupConversations = new Map()
-  p2pManager.joinGroupConversation = async () => true
+  p2pManager.joinGroupConversation = async (id) => { calls.joins.push(id); return true }
   p2pManager.openRemoteCore = async () => true
   p2pManager.sendInvite = async (key, invite) => { calls.invites.push({ key, invite }); return true }
   p2pManager.sendToConversation = (id, record) => { calls.broadcasts.push({ id, record }); return true }
 
   const handler = new IPCHandler({
-    identity: { keyPair: MY_KP, publicKeyHex: MY, displayName: 'Me' },
+    identity: { keyPair, publicKeyHex: hex(keyPair.publicKey), displayName: 'Me' },
     chatStore,
     contactStore: { async getContact () { return null }, async clearAll () {} },
     p2pManager,
     hypercoreManager: { getLocalCoreKey: () => 'cc'.repeat(32) },
-    groupLinkStore: new GroupLinkStore({ filePath: path.join(tmpRoot, 'links-' + (++counter) + '.json') })
+    groupLinkStore: new GroupLinkStore({ filePath: storePath || path.join(tmpRoot, 'links-' + (++counter) + '.json') })
   })
   handler.pushEvent = (type, payload) => calls.events.push({ type, payload })
   process.stdin.removeAllListeners('data')
@@ -148,6 +148,7 @@ test('add_member over IPC behaves as before', async () => {
 test('a group invite keeps viaLink through normalization and hands it to the link service', async () => {
   const { handler } = makeHarness()
   let seen = null
+  handler.groupLinks.expectsAdmission = () => true
   handler.groupLinks.onGroupInviteApplied = (invite, conversation) => { seen = { invite, conversation } }
   const viaLink = { linkId: 'AA'.repeat(16), admitSig: 'BB'.repeat(64) }
   const finished = await handler._handleGroupInvite({
@@ -195,3 +196,162 @@ test('wiping the account clears link state in memory', async () => {
   await handler._wipeAccountData()
   assert.deepStrictEqual(handler.groupLinks.store.ownerConversationIds(), [])
 })
+
+// ── Cancellation and delivery, owner and joiner each through a real handler ──
+
+const JOINER_KP = keyPairFrom(3)
+
+/** An owner with a link, and a joiner whose request is waiting on it. */
+async function ownerAndJoiner ({ approval = 'auto' } = {}) {
+  const owner = makeHarness({ conversations: ownedGroup() })
+  const { link } = await owner.handler.routeMessage('group_link.enable', { conversationId: 'g1', approval })
+  const joiner = makeHarness({ keyPair: JOINER_KP })
+  const { status, linkId } = await joiner.handler.routeMessage('group_link.join', { link })
+  assert.strictEqual(status, 'requested')
+  return { owner, joiner, linkId }
+}
+
+/** What the owner sends when it admits the joiner through the link. */
+async function admissionInvite (owner, linkId) {
+  const viaLink = owner.handler.groupLinks.viaLinkFor('g1', linkId, NEWCOMER)
+  assert.strictEqual(await owner.handler._admitViaLink('g1', NEWCOMER, 'Ana', viaLink), true)
+  return owner.calls.invites.filter(c => c.key === NEWCOMER).pop().invite
+}
+
+test('a link admission joins the group while the request is waiting', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner()
+  const invite = await admissionInvite(owner, linkId)
+  assert.strictEqual(await joiner.handler._handleGroupInvite(invite, MY), true)
+  const conv = [...joiner.chatStore.conversations.values()].find(c => c.groupId === GROUP_ID)
+  assert.ok(conv)
+  assert.deepStrictEqual(joiner.calls.joins, [conv.id])
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'joined')
+
+  // A second copy of the same admission changes nothing.
+  assert.strictEqual(await joiner.handler._handleGroupInvite(invite, MY), true)
+  assert.strictEqual(joiner.chatStore.conversations.size, 1)
+})
+
+test('after cancelling, a later admission creates and joins nothing', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner()
+  assert.deepStrictEqual(await joiner.handler.routeMessage('group_link.cancel', { linkId }), { cancelled: true })
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'cancelled')
+  assert.deepStrictEqual(joiner.calls.events.find(e => e.type === 'group_link.join_updated').payload,
+    { linkId, status: 'cancelled', conversationId: null })
+
+  const invite = await admissionInvite(owner, linkId)
+  assert.strictEqual(await joiner.handler._handleGroupInvite(invite, MY), true, 'finished with, so the mailbox copy goes')
+  assert.strictEqual(joiner.chatStore.conversations.size, 0)
+  assert.deepStrictEqual(joiner.calls.joins, [])
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'cancelled')
+
+  // Still refused once the cancelled request has been forgotten.
+  joiner.handler.groupLinks.store.deleteJoinerRecord(linkId)
+  await joiner.handler._handleGroupInvite(invite, MY)
+  assert.strictEqual(joiner.chatStore.conversations.size, 0)
+})
+
+test('a request that ended is not revived by a late admission', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner()
+  const record = joiner.handler.groupLinks.store.joinerRecord(linkId)
+  joiner.handler.groupLinks._finish(record, 'expired')
+  await joiner.handler._handleGroupInvite(await admissionInvite(owner, linkId), MY)
+  assert.strictEqual(joiner.chatStore.conversations.size, 0)
+})
+
+test('an approved admission no transport took is kept on disk and sent after a restart', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner({ approval: 'owner' })
+  const entry = owner.handler.groupLinks.store.ownerEntry('g1')
+  entry.requests.push({ linkId, joinerKey: NEWCOMER, joinerName: 'Ana', requestedAt: Date.now(), receivedAt: Date.now() })
+  owner.handler.p2pManager.sendInvite = async () => false
+
+  assert.deepStrictEqual(await owner.handler.routeMessage('group_link.approve', { conversationId: 'g1', joinerKey: NEWCOMER }), { status: 'admitted' })
+  assert.deepStrictEqual(owner.chatStore.conversations.get('g1').participantIds, [PEER, NEWCOMER])
+  assert.deepStrictEqual(await owner.handler.routeMessage('group_link.requests', { conversationId: 'g1' }), { requests: [] })
+  const storePath = owner.handler.groupLinks.store.filePath
+  assert.ok(new GroupLinkStore({ filePath: storePath }).pendingAdmission('g1', NEWCOMER), 'saved before the app could close')
+
+  // The app closes and starts again.
+  const restarted = makeHarness({ conversations: { g1: owner.chatStore.conversations.get('g1') }, storePath })
+  await restarted.handler.retryPendingAdmissions()
+  const sent = restarted.calls.invites.filter(c => c.key === NEWCOMER)
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(restarted.handler.groupLinks.store.pendingAdmission('g1', NEWCOMER), null)
+  await restarted.handler.retryPendingAdmissions()
+  assert.strictEqual(restarted.calls.invites.length, 1, 'sent once')
+
+  assert.strictEqual(await joiner.handler._handleGroupInvite(sent[0].invite, MY), true)
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'joined')
+})
+
+test('an undelivered admission is signed again when the group moves to a new secret', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner()
+  owner.handler.p2pManager.sendInvite = async () => false
+  await admissionInvite(owner, linkId).catch(() => {})
+  assert.ok(owner.handler.groupLinks.store.pendingAdmission('g1', NEWCOMER))
+  owner.chatStore.conversations.get('g1').groupId = 'ef'.repeat(32)
+
+  owner.handler.p2pManager.sendInvite = async (key, invite) => { owner.calls.invites.push({ key, invite }); return true }
+  await owner.handler.retryPendingAdmissions()
+  const { invite } = owner.calls.invites.pop()
+  assert.strictEqual(invite.groupId, 'ef'.repeat(32))
+  await joiner.handler._handleGroupInvite(invite, MY)
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'joined')
+})
+
+test('a queued admission is dropped once the joiner is no longer a member', async () => {
+  const { owner, linkId } = await ownerAndJoiner()
+  owner.handler.p2pManager.sendInvite = async () => false
+  await admissionInvite(owner, linkId).catch(() => {})
+  owner.chatStore.conversations.get('g1').participantIds = [PEER]
+  owner.handler.p2pManager.sendInvite = async () => { throw new Error('must not send') }
+  await owner.handler.retryPendingAdmissions()
+  assert.strictEqual(owner.handler.groupLinks.store.pendingAdmission('g1', NEWCOMER), null)
+})
+
+test('cancelling over IPC hands the owner a withdrawal for that request', async () => {
+  const owner = makeHarness({ conversations: ownedGroup() })
+  const { link } = await owner.handler.routeMessage('group_link.enable', { conversationId: 'g1' })
+  const joiner = makeHarness({ keyPair: JOINER_KP })
+  const put = []
+  let online = false
+  joiner.handler.p2pManager.putMailboxAs = async (sender, recipient, record) => { put.push({ sender, recipient, record }); return online }
+  const { linkId } = await joiner.handler.routeMessage('group_link.join', { link })
+  const request = joiner.handler.groupLinks.store.joinerRecord(linkId).request
+
+  assert.deepStrictEqual(await joiner.handler.routeMessage('group_link.cancel', { linkId }), { cancelled: true })
+  const withdrawal = put.pop()
+  const rendezvous = gl.parseLink(link).rendezvousPublicKey
+  assert.strictEqual(withdrawal.recipient, hex(rendezvous))
+  assert.notStrictEqual(hex(withdrawal.sender.publicKey), NEWCOMER, 'under a throwaway key, like the request')
+  assert.strictEqual(withdrawal.record.type, 'group_join_withdraw')
+  assert.strictEqual(withdrawal.record.nonce, request.nonce)
+  assert.ok(gl.verifyJoinWithdrawal(withdrawal.record, rendezvous))
+  assert.ok(joiner.handler.groupLinks.store.joinerRecord(linkId).withdrawal, 'kept: no transport took it')
+
+  online = true
+  await joiner.handler.groupLinks.maintainJoinRequests()
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).withdrawal, null)
+})
+
+test('a failed admission is retried on mailbox drains, not only at the next start', async () => {
+  const { owner, joiner, linkId } = await ownerAndJoiner()
+  const restarted = makeHarness({ conversations: { g1: owner.chatStore.conversations.get('g1') }, storePath: owner.handler.groupLinks.store.filePath })
+  restarted.handler.p2pManager.sendInvite = async () => false
+  await admissionInviteFrom(restarted.handler, linkId)
+  assert.ok(restarted.handler.groupLinks.store.pendingAdmission('g1', NEWCOMER))
+
+  // The next drain takes it through the mailbox.
+  const resent = []
+  restarted.handler.p2pManager.resendInvite = async (key, invite) => { resent.push({ key, invite }); return true }
+  await restarted.handler.retryPendingDeliveries()
+  assert.strictEqual(resent.length, 1)
+  assert.strictEqual(restarted.handler.groupLinks.store.pendingAdmission('g1', NEWCOMER), null)
+  await joiner.handler._handleGroupInvite(resent[0].invite, MY)
+  assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'joined')
+})
+
+async function admissionInviteFrom (handler, linkId) {
+  const viaLink = handler.groupLinks.viaLinkFor('g1', linkId, NEWCOMER)
+  return handler._admitViaLink('g1', NEWCOMER, 'Ana', viaLink)
+}

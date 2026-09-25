@@ -916,6 +916,30 @@ test('an invite whose write did not land is not reported as sent', async () => {
   assert.strictEqual(mailboxAttempts, 1, 'the failed write fell through to the mailbox')
 })
 
+test('resending an invite tries the connection and the mailbox, and queues nothing', async () => {
+  const manager = new P2PManager()
+  const peerKey = b4a.toString(crypto.randomBytes(32), 'hex')
+  const joins = []
+  manager.swarm = { dht: {}, join: (topic) => { joins.push(topic); return { flushed: async () => {} } } }
+  let mailboxUp = false
+  manager._putInviteMailbox = async () => mailboxUp
+
+  assert.strictEqual(await manager.resendInvite(peerKey, { type: 'group_invite' }), false)
+  assert.strictEqual(manager.pendingInvites.size, 0, 'the caller keeps the invite')
+  assert.strictEqual(joins.length, 0)
+  mailboxUp = true
+  assert.strictEqual(await manager.resendInvite(peerKey, { type: 'group_invite' }), true)
+
+  const socket = {}
+  const written = []
+  manager.allPeerConnections.set(peerKey, [socket])
+  manager.framedSockets.set(socket, { _destroyed: false, destroy: () => {}, writeJSON: (invite) => { written.push(invite); return true } })
+  mailboxUp = false
+  assert.strictEqual(await manager.resendInvite(peerKey, { type: 'group_invite' }), true)
+  assert.strictEqual(written.length, 1)
+  assert.strictEqual(await new P2PManager().resendInvite(peerKey, {}), false, 'not started')
+})
+
 test('a pending invite whose write did not land stays pending', () => {
   const manager = new P2PManager()
   const peerKey = b4a.toString(crypto.randomBytes(32), 'hex')

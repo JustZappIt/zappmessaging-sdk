@@ -17,6 +17,12 @@
  * mailbox operator does not learn who is asking. After signing, the secret is
  * no longer needed and is not kept.
  *
+ * Cancelling. The joiner signs a withdrawal naming the request (by its nonce)
+ * and leaves it in the same mailbox. The owner drops the request if it is
+ * still queued, and if it was already admitted takes the joiner out again
+ * and moves the group to a new secret: the admission carried the secret, and
+ * someone holding it who is no longer listed would be a hidden reader.
+ *
  * Everything the service touches outside itself is injected, so the whole
  * protocol runs under node --test without a network.
  */
@@ -42,6 +48,7 @@ const RATE_WINDOW_MS = 60 * 60 * 1000
 const RATE_LIMIT = 20
 const FAST_POLL_MS = 10 * 1000
 const FAST_WINDOW_MS = 10 * 60 * 1000
+const MAX_TRACKED_REQUESTS = 512
 
 const WAITING_STATUSES = new Set(['waiting', 'pending_approval'])
 const FINAL_STATUSES = new Set(['joined', 'inactive', 'expired', 'full', 'declined', 'cancelled'])
@@ -92,16 +99,19 @@ class GroupLinkService {
    *   sendInvite(recipientHex, record) -> Promise<boolean>, the identity invite path
    *   drainOwn() -> Promise, drains this identity's own mailbox
    * @param {Function} deps.admit async (conversationId, joinerKey, joinerName, viaLink) -> boolean
+   * @param {Function} [deps.withdraw] async (conversationId, joinerKey) -> void, takes an
+   *   admitted joiner out again after they withdrew; throws when it should be retried
    * @param {Function} deps.emit (type, payload) -> void
    * @param {Function} [deps.now]
    * @param {{setInterval: Function, clearInterval: Function}} [deps.timers]
    */
-  constructor ({ store, chatStore, identity, transport, admit, emit, now, timers }) {
+  constructor ({ store, chatStore, identity, transport, admit, withdraw, emit, now, timers }) {
     this.store = store
     this.chatStore = chatStore
     this.identity = identity
     this.transport = transport
     this.admit = admit
+    this.withdraw = withdraw || (async () => {})
     this.emit = emit || (() => {})
     this.now = now || (() => Date.now())
     this.timers = timers || { setInterval, clearInterval }
@@ -149,7 +159,11 @@ class GroupLinkService {
       approval: options.approval === 'owner' ? 'owner' : 'auto',
       approvalReason: null,
       state: 'active',
-      declinedKeys: []
+      declinedKeys: [],
+      // Which request each link admission came from, and requests taken
+      // back, both as { joinerKey, nonce }.
+      admitted: [],
+      withdrawn: []
     }
   }
 
@@ -274,6 +288,8 @@ class GroupLinkService {
       rendezvousPublicKey: record.rendezvousPublicKey,
       proofPublicKey: record.proofPublicKey,
       createdAt: record.createdAt,
+      // A withdrawal can still arrive for someone this link let in.
+      admitted: record.admitted || [],
       retiredAt: this.now()
     })
     entry.retired = entry.retired.slice(0, MAX_RETIRED)
@@ -312,6 +328,7 @@ class GroupLinkService {
       throw new GroupLinkRequestError('ADMIT_FAILED', 'The member could not be added')
     }
     entry.requests = entry.requests.filter(r => r !== request)
+    if (record) this._noteAdmitted(record, key, request.nonce)
     if (record === entry.current) {
       record.joins += 1
       entry.admissions.push(this.now())
@@ -381,6 +398,17 @@ class GroupLinkService {
     }
   }
 
+  /**
+   * The admission signed again for the group's current secret, for an invite
+   * still undelivered when the group moved on. Null once the link is gone.
+   */
+  viaLinkFor (conversationId, linkId, joinerKey) {
+    const conv = this.chatStore.conversations.get(conversationId)
+    const record = this._recordForLinkId(this.store.ownerEntry(conversationId), linkId)
+    if (!conv || !record || !this.myKey) return null
+    return this._viaLink(record, conv, joinerKey)
+  }
+
   async _sendResult (record, joinerKey, status) {
     try {
       const rendezvous = gl.rendezvousKeyPair(fromHex(record.rendezvousSeed))
@@ -447,6 +475,7 @@ class GroupLinkService {
    * succeed where this one failed.
    */
   async _handleRequest (conversationId, entry, record, isCurrent, request) {
+    if (request && request.type === 'group_join_withdraw') return await this._handleWithdrawal(conversationId, entry, record, request)
     if (!request || request.type !== 'group_join_request') return true
     const context = { rendezvousPublicKey: fromHex(record.rendezvousPublicKey), proofPublicKey: fromHex(record.proofPublicKey) }
     if (request.linkId !== record.linkId || !gl.verifyJoinRequest(request, context)) {
@@ -456,7 +485,10 @@ class GroupLinkService {
     const now = this.now()
     if (request.requestedAt < record.createdAt - CLOCK_SKEW_MS || request.requestedAt > now + CLOCK_SKEW_MS) return true
     const joinerKey = request.joinerKey.toLowerCase()
+    const nonce = request.nonce.toLowerCase()
     if (joinerKey === (this.myKey || '').toLowerCase()) return true
+    // Taken back already: a copy drained after the withdrawal gets nothing.
+    if (this._isWithdrawn(record, joinerKey, nonce)) return true
 
     const conv = this.chatStore.conversations.get(conversationId)
     const ownsGroup = conv && conv.type === 'group' && !this.chatStore.hasLeftConversation(conversationId) &&
@@ -476,8 +508,11 @@ class GroupLinkService {
 
     const isMember = (conv.participantIds || []).some(k => (k || '').toLowerCase() === joinerKey)
     if (isMember) {
-      // Already in: the first invite may have been lost. Send it again.
-      await this.admit(conversationId, joinerKey, request.joinerName, this._viaLink(record, conv, joinerKey), { resendOnly: true })
+      // Already in: the first invite may have been lost. Send it again. A
+      // newer request replaces the one a withdrawal would have to name.
+      if (await this.admit(conversationId, joinerKey, request.joinerName, this._viaLink(record, conv, joinerKey), { resendOnly: true })) {
+        if (this._noteAdmitted(record, joinerKey, nonce, { onlyIfListed: true })) this.store.save()
+      }
       return true
     }
     if (this._groupIsFull(conv) || (record.maxJoins != null && record.joins >= record.maxJoins)) {
@@ -494,12 +529,19 @@ class GroupLinkService {
 
     if (record.approval === 'owner') {
       const existing = entry.requests.find(r => r.joinerKey === joinerKey)
+      if (existing && existing.nonce !== nonce && request.requestedAt >= existing.requestedAt) {
+        // Asked again after cancelling: this request is the one a later
+        // withdrawal names.
+        Object.assign(existing, { linkId: record.linkId, nonce, requestedAt: request.requestedAt, joinerName: request.joinerName })
+        this.store.save()
+      }
       if (!existing) {
         entry.requests.push({
           linkId: record.linkId,
           joinerKey,
           joinerName: request.joinerName,
           requestedAt: request.requestedAt,
+          nonce,
           receivedAt: now,
           previouslyRemoved
         })
@@ -518,10 +560,61 @@ class GroupLinkService {
       diag('Link admission failed: ' + (err.message || err))
     }
     if (!admitted) return false
+    this._noteAdmitted(record, joinerKey, nonce)
     record.joins += 1
     entry.admissions.push(now)
     this.store.save()
     this.emit('group_link.member_joined', { conversationId, memberKey: joinerKey, memberName: request.joinerName })
+    return true
+  }
+
+  _isWithdrawn (record, joinerKey, nonce) {
+    return (record.withdrawn || []).some(w => w.joinerKey === joinerKey && w.nonce === nonce)
+  }
+
+  /**
+   * One request per joiner: the latest. With onlyIfListed, only replaces an
+   * admission already recorded. Returns whether anything changed.
+   */
+  _noteAdmitted (record, joinerKey, nonce, { onlyIfListed = false } = {}) {
+    if (typeof nonce !== 'string') return false
+    const admitted = record.admitted || []
+    const current = admitted.find(a => a.joinerKey === joinerKey)
+    if (current ? current.nonce === nonce : onlyIfListed) return false
+    record.admitted = [...admitted.filter(a => a !== current), { joinerKey, nonce }].slice(-MAX_TRACKED_REQUESTS)
+    return true
+  }
+
+  /**
+   * A joiner took their request back. Finished with unless taking an admitted
+   * joiner out again failed, which the next drain retries.
+   */
+  async _handleWithdrawal (conversationId, entry, record, withdrawal) {
+    if (withdrawal.linkId !== record.linkId || !gl.verifyJoinWithdrawal(withdrawal, fromHex(record.rendezvousPublicKey))) {
+      diag('Discarded a withdrawal that did not verify')
+      return true
+    }
+    const joinerKey = withdrawal.joinerKey.toLowerCase()
+    const nonce = withdrawal.nonce.toLowerCase()
+    if (!this._isWithdrawn(record, joinerKey, nonce)) {
+      record.withdrawn = [...(record.withdrawn || []), { joinerKey, nonce }].slice(-MAX_TRACKED_REQUESTS)
+    }
+    const queued = entry.requests.filter(r => r.joinerKey === joinerKey && r.nonce === nonce)
+    entry.requests = entry.requests.filter(r => !queued.includes(r))
+    this.store.save()
+    if (queued.length > 0) this.emit('group_link.request_withdrawn', { conversationId, joinerKey })
+
+    const admitted = (record.admitted || []).find(a => a.joinerKey === joinerKey && a.nonce === nonce)
+    if (!admitted) return true
+    try {
+      await this.withdraw(conversationId, joinerKey)
+    } catch (err) {
+      diag('Withdrawn member not taken out yet: ' + (err.message || err))
+      return false
+    }
+    record.admitted = record.admitted.filter(a => a !== admitted)
+    if (record === entry.current && record.joins > 0) record.joins -= 1
+    this.store.save()
     return true
   }
 
@@ -579,7 +672,9 @@ class GroupLinkService {
       joinerName: name,
       requestedAt: this.now()
     })
-    // The secret stops here: only the signed request is kept.
+    // The secret stops here: only the signed request is kept. This replaces
+    // any cancelled request for the same link, and with it a withdrawal not
+    // sent yet: asking again means the joiner wants in after all.
     parsed.secret.fill(0)
     const record = {
       linkId,
@@ -614,8 +709,12 @@ class GroupLinkService {
     return sent
   }
 
+  /**
+   * Also while waiting for approval: if the owner approved but the invite
+   * never arrived, asking again makes the owner send it again.
+   */
   async _maybeResend (record) {
-    if (record.status !== 'waiting') return false
+    if (!WAITING_STATUSES.has(record.status)) return false
     const due = record.sendCount === 0 ||
       (record.sendCount < MAX_SENDS && this.now() - record.lastSentAt >= RESEND_INTERVAL_MS)
     return due ? this._send(record) : false
@@ -631,12 +730,44 @@ class GroupLinkService {
     }))
   }
 
-  cancel (linkId) {
+  /**
+   * A waiting request is kept as cancelled, so an admission the owner sends
+   * later is refused (see expectsAdmission), and the owner is sent a
+   * withdrawal, kept until a transport takes it. An ended request is just
+   * forgotten.
+   */
+  async cancel (linkId) {
     const record = this.store.joinerRecord(linkId)
     if (!record) return false
-    this.store.deleteJoinerRecord(linkId)
-    this.store.save()
+    if (!WAITING_STATUSES.has(record.status)) {
+      this.store.deleteJoinerRecord(linkId)
+      this.store.save()
+      return true
+    }
+    if (record.request && this.identity && this.identity.keyPair) {
+      record.withdrawal = gl.createJoinWithdrawal({
+        request: record.request,
+        rendezvousPublicKey: fromHex(record.rendezvousPublicKey),
+        joinerKeyPair: this.identity.keyPair
+      })
+    }
+    this._finish(record, 'cancelled')
+    if (record.withdrawal) await this._sendWithdrawal(record)
     return true
+  }
+
+  async _sendWithdrawal (record) {
+    let sent = false
+    try {
+      sent = await this.transport.put(throwawayKeyPair(), record.rendezvousPublicKey, record.withdrawal)
+    } catch (err) {
+      diag('Withdrawal not sent yet: ' + (err.message || err))
+    }
+    if (sent) {
+      record.withdrawal = null
+      this.store.save()
+    }
+    return sent
   }
 
   _finish (record, status, conversationId = null) {
@@ -668,15 +799,12 @@ class GroupLinkService {
     return true
   }
 
-  /**
-   * Called after the ordinary group invite path accepted an invite. When it
-   * carries a valid admission for one of our requests, that request is done.
-   */
-  onGroupInviteApplied (invite, conversation) {
+  /** Our request the invite's admission is for, when it verifies. */
+  _admittedRecord (invite) {
     const via = invite && invite.viaLink
-    if (!via || !conversation) return false
+    if (!via) return null
     const record = this.store.joinerRecord(via.linkId)
-    if (!record) return false
+    if (!record) return null
     const ok = gl.verifyAdmit(via.admitSig, fromHex(record.rendezvousPublicKey), {
       linkId: via.linkId,
       joinerKey: this.myKey,
@@ -685,8 +813,30 @@ class GroupLinkService {
     })
     if (!ok) {
       diag('Ignored an admission that did not verify')
-      return false
+      return null
     }
+    return record
+  }
+
+  /**
+   * Checked before a group we are not in is created from a link admission:
+   * only a request still waiting may be admitted. A cancelled, ended or
+   * forgotten request refuses it, however late it arrives.
+   */
+  expectsAdmission (invite) {
+    const record = this._admittedRecord(invite)
+    return !!record && WAITING_STATUSES.has(record.status)
+  }
+
+  /**
+   * Called after the ordinary group invite path accepted an invite. When it
+   * carries a valid admission for one of our requests, that request is done.
+   */
+  onGroupInviteApplied (invite, conversation) {
+    if (!conversation) return false
+    const record = this._admittedRecord(invite)
+    if (!record) return false
+    const via = invite.viaLink
     this.store.addJoinedVia(conversation.id, via.linkId)
     if (record.status !== 'joined' || record.conversationId !== conversation.id) {
       this._finish(record, 'joined', conversation.id)
@@ -696,17 +846,24 @@ class GroupLinkService {
     return true
   }
 
-  /** Resends and expires waiting requests. Called on every mailbox drain. */
+  /**
+   * Resends and expires waiting requests, and sends withdrawals no transport
+   * took yet. Called on every mailbox drain.
+   */
   async maintainJoinRequests () {
     const now = this.now()
     for (const record of this.store.joinerRecords()) {
+      const age = now - (record.updatedAt || record.createdAt)
       if (WAITING_STATUSES.has(record.status)) {
         if (now - record.createdAt >= JOINER_TTL_MS) {
           this._finish(record, 'expired')
           continue
         }
         await this._maybeResend(record)
-      } else if (now - (record.updatedAt || record.createdAt) >= FINISHED_KEEP_MS) {
+      } else if (record.withdrawal && age < JOINER_TTL_MS) {
+        // The mailbox keeps a request 30 days, so a withdrawal is tried as long.
+        await this._sendWithdrawal(record)
+      } else if (age >= FINISHED_KEEP_MS) {
         this.store.deleteJoinerRecord(record.linkId)
         this.store.save()
       }
@@ -783,5 +940,6 @@ module.exports = {
   RESEND_INTERVAL_MS,
   MAX_SENDS,
   JOINER_TTL_MS,
+  FINISHED_KEEP_MS,
   RETIRED_KEEP_MS
 }

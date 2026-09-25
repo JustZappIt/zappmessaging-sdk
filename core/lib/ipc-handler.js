@@ -31,6 +31,10 @@ const MAX_LINK_CHARS = 16 * 1024
 const GROUP_ADMIN_FEATURE = 'group_admin_v1'
 const CAPS_VERSION = 1
 const MAX_PAST_GROUP_IDS = 4
+// Undelivered admissions and group secrets are tried again on mailbox drains,
+// waiting twice as long after each failure.
+const DELIVERY_RETRY_MIN_MS = 60 * 1000
+const DELIVERY_RETRY_MAX_MS = 30 * 60 * 1000
 
 function groupTopicHex (groupId) {
   return b4a.toString(deriveGroupChatTopic(groupId), 'hex')
@@ -123,10 +127,20 @@ class IPCHandler {
       },
       admit: (conversationId, joinerKey, joinerName, viaLink, options) =>
         this._admitViaLink(conversationId, joinerKey, joinerName, viaLink, options),
+      withdraw: (conversationId, joinerKey) => this._withdrawLinkMember(conversationId, joinerKey),
       emit: (type, payload) => this.pushEvent(type, payload)
     })
+    // 'admit:<conversationId>:<key>' or 'rekey:...' -> { delay, dueAt }
+    this._deliveryRetry = new Map()
+    this._retryingDeliveries = null
     if (typeof p2p.setAuxiliaryDrain === 'function') {
-      p2p.setAuxiliaryDrain(() => this.groupLinks.onMailboxDrain())
+      p2p.setAuxiliaryDrain(async () => {
+        try {
+          await this.groupLinks.onMailboxDrain()
+        } finally {
+          await this.retryPendingDeliveries()
+        }
+      })
     }
   }
 
@@ -401,7 +415,7 @@ class IPCHandler {
       case 'join_status': return { requests: links.joinStatus() }
       case 'cancel': {
         if (!isValidString(payload.linkId, 64)) throw new IPCRequestError('INVALID_LINK_ID', 'linkId is required')
-        return { cancelled: links.cancel(payload.linkId) }
+        return { cancelled: await links.cancel(payload.linkId) }
       }
       default:
         throw new Error(`Unknown group_link action: ${action}`)
@@ -840,14 +854,15 @@ class IPCHandler {
   /**
    * Owner only: add newKey to the group, invite them, and tell the others.
    * The caller has checked ownership and that newKey is not a member yet.
+   * With sendInvite false the caller delivers newKey's invite itself.
    * @returns {Promise<string[]>} the updated participant list (without us)
    */
-  async _addMemberAsOwner (conv, newKey, newName, { viaLink = null } = {}) {
+  async _addMemberAsOwner (conv, newKey, newName, { sendInvite = true } = {}) {
     const updatedParticipants = [...new Set([...this._normalizedParticipants(conv), newKey])]
     await this.chatStore.updateConversation(conv.id, { participantIds: updatedParticipants })
-    const invite = this._ownerGroupInvite(conv, updatedParticipants, viaLink ? { viaLink } : {})
+    const invite = this._ownerGroupInvite(conv, updatedParticipants)
     await this.p2pManager.joinGroupConversation(conv.id, conv.groupId, invite.participants)
-    await this.p2pManager.sendInvite(newKey, invite)
+    if (sendInvite) await this.p2pManager.sendInvite(newKey, invite)
     this.p2pManager.sendToConversation(conv.id, {
       type: 'group_member_added',
       newMemberKey: newKey,
@@ -860,7 +875,11 @@ class IPCHandler {
   /**
    * The group link service's admission hook. With resendOnly the joiner is
    * already a member and only gets their invite again.
-   * @returns {Promise<boolean>}
+   *
+   * The invite is queued on disk before anything is sent and stays queued
+   * until a transport takes it, so a failed handoff followed by the app
+   * closing is retried at the next start (retryPendingAdmissions).
+   * @returns {Promise<boolean>} whether the joiner is a member now
    */
   async _admitViaLink (conversationId, joinerKey, joinerName, viaLink, { resendOnly = false } = {}) {
     const conv = await this.chatStore.getConversation(conversationId)
@@ -870,16 +889,144 @@ class IPCHandler {
     const key = (joinerKey || '').toLowerCase()
     if (!isValidPublicKey(key) || key === myKey) return false
     const name = (typeof joinerName === 'string' && joinerName.trim()) || key.substring(0, 8)
-    const participants = this._normalizedParticipants(conv)
-    if (resendOnly || participants.includes(key)) {
-      if (!participants.includes(key)) return false
-      await this.p2pManager.sendInvite(key, this._ownerGroupInvite(conv, participants, viaLink ? { viaLink } : {}))
-      return true
+    const isMember = this._normalizedParticipants(conv).includes(key)
+    if (resendOnly && !isMember) return false
+
+    const store = this.groupLinks.store
+    store.queueAdmission(conversationId, key, viaLink ? { ...viaLink, groupId: conv.groupId } : null, Date.now())
+    store.save()
+    if (!isMember) {
+      await this._addMemberAsOwner(conv, key, name, { sendInvite: false })
+      // The native side did not start this, so it learns of it here.
+      this.pushEvent('conversation.member_added', { conversationId, newMemberKey: key, newMemberName: name })
     }
-    await this._addMemberAsOwner(conv, key, name, { viaLink })
-    // The native side did not start this, so it learns of it here.
-    this.pushEvent('conversation.member_added', { conversationId, newMemberKey: key, newMemberName: name })
+    try {
+      await this._sendPendingAdmission(conversationId, key)
+    } catch (err) {
+      diag('Link admission invite not sent yet: ' + (err.message || err))
+    }
     return true
+  }
+
+  /**
+   * The group link service's withdrawal hook: someone let in through the
+   * link took their request back before their app accepted it. They come out
+   * as a removal does, new secret included, but are not marked removed, so
+   * asking again later is an ordinary request.
+   */
+  async _withdrawLinkMember (conversationId, joinerKey) {
+    const conv = await this.chatStore.getConversation(conversationId)
+    const myKey = (this.identity.publicKeyHex || '').toLowerCase()
+    if (!conv || conv.type !== 'group' || this.chatStore.hasLeftConversation(conversationId) ||
+        (conv.creatorKey || '').toLowerCase() !== myKey) return
+    if (!this._normalizedParticipants(conv).includes(joinerKey)) return
+    await this._removeMember(conversationId, joinerKey, { resetLink: false, recordRemoval: false })
+    // The native side did not start this, so it learns of it here.
+    this.pushEvent('conversation.member_removed', { conversationId, removedKey: joinerKey })
+  }
+
+  /**
+   * Send one queued admission invite, and forget it once a transport took it.
+   * @returns {Promise<boolean>} whether it was handed off
+   */
+  async _sendPendingAdmission (conversationId, key, { resend = false } = {}) {
+    const store = this.groupLinks.store
+    const pending = store.pendingAdmission(conversationId, key)
+    if (!pending) return false
+    const drop = () => {
+      store.clearAdmission(conversationId, key)
+      store.save()
+      return false
+    }
+    const conv = await this.chatStore.getConversation(conversationId)
+    const myKey = (this.identity.publicKeyHex || '').toLowerCase()
+    if (!conv || conv.type !== 'group' || this.chatStore.hasLeftConversation(conversationId) ||
+        (conv.creatorKey || '').toLowerCase() !== myKey) return drop()
+    const participants = this._normalizedParticipants(conv)
+    if (!participants.includes(key)) return drop()
+
+    let viaLink = null
+    if (pending.viaLink) {
+      const { groupId, ...signed } = pending.viaLink
+      // The admission is signed for one secret; after a rekey it is signed
+      // again, and without its link it is not sent at all, since an invite
+      // without an admission would skip the joiner's cancellation check.
+      viaLink = groupId === conv.groupId ? signed : this.groupLinks.viaLinkFor(conversationId, signed.linkId, key)
+      if (!viaLink) return drop()
+    }
+    const sent = await this._inviteSender(resend)(key, this._ownerGroupInvite(conv, participants, viaLink ? { viaLink } : {}))
+    if (sent) {
+      store.clearAdmission(conversationId, key)
+      store.save()
+    }
+    return sent
+  }
+
+  /** At start: send every admission invite no transport took before. */
+  async retryPendingAdmissions () {
+    const pendingAll = this.groupLinks.store.state.pendingAdmissions || {}
+    for (const [conversationId, pending] of Object.entries(pendingAll)) {
+      for (const key of Object.keys(pending)) {
+        await this._sendPendingAdmission(conversationId, key).catch(() => false)
+      }
+    }
+  }
+
+  /**
+   * The first send of an invite also queues it in memory for when the peer
+   * connects; a retry only tries the live connection and the mailbox, so
+   * copies do not pile up.
+   */
+  _inviteSender (resend) {
+    const p2p = this.p2pManager
+    return resend && typeof p2p.resendInvite === 'function'
+      ? (key, invite) => p2p.resendInvite(key, invite)
+      : (key, invite) => p2p.sendInvite(key, invite)
+  }
+
+  /**
+   * On every mailbox drain: try again each admission and group secret no
+   * transport took, so a failure heals while the app stays open, not only
+   * at the next start. Each waits a minute after its first failure, doubling
+   * up to half an hour.
+   */
+  retryPendingDeliveries () {
+    if (!this._retryingDeliveries) {
+      this._retryingDeliveries = this._retryPendingDeliveriesOnce()
+        .catch(err => diag('Pending deliveries not retried: ' + (err.message || err)))
+        .finally(() => { this._retryingDeliveries = null })
+    }
+    return this._retryingDeliveries
+  }
+
+  async _retryPendingDeliveriesOnce () {
+    const store = this.groupLinks.store
+    const items = []
+    for (const [conversationId, pending] of Object.entries(store.state.pendingRekey || {})) {
+      for (const key of Object.keys(pending)) {
+        if (this._supportsGroupAdmin(conversationId, key)) items.push({ kind: 'rekey', conversationId, key })
+      }
+    }
+    for (const [conversationId, pending] of Object.entries(store.state.pendingAdmissions || {})) {
+      for (const key of Object.keys(pending)) items.push({ kind: 'admit', conversationId, key })
+    }
+    const ids = new Set()
+    for (const { kind, conversationId, key } of items) {
+      const id = kind + ':' + conversationId + ':' + key
+      ids.add(id)
+      const retry = this._deliveryRetry.get(id)
+      if (retry && Date.now() < retry.dueAt) continue
+      const send = kind === 'rekey' ? this._sendDeferredRekey(conversationId, key, { resend: true }) : this._sendPendingAdmission(conversationId, key, { resend: true })
+      await send.catch(err => diag('Retried invite not sent: ' + (err.message || err)))
+      const stillPending = kind === 'rekey' ? !!store.pendingRekey(conversationId)[key] : !!store.pendingAdmission(conversationId, key)
+      if (!stillPending) {
+        this._deliveryRetry.delete(id)
+      } else {
+        const delay = retry ? Math.min(retry.delay * 2, DELIVERY_RETRY_MAX_MS) : DELIVERY_RETRY_MIN_MS
+        this._deliveryRetry.set(id, { delay, dueAt: Date.now() + delay })
+      }
+    }
+    for (const id of this._deliveryRetry.keys()) if (!ids.has(id)) this._deliveryRetry.delete(id)
   }
 
   /**
@@ -1179,6 +1326,14 @@ class IPCHandler {
           !this._isConversationParticipant(existing, authenticatedPeer) ||
           this.chatStore.hasLeftConversation(existing.id))) return true
 
+      // A link admission into a group we are not in needs a request still
+      // waiting here. Checked before anything is created or joined, so a
+      // request the user cancelled cannot pull them in later.
+      if (!existing && inviteData.viaLink && !this.groupLinks.expectsAdmission(inviteData)) {
+        diag('Ignoring a link admission with no waiting request')
+        return true // rejected: terminal, nothing to retry
+      }
+
       // Other participants (excluding self) become the conversation's participantIds
       const otherParticipants = [...new Set([...(existing ? existing.participantIds : []),
         ...normalizedParticipants.filter(k => k !== myKey.toLowerCase())])]
@@ -1245,7 +1400,7 @@ class IPCHandler {
    * secret the removed member never sees, so they neither receive nor send
    * anything more in it.
    */
-  async _removeMember (conversationId, removedKey, { resetLink = true } = {}) {
+  async _removeMember (conversationId, removedKey, { resetLink = true, recordRemoval = true } = {}) {
     const conv = await this.chatStore.getConversation(conversationId)
     if (!conv || conv.type !== 'group' || this.chatStore.hasLeftConversation(conversationId)) {
       throw new IPCRequestError('CONVERSATION_NOT_FOUND', 'Group not found')
@@ -1262,8 +1417,10 @@ class IPCHandler {
     // the removed member can still read, before that core is retired.
     const remaining = participants.filter(k => k !== removedKey)
     await this.chatStore.updateConversation(conv.id, { participantIds: remaining })
-    this.groupLinks.recordRemoval(conv.id, removedKey)
+    if (recordRemoval) this.groupLinks.recordRemoval(conv.id, removedKey)
     this.groupLinks.forgetRequest(conv.id, removedKey)
+    this.groupLinks.store.clearAdmission(conv.id, removedKey)
+    this.groupLinks.store.save()
     try {
       await this.p2pManager.sendToConversationDurably(conv.id, { type: 'group_member_removed', removedKey })
     } catch (err) {
@@ -1294,12 +1451,20 @@ class IPCHandler {
   /**
    * Owner: give the group a new secret. Members whose app announced it
    * understands this get the new secret now; the rest when it does.
+   *
+   * Every member is recorded as waiting before the secret changes, and
+   * stays so until a transport takes their invite: a failed handoff followed
+   * by the app closing is retried at the next start (retryDeferredRekeys).
    * @returns {Promise<{olderMemberCount: number}>}
    */
   async _rekeyGroup (conversationId) {
     const conv = await this.chatStore.getConversation(conversationId)
     const oldGroupId = conv.groupId
     const oldEpoch = Number.isSafeInteger(conv.groupEpoch) ? conv.groupEpoch : 0
+    const participants = this._normalizedParticipants(conv)
+    for (const key of participants) this.groupLinks.store.deferRekey(conversationId, key, oldGroupId)
+    this.groupLinks.store.save()
+
     // Our current core must be open so its end can be marked.
     if (this.hypercoreManager) await this.hypercoreManager.getOrCreateLocalCore(conversationId)
     await this.chatStore.updateConversation(conversationId, {
@@ -1309,18 +1474,15 @@ class IPCHandler {
     })
     await this._switchToNewGroupSecret(conversationId, oldGroupId, oldEpoch + 1)
 
-    const updated = await this.chatStore.getConversation(conversationId)
-    const participants = this._normalizedParticipants(updated)
     let olderMemberCount = 0
     for (const key of participants) {
       if (this._supportsGroupAdmin(conversationId, key)) {
-        await this.p2pManager.sendInvite(key, this._rekeyInvite(updated, participants, oldGroupId))
+        await this._sendDeferredRekey(conversationId, key)
+          .catch(err => { diag('Group secret not sent yet: ' + (err.message || err)); return false })
       } else {
-        this.groupLinks.store.deferRekey(conversationId, key, oldGroupId)
         olderMemberCount++
       }
     }
-    this.groupLinks.store.save()
     this.pushEvent('conversation.rekeyed', { conversationId })
     return { olderMemberCount }
   }
@@ -1356,8 +1518,12 @@ class IPCHandler {
   async _applyRekey (inviteData, sender, normalizedParticipants) {
     const newGroupId = inviteData.groupId.toLowerCase()
     const myKey = this.identity.publicKeyHex.toLowerCase()
+    // rekeyOf names the secret the owner last knew us on. A retried invite
+    // may name one we already moved past, so earlier secrets match too; the
+    // epoch check below still refuses anything older than where we are.
     const conv = [...this.chatStore.conversations.values()].find(c => c.type === 'group' &&
-      (c.groupId === newGroupId || groupTopicHex(c.groupId) === inviteData.rekeyOf))
+      (c.groupId === newGroupId || groupTopicHex(c.groupId) === inviteData.rekeyOf ||
+        (c.pastGroupIds || []).some(p => groupTopicHex(p.groupId) === inviteData.rekeyOf)))
     if (!conv || this.chatStore.hasLeftConversation(conv.id) || conv.removedAt) return true
     if ((conv.creatorKey || '').toLowerCase() !== sender) return true
 
@@ -1447,20 +1613,24 @@ class IPCHandler {
 
   /**
    * Hand one waiting member the group's current secret. The wait is cleared
-   * only once a transport took the invite; otherwise the next start retries.
+   * only once a transport took the invite; until then mailbox drains and the
+   * next start retry it.
    */
-  async _sendDeferredRekey (conversationId, key) {
+  async _sendDeferredRekey (conversationId, key, { resend = false } = {}) {
     const fromGroupId = this.groupLinks.store.pendingRekey(conversationId)[key]
     if (!fromGroupId) return false
     const conv = await this.chatStore.getConversation(conversationId)
     const myKey = (this.identity.publicKeyHex || '').toLowerCase()
     const participants = conv ? this._normalizedParticipants(conv) : []
-    if (!conv || (conv.creatorKey || '').toLowerCase() !== myKey || !participants.includes(key)) {
+    // Nothing to hand over. A matching groupId means the app stopped before
+    // the group moved to its new secret.
+    if (!conv || (conv.creatorKey || '').toLowerCase() !== myKey || !participants.includes(key) ||
+        conv.groupId === fromGroupId) {
       this.groupLinks.store.clearPendingRekey(conversationId, key)
       this.groupLinks.store.save()
       return false
     }
-    const sent = await this.p2pManager.sendInvite(key, this._rekeyInvite(conv, participants, fromGroupId))
+    const sent = await this._inviteSender(resend)(key, this._rekeyInvite(conv, participants, fromGroupId))
     if (sent) {
       this.groupLinks.store.clearPendingRekey(conversationId, key)
       this.groupLinks.store.save()

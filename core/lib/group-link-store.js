@@ -17,8 +17,11 @@
  *   removed:    conversationId -> keys the owner removed from that group
  *   memberCaps: conversationId -> { memberKey: [feature, ...] }
  *   pendingRekey: conversationId -> { memberKey: groupId they were last sent }
- *     members on an older app who get the group's new secret once they
- *     announce they understand it
+ *     members still to be handed the group's new secret: on an older app
+ *     until they announce they understand it, otherwise until a transport
+ *     takes the invite
+ *   pendingAdmissions: conversationId -> { memberKey: { viaLink, queuedAt } }
+ *     link admissions whose invite no transport has taken yet
  *   capsAnnounced: conversationId -> version this device announced there
  *   blockedKeys: keys the app has blocked, pushed down by the native side
  */
@@ -32,7 +35,7 @@ const diag = createDiagnosticLogger('GLINK')
 const FILE_VERSION = 1
 
 function emptyState () {
-  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, pendingRekey: {}, capsAnnounced: {}, blockedKeys: [] }
+  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, pendingRekey: {}, pendingAdmissions: {}, capsAnnounced: {}, blockedKeys: [] }
 }
 
 function isObject (value) {
@@ -59,7 +62,7 @@ class GroupLinkStore {
       return
     }
     const state = emptyState()
-    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps', 'pendingRekey', 'capsAnnounced']) {
+    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps', 'pendingRekey', 'pendingAdmissions', 'capsAnnounced']) {
       if (isObject(stored[key])) state[key] = stored[key]
     }
     if (Array.isArray(stored.blockedKeys)) state.blockedKeys = stored.blockedKeys.filter(k => typeof k === 'string')
@@ -162,6 +165,25 @@ class GroupLinkStore {
     if (Object.keys(pending).length === 0) delete this.state.pendingRekey[conversationId]
   }
 
+  pendingAdmission (conversationId, memberKey) {
+    const pending = this.state.pendingAdmissions[conversationId]
+    return (pending && pending[memberKey]) || null
+  }
+
+  /** viaLink is the signed admission and the groupId it was signed for, or null. */
+  queueAdmission (conversationId, memberKey, viaLink, queuedAt) {
+    const pending = this.state.pendingAdmissions[conversationId] || {}
+    pending[memberKey] = { viaLink, queuedAt }
+    this.state.pendingAdmissions[conversationId] = pending
+  }
+
+  clearAdmission (conversationId, memberKey) {
+    const pending = this.state.pendingAdmissions[conversationId]
+    if (!pending) return
+    delete pending[memberKey]
+    if (Object.keys(pending).length === 0) delete this.state.pendingAdmissions[conversationId]
+  }
+
   capsAnnounced (conversationId) {
     return this.state.capsAnnounced[conversationId] || 0
   }
@@ -186,6 +208,7 @@ class GroupLinkStore {
     delete this.state.removed[conversationId]
     delete this.state.memberCaps[conversationId]
     delete this.state.pendingRekey[conversationId]
+    delete this.state.pendingAdmissions[conversationId]
     delete this.state.capsAnnounced[conversationId]
   }
 }

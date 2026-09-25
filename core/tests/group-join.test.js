@@ -13,7 +13,7 @@ const b4a = require('b4a')
 const sodium = require('sodium-universal')
 const { encryptInvite, drainInvites } = require('../lib/invite-mailbox')
 const { GroupLinkStore } = require('../lib/group-link-store')
-const { GroupLinkService, RATE_LIMIT, RESEND_INTERVAL_MS, JOINER_TTL_MS } = require('../lib/group-link-service')
+const { GroupLinkService, RATE_LIMIT, RESEND_INTERVAL_MS, JOINER_TTL_MS, FINISHED_KEEP_MS } = require('../lib/group-link-service')
 const gl = require('../lib/group-link')
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'group-join-'))
@@ -83,6 +83,7 @@ class Node {
     this.chatStore = chatStoreStub()
     this.events = []
     this.admitCalls = []
+    this.withdrawCalls = []
     this.store = new GroupLinkStore({ filePath: path.join(tmpRoot, 'links-' + (++fileCounter) + '.json') })
     this.service = new GroupLinkService({
       store: this.store,
@@ -95,6 +96,7 @@ class Node {
         drainOwn: async () => this.drainOwn()
       },
       admit: async (...args) => this.admit(...args),
+      withdraw: async (conversationId, joinerKey) => this.withdrawMember(conversationId, joinerKey),
       emit: (type, payload) => this.events.push({ type, payload }),
       now: () => world.clock,
       timers: { setInterval: () => null, clearInterval: () => {} }
@@ -118,7 +120,7 @@ class Node {
     const conv = this.chatStore.conversations.get(conversationId)
     if (!options.resendOnly) conv.participantIds = [...conv.participantIds, joinerKey]
     const joiner = this.world.nodes.get(joinerKey)
-    if (joiner) {
+    if (joiner && !this.dropInvites) {
       joiner.receiveGroupInvite({
         type: 'group_invite',
         groupId: conv.groupId,
@@ -131,8 +133,18 @@ class Node {
     return true
   }
 
+  /** What ipc-handler does: take the member out (and give the group a new secret). */
+  async withdrawMember (conversationId, joinerKey) {
+    if (this.withdrawFails) throw new Error('offline')
+    this.withdrawCalls.push(joinerKey)
+    const conv = this.chatStore.conversations.get(conversationId)
+    conv.participantIds = conv.participantIds.filter(k => k !== joinerKey)
+  }
+
   receiveGroupInvite (invite) {
     let conv = [...this.chatStore.conversations.values()].find(c => c.groupId === invite.groupId)
+    // As ipc-handler: a link admission into a new group needs a waiting request.
+    if (!conv && invite.viaLink && !this.service.expectsAdmission(invite)) return
     if (!conv) {
       conv = { id: 'joined-' + invite.groupId.substring(0, 8), type: 'group', groupId: invite.groupId, creatorKey: invite.creatorKey, participantIds: invite.participants.filter(k => k !== this.key) }
       this.chatStore.conversations.set(conv.id, conv)
@@ -263,6 +275,135 @@ test('approval mode holds requests for the owner, who can approve', async () => 
   assert.strictEqual(owner.service.listRequests(groupId).length, 0)
 })
 
+test('an approval whose invite was lost is recovered when the joiner asks again', async () => {
+  const { w, owner, joiner, groupId, info } = await setup({ linkOptions: { approval: 'owner' } })
+  const { linkId } = await joiner.service.join(info.link)
+  await owner.service.drainOwnerMailboxes()
+  await joiner.drainOwn()
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'pending_approval')
+
+  owner.dropInvites = true
+  await owner.service.approve(groupId, joiner.key)
+  owner.dropInvites = false
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'pending_approval')
+
+  w.clock += RESEND_INTERVAL_MS
+  await joiner.service.maintainJoinRequests()
+  await owner.service.drainOwnerMailboxes()
+  assert.deepStrictEqual(owner.admitCalls.map(c => c.resendOnly), [false, true])
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'joined')
+})
+
+test('cancelling before the owner acts drops the request, and any later copy of it', async () => {
+  const { w, owner, joiner, groupId, info } = await setup({ linkOptions: { approval: 'owner' } })
+  const { linkId } = await joiner.service.join(info.link)
+  const request = joiner.store.joinerRecord(linkId).request
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(owner.service.listRequests(groupId).length, 1)
+
+  assert.strictEqual(await joiner.service.cancel(linkId), true)
+  const record = joiner.store.joinerRecord(linkId)
+  assert.strictEqual(record.status, 'cancelled')
+  assert.strictEqual(record.request, null)
+  assert.strictEqual(record.withdrawal, null, 'handed to the mailbox')
+
+  await owner.service.drainOwnerMailboxes()
+  assert.deepStrictEqual(owner.service.listRequests(groupId), [])
+  assert.deepStrictEqual(owner.eventsOf('group_link.request_withdrawn'), [{ conversationId: groupId, joinerKey: joiner.key }])
+
+  // A copy of the same request drained later is dropped silently.
+  const rendezvousHex = hex(gl.parseLink(info.link).rendezvousPublicKey)
+  w.mailbox.put(keyPair(), rendezvousHex, request)
+  await owner.service.drainOwnerMailboxes()
+  assert.deepStrictEqual(owner.service.listRequests(groupId), [])
+  assert.strictEqual(owner.eventsOf('group_link.request_received').length, 1)
+  assert.strictEqual(w.mailbox.count(rendezvousHex), 0)
+})
+
+test('cancelling after the owner let the joiner in takes them out again', async () => {
+  const { owner, joiner, groupId, info } = await setup()
+  const { linkId } = await joiner.service.join(info.link)
+  await joiner.service.cancel(linkId)
+
+  // The request and the withdrawal are drained together: the request is
+  // admitted, the joiner's app refuses the admission, and the withdrawal
+  // then takes them out.
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(owner.admitCalls.length, 1)
+  assert.deepStrictEqual(owner.withdrawCalls, [joiner.key])
+  assert.ok(!owner.chatStore.conversations.get(groupId).participantIds.includes(joiner.key))
+  assert.strictEqual(owner.service.getLink(groupId).joins, 0)
+  assert.strictEqual(joiner.chatStore.conversations.size, 0)
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'cancelled')
+
+  // Taking a request back is not a removal: asking again is an ordinary request.
+  assert.strictEqual((await joiner.service.join(info.link)).status, 'requested')
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'joined')
+  assert.strictEqual(owner.withdrawCalls.length, 1)
+})
+
+test('a withdrawal is retried until delivered, and taking someone out is retried too', async () => {
+  const { w, owner, joiner, groupId, info } = await setup()
+  const { linkId } = await joiner.service.join(info.link)
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'joined', 'the joiner accepted this one')
+
+  const other = new Node(w, 'Ben')
+  const second = await other.service.join(info.link)
+  owner.dropInvites = true
+  await owner.service.drainOwnerMailboxes()
+  owner.dropInvites = false
+  w.mailbox.online = false
+  await other.service.cancel(second.linkId)
+  assert.ok(other.store.joinerRecord(second.linkId).withdrawal, 'kept until a transport takes it')
+  w.clock += FINISHED_KEEP_MS
+  await other.service.maintainJoinRequests()
+  assert.ok(other.store.joinerRecord(second.linkId), 'not forgotten while the withdrawal waits')
+
+  w.mailbox.online = true
+  await other.service.maintainJoinRequests()
+  assert.strictEqual(other.store.joinerRecord(second.linkId).withdrawal, null)
+
+  owner.withdrawFails = true
+  await owner.service.drainOwnerMailboxes()
+  assert.ok(owner.chatStore.conversations.get(groupId).participantIds.includes(other.key))
+  owner.withdrawFails = false
+  await owner.service.drainOwnerMailboxes()
+  assert.deepStrictEqual(owner.withdrawCalls, [other.key])
+  assert.ok(owner.chatStore.conversations.get(groupId).participantIds.includes(joiner.key), 'the other joiner stays')
+})
+
+test('a withdrawal only takes back the request it names, and only its joiner can sign it', async () => {
+  const { w, owner, joiner, groupId, info } = await setup({ linkOptions: { approval: 'owner' } })
+  const rendezvousHex = hex(gl.parseLink(info.link).rendezvousPublicKey)
+  const first = await joiner.service.join(info.link)
+  const firstRequest = joiner.store.joinerRecord(first.linkId).request
+  await owner.service.drainOwnerMailboxes()
+
+  // Someone else cannot withdraw it.
+  const impostor = keyPair()
+  const forged = gl.createJoinWithdrawal({ request: firstRequest, rendezvousPublicKey: b4a.from(rendezvousHex, 'hex'), joinerKeyPair: impostor })
+  w.mailbox.put(keyPair(), rendezvousHex, { ...forged, joinerKey: joiner.key })
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(owner.service.listRequests(groupId).length, 1)
+
+  // Cancelled while offline, then asked again: the new request is the one queued.
+  w.mailbox.online = false
+  await joiner.service.cancel(first.linkId)
+  const staleWithdrawal = gl.createJoinWithdrawal({ request: firstRequest, rendezvousPublicKey: b4a.from(rendezvousHex, 'hex'), joinerKeyPair: joiner.keyPair })
+  w.mailbox.online = true
+  await joiner.service.join(info.link)
+  assert.strictEqual(joiner.store.joinerRecord(first.linkId).withdrawal, undefined, 'asking again drops the unsent withdrawal')
+  await owner.service.drainOwnerMailboxes()
+  w.mailbox.put(keyPair(), rendezvousHex, staleWithdrawal)
+  await owner.service.drainOwnerMailboxes()
+  assert.strictEqual(owner.service.listRequests(groupId).length, 1, 'the newer request still waits')
+  assert.strictEqual(owner.eventsOf('group_link.request_withdrawn').length, 0)
+  assert.strictEqual((await owner.service.approve(groupId, joiner.key)).status, 'admitted')
+  assert.strictEqual(joiner.store.joinerRecord(first.linkId).status, 'joined')
+})
+
 test('a declined joiner is told, and the same link then ignores them', async () => {
   const { w, owner, joiner, groupId, info } = await setup({ linkOptions: { approval: 'owner' } })
   const { linkId } = await joiner.service.join(info.link)
@@ -272,7 +413,7 @@ test('a declined joiner is told, and the same link then ignores them', async () 
   assert.strictEqual(joiner.store.joinerRecord(linkId).status, 'declined')
 
   // Asking again is dropped without an answer or a new request.
-  joiner.service.cancel(linkId)
+  await joiner.service.cancel(linkId)
   await joiner.service.join(info.link)
   await owner.service.drainOwnerMailboxes()
   assert.strictEqual(owner.service.listRequests(groupId).length, 0)

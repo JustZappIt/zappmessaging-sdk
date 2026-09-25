@@ -658,13 +658,17 @@ async function initialize() {
         coldStartMilestone('conversation_reconnect_finished')
         diag('Auto-reconnected ' + conversations.length + ' conversation(s)')
         // Let each group's owner know this app understands removal, and as an
-        // owner, hand waiting members a group secret they could not get before.
+        // owner, hand waiting members a group secret or a link admission they
+        // could not get before.
         if (ipcHandler) {
           for (const conv of conversations) {
             if (conv.type === 'group') ipcHandler.announceGroupCaps(conv.id)
           }
           ipcHandler.retryDeferredRekeys().catch((err) => {
             diag('Deferred group secrets not retried: ' + (err.message || err))
+          })
+          ipcHandler.retryPendingAdmissions().catch((err) => {
+            diag('Pending link admissions not retried: ' + (err.message || err))
           })
         }
       } catch (e) {

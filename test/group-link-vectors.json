@@ -171,5 +171,13 @@
       "status": "pending_approval",
       "sig": "1e4570dd42ec90fff6b4da50a3b52d9d0b203f2f6e34621861bbed6e20a527eb80a5156d9a2b711e4b612f7f861f42117440021a0c5b27010f829947954c060e"
     }
-  ]
+  ],
+  "withdraw": {
+    "type": "group_join_withdraw",
+    "v": 1,
+    "linkId": "c096cd088d6ad169ccc50645be0a96f8",
+    "joinerKey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "nonce": "55555555555555555555555555555555",
+    "sig": "67c59b0ecb917a7a3211ad374e39d6944641e7a5b76ff69b237455f4e8f7b3b8b519d0344d6f5c898d426da5da4bff5b55b708650634885697cda00cc1826309"
+  }
 }
