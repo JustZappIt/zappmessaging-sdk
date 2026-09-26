@@ -561,6 +561,31 @@ test('opening your own link, or a link you already joined, needs nothing', async
   assert.strictEqual(again.status, 'already_member')
 })
 
+test('a removed member opening the old link asks again rather than being told they are in', async () => {
+  const { owner, joiner, groupId, info } = await setup({ linkOptions: { approval: 'owner' } })
+  await joiner.service.join(info.link)
+  await owner.service.drainOwnerMailboxes()
+  await owner.service.approve(groupId, joiner.key)
+  const { linkId } = gl.inspectLink(info.link)
+  const conversationId = joiner.store.conversationJoinedVia(linkId)
+  assert.strictEqual((await joiner.service.join(info.link)).status, 'already_member')
+
+  // The owner removes them without resetting the link.
+  const ownerConv = owner.chatStore.conversations.get(groupId)
+  ownerConv.participantIds = ownerConv.participantIds.filter(k => k !== joiner.key)
+  owner.service.recordRemoval(groupId, joiner.key)
+  joiner.chatStore.conversations.get(conversationId).removedAt = joiner.world.clock
+  const again = await joiner.service.join(info.link)
+  assert.strictEqual(again.status, 'requested')
+  assert.strictEqual(again.conversationId, undefined)
+
+  // In approval mode the owner sees the request, marked.
+  await owner.service.drainOwnerMailboxes()
+  const [request] = owner.service.listRequests(groupId)
+  assert.strictEqual(request.joinerKey, joiner.key)
+  assert.strictEqual(request.previouslyRemoved, true)
+})
+
 test('waiting requests expire after 30 days', async () => {
   const { w, joiner, info } = await setup()
   const { linkId } = await joiner.service.join(info.link)

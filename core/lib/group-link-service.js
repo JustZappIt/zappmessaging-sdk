@@ -633,9 +633,10 @@ class GroupLinkService {
     return null
   }
 
+  /** A conversation we are still in: not left, and not removed from by the owner. */
   _liveConversation (conversationId) {
-    return conversationId && this.chatStore.conversations.has(conversationId) &&
-      !this.chatStore.hasLeftConversation(conversationId)
+    const conv = conversationId && this.chatStore.conversations.get(conversationId)
+    return !!conv && !conv.removedAt && !this.chatStore.hasLeftConversation(conversationId)
   }
 
   /**
