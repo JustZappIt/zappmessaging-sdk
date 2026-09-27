@@ -579,7 +579,8 @@ Send a text message.
     "contentType": "text/plain",
     "replyToId": null,
     "replyToSenderName": null,
-    "replyToContent": null
+    "replyToContent": null,
+    "replyToContentType": null
   }
 }
 ```
@@ -611,7 +612,8 @@ Send a text message.
       "mediaTransferState": null,
       "replyToId": null,
       "replyToSenderName": null,
-      "replyToContent": null
+      "replyToContent": null,
+      "replyToContentType": null
     },
     "sent": true,
     "durability": {

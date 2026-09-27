@@ -289,3 +289,29 @@ test('contacts.update rejects malformed payloads before touching the store', asy
   assert.deepStrictEqual(await handler.handleContacts('update', { publicKey: ownKey, updates: { name: 'ok' } }), { success: true })
   assert.strictEqual(touched, true)
 })
+
+test('message.send and media.send_message forward the quoted message type to the store', async () => {
+  const handler = Object.create(IPCHandler.prototype)
+  const stored = []
+  handler.identity = { publicKeyHex: ownKey, displayName: 'Me' }
+  handler.chatStore = {
+    getConversation: async () => ({ id: 'conversation', type: 'group' }),
+    addMessage: async (conversationId, data) => { stored.push(data); return { id: 'persisted', ...data } },
+    markRelayedByIds: () => []
+  }
+  handler.p2pManager = { sendToConversationDurably: async () => ({ sent: true, relay: 'pending' }) }
+  handler.pushEvent = () => {}
+  handler.mediaTransfer = null
+  handler.mediaStore = {}
+  handler._mediaCoreDescriptor = async () => ({})
+
+  const reply = { replyToId: 'quoted', replyToSenderName: 'alice', replyToContent: 'beach', replyToContentType: 'image/jpeg' }
+  await handler.handleMessage('send', { conversationId: 'conversation', content: 'nice', ...reply })
+  await handler.handleMedia('send_message', { conversationId: 'conversation', contentType: 'image/jpeg', mediaId: 'ff'.repeat(32), ...reply })
+  await handler.handleMessage('send', { conversationId: 'conversation', content: 'plain' })
+
+  assert.strictEqual(stored.length, 3)
+  assert.strictEqual(stored[0].replyToContentType, 'image/jpeg')
+  assert.strictEqual(stored[1].replyToContentType, 'image/jpeg')
+  assert.strictEqual(stored[2].replyToContentType, null)
+})

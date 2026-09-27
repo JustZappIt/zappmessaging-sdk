@@ -690,7 +690,8 @@ class ZappMessagingSDK internal constructor(
         contentType: String = "text/plain",
         replyToId: String? = null,
         replyToSenderName: String? = null,
-        replyToContent: String? = null
+        replyToContent: String? = null,
+        replyToContentType: String? = null
     ): ZMMessage {
         requireIdentity()
         ensureConversationConnected(conversationId)
@@ -702,6 +703,7 @@ class ZappMessagingSDK internal constructor(
             replyToId?.let { put("replyToId", it) }
             replyToSenderName?.let { put("replyToSenderName", it) }
             replyToContent?.let { put("replyToContent", it) }
+            replyToContentType?.let { put("replyToContentType", it) }
         }
 
         val response = ipcBridge.sendRequest("message.send", payload)
@@ -822,7 +824,8 @@ class ZappMessagingSDK internal constructor(
         thumbnailData: String? = null,
         replyToId: String? = null,
         replyToSenderName: String? = null,
-        replyToContent: String? = null
+        replyToContent: String? = null,
+        replyToContentType: String? = null
     ): ZMMessage {
         requireIdentity()
         ensureConversationConnected(conversationId)
@@ -854,6 +857,7 @@ class ZappMessagingSDK internal constructor(
             replyToId?.let { put("replyToId", it) }
             replyToSenderName?.let { put("replyToSenderName", it) }
             replyToContent?.let { put("replyToContent", it) }
+            replyToContentType?.let { put("replyToContentType", it) }
         }
 
         val response = ipcBridge.sendRequest("media.send_message", sendPayload)

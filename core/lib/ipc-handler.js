@@ -2015,7 +2015,8 @@ class IPCHandler {
           isFromMe: true,
           replyToId: payload.replyToId || null,
           replyToSenderName: payload.replyToSenderName || null,
-          replyToContent: payload.replyToContent || null
+          replyToContent: payload.replyToContent || null,
+          replyToContentType: payload.replyToContentType || null
         })
 
         diag('Outgoing message stored locally conv=' + payload.conversationId.substring(0, 12) +
@@ -2318,7 +2319,8 @@ class IPCHandler {
           mediaTransferState: 'complete',
           replyToId: payload.replyToId || null,
           replyToSenderName: payload.replyToSenderName || null,
-          replyToContent: payload.replyToContent || null
+          replyToContent: payload.replyToContent || null,
+          replyToContentType: payload.replyToContentType || null
         })
 
         // Send message JSON (with thumbnail) over P2P

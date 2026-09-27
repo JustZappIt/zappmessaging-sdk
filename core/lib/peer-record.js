@@ -37,6 +37,10 @@ function keys (value, field) {
   return [...new Set(value.map(k => key(k, field, true)))]
 }
 const MEDIA_DESCRIPTOR_FIELDS = ['mediaCoreKey', 'mediaBlockOffset', 'mediaBlockLength']
+const MIME_TYPE = /^[\w.+-]+\/[\w.+-]+(?:;[^\r\n]*)?$/
+function mimeType (value) {
+  return typeof value === 'string' && b4a.byteLength(value) <= 256 && MIME_TYPE.test(value)
+}
 // Where an image's bytes sit in the sender's media core. Meaningless without
 // the mediaId that verifies them, so it is all three fields or none.
 function validateMediaDescriptor (record) {
@@ -53,8 +57,9 @@ function validateMessage (record) {
   string(record.senderId, 'senderId', 128, true)
   for (const field of ['content', 'replyToContent']) string(record[field], field, MAX_CONTENT)
   for (const field of ['senderName', 'replyToSenderName']) string(record[field], field, 1024)
-  string(record.contentType, 'contentType', 256)
-  if (record.contentType != null && !/^[\w.+-]+\/[\w.+-]+(?:;[^\r\n]*)?$/.test(record.contentType)) throw new InvalidPeerRecord('contentType')
+  if (record.contentType != null && !mimeType(record.contentType)) throw new InvalidPeerRecord('contentType')
+  // Only a hint for drawing the quote, so a bad one is cleared rather than failing the message.
+  if (record.replyToContentType != null && !mimeType(record.replyToContentType)) record.replyToContentType = null
   identifier(record.replyToId, 'replyToId')
   string(record.mediaId, 'mediaId', 128)
   validateMediaDescriptor(record)
@@ -143,7 +148,7 @@ function normalizePeerRecord (input, peer) {
     // Unrecognized types remain controls and are never stored as chat rows.
     return record
   }
-  for (const field of ['id', 'senderName', 'content', 'contentType', 'timestamp', 'mediaId', 'mediaSize', 'mediaWidth', 'mediaHeight', 'thumbnailData', 'replyToId', 'replyToSenderName', 'replyToContent', ...MEDIA_DESCRIPTOR_FIELDS]) {
+  for (const field of ['id', 'senderName', 'content', 'contentType', 'timestamp', 'mediaId', 'mediaSize', 'mediaWidth', 'mediaHeight', 'thumbnailData', 'replyToId', 'replyToSenderName', 'replyToContent', 'replyToContentType', ...MEDIA_DESCRIPTOR_FIELDS]) {
     if (input[field] != null) record[field] = input[field]
   }
   record.senderId = peer

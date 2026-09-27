@@ -158,13 +158,27 @@ final class SDKContractTests: XCTestCase {
         let payload = try decodePayload("""
         {"id":"m2","conversationId":"c1","senderId":"abc","content":"re",
          "timestamp":1751500000000,"isFromMe":true,
-         "replyToId":"m1","replyToSenderName":"alice","replyToContent":"hi"}
+         "replyToId":"m1","replyToSenderName":"alice","replyToContent":"hi",
+         "replyToContentType":"image/jpeg"}
         """)
 
         let message = try XCTUnwrap(ZMParse.message(from: payload))
         XCTAssertEqual(message.replyToId, "m1")
         XCTAssertEqual(message.replyToSenderName, "alice")
         XCTAssertEqual(message.replyToContent, "hi")
+        XCTAssertEqual(message.replyToContentType, "image/jpeg")
+    }
+
+    /// A client that predates the field sends no `replyToContentType`; readers treat it as a text quote.
+    func testLegacyReplyParsesWithoutQuotedType() throws {
+        let payload = try decodePayload("""
+        {"id":"m2","conversationId":"c1","senderId":"abc","content":"re",
+         "timestamp":1751500000000,"isFromMe":true,"replyToId":"m1"}
+        """)
+
+        let message = try XCTUnwrap(ZMParse.message(from: payload))
+        XCTAssertEqual(message.replyToId, "m1")
+        XCTAssertNil(message.replyToContentType)
     }
 
     func testContactWalletAddressIsParsed() throws {

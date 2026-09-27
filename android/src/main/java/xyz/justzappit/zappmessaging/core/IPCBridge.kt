@@ -347,6 +347,7 @@ internal class IPCBridge {
             replyToId = data["replyToId"]?.jsonPrimitive?.contentOrNull,
             replyToSenderName = data["replyToSenderName"]?.jsonPrimitive?.contentOrNull,
             replyToContent = data["replyToContent"]?.jsonPrimitive?.contentOrNull,
+            replyToContentType = data["replyToContentType"]?.jsonPrimitive?.contentOrNull,
             status = data["status"]?.jsonPrimitive?.contentOrNull
         )
     }

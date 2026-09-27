@@ -333,6 +333,7 @@ extension IPCBridge {
             payload["replyToId"] = replyTo.id
             payload["replyToSenderName"] = replyTo.senderName
             payload["replyToContent"] = replyTo.content
+            payload["replyToContentType"] = replyTo.contentType
         }
 
         let response = try await sendRequest(type: "message.send", payload: payload)
@@ -454,10 +455,14 @@ public struct ZMReplyContext: Equatable, Sendable {
     public let id: String
     public let senderName: String
     public let content: String
+    /// MIME type of the quoted message. Lets the recipient label a quoted photo, file or
+    /// payment request in its own language instead of echoing the raw body.
+    public let contentType: String?
 
-    public init(id: String, senderName: String, content: String) {
+    public init(id: String, senderName: String, content: String, contentType: String? = nil) {
         self.id = id
         self.senderName = senderName
         self.content = content
+        self.contentType = contentType
     }
 }
