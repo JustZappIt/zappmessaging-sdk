@@ -109,6 +109,8 @@ data class ZMGroupJoinResult(
     val linkId: String? = null,
     /** Set when already a member. */
     val conversationId: String? = null,
+    /** The request reached the link's mailbox. False while it is only queued on this device. */
+    val sent: Boolean = true,
 )
 
 /** Where a request this device made stands. */
@@ -135,6 +137,8 @@ data class ZMGroupJoinUpdate(
     val status: ZMGroupJoinStatus,
     val conversationId: String? = null,
     val nameHint: String? = null,
+    /** The request reached the link's mailbox. False while it is only queued on this device. */
+    val sent: Boolean = true,
 )
 
 /** A request waiting for the owner, in approval mode. */

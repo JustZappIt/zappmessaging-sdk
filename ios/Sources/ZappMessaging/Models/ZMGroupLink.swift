@@ -153,16 +153,24 @@ public enum ZMGroupJoinRequestStatus: String, Equatable, Sendable {
 
 /// The answer to asking to join.
 public struct ZMGroupJoinResult: Equatable, Sendable {
-    public init(status: ZMGroupJoinRequestStatus, linkId: String? = nil, conversationId: String? = nil) {
+    public init(
+        status: ZMGroupJoinRequestStatus,
+        linkId: String? = nil,
+        conversationId: String? = nil,
+        sent: Bool = true
+    ) {
         self.status = status
         self.linkId = linkId
         self.conversationId = conversationId
+        self.sent = sent
     }
 
     public let status: ZMGroupJoinRequestStatus
     public let linkId: String?
     /// Set when already a member.
     public let conversationId: String?
+    /// The request reached the link's mailbox. False while it is only queued on this device.
+    public let sent: Bool
 }
 
 /// Where a request this device made stands.
@@ -187,18 +195,22 @@ public struct ZMGroupJoinUpdate: Equatable, Sendable {
         linkId: String,
         status: ZMGroupJoinStatus,
         conversationId: String? = nil,
-        nameHint: String? = nil
+        nameHint: String? = nil,
+        sent: Bool = true
     ) {
         self.linkId = linkId
         self.status = status
         self.conversationId = conversationId
         self.nameHint = nameHint
+        self.sent = sent
     }
 
     public let linkId: String
     public let status: ZMGroupJoinStatus
     public let conversationId: String?
     public let nameHint: String?
+    /// The request reached the link's mailbox. False while it is only queued on this device.
+    public let sent: Bool
 }
 
 /// A request waiting for the owner, in approval mode.
@@ -287,7 +299,8 @@ extension ZMParse {
         ZMGroupJoinResult(
             status: ZMGroupJoinRequestStatus(raw: data["status"] as? String),
             linkId: data["linkId"] as? String,
-            conversationId: data["conversationId"] as? String
+            conversationId: data["conversationId"] as? String,
+            sent: data["sent"] as? Bool ?? true
         )
     }
 
@@ -297,7 +310,8 @@ extension ZMParse {
             linkId: linkId,
             status: ZMGroupJoinStatus(raw: data["status"] as? String),
             conversationId: data["conversationId"] as? String,
-            nameHint: data["nameHint"] as? String
+            nameHint: data["nameHint"] as? String,
+            sent: data["sent"] as? Bool ?? true
         )
     }
 

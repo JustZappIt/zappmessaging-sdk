@@ -640,8 +640,10 @@ class GroupLinkService {
   }
 
   /**
-   * Asks to join through a link.
-   * @returns {Promise<{status: string, linkId?: string, conversationId?: string}>}
+   * Asks to join through a link. `sent` says whether the request reached the
+   * link's mailbox; when it did not, it stays queued here and goes out on a
+   * later drain, with a join update when it does.
+   * @returns {Promise<{status: string, linkId?: string, conversationId?: string, sent?: boolean}>}
    */
   async join (link, joinerName = null) {
     if (!this.identity || !this.identity.keyPair) {
@@ -662,7 +664,7 @@ class GroupLinkService {
     const existing = this.store.joinerRecord(linkId)
     if (existing && WAITING_STATUSES.has(existing.status)) {
       await this._maybeResend(existing)
-      return { status: 'already_requested', linkId }
+      return { status: 'already_requested', linkId, sent: existing.sendCount > 0 }
     }
 
     const name = joinerName || this.identity.displayName || this.myKey.substring(0, 8)
@@ -691,8 +693,8 @@ class GroupLinkService {
     }
     this.store.setJoinerRecord(linkId, record)
     this.store.save()
-    await this._send(record)
-    return { status: 'requested', linkId }
+    const sent = await this._send(record)
+    return { status: 'requested', linkId, sent }
   }
 
   async _send (record) {
@@ -718,7 +720,12 @@ class GroupLinkService {
     if (!WAITING_STATUSES.has(record.status)) return false
     const due = record.sendCount === 0 ||
       (record.sendCount < MAX_SENDS && this.now() - record.lastSentAt >= RESEND_INTERVAL_MS)
-    return due ? this._send(record) : false
+    if (!due) return false
+    const first = record.sendCount === 0
+    const sent = await this._send(record)
+    // A request that was only queued here has now gone out.
+    if (sent && first) this._emitJoinUpdated(record)
+    return sent
   }
 
   joinStatus () {
@@ -727,7 +734,8 @@ class GroupLinkService {
       status: r.status,
       nameHint: r.nameHint,
       createdAt: r.createdAt,
-      conversationId: r.conversationId || null
+      conversationId: r.conversationId || null,
+      sent: r.sendCount > 0
     }))
   }
 
@@ -778,7 +786,16 @@ class GroupLinkService {
     // Nothing waiting needs the request any more.
     if (FINAL_STATUSES.has(status)) record.request = null
     this.store.save()
-    this.emit('group_link.join_updated', { linkId: record.linkId, status, conversationId: record.conversationId || null })
+    this._emitJoinUpdated(record)
+  }
+
+  _emitJoinUpdated (record) {
+    this.emit('group_link.join_updated', {
+      linkId: record.linkId,
+      status: record.status,
+      conversationId: record.conversationId || null,
+      sent: record.sendCount > 0
+    })
   }
 
   /**

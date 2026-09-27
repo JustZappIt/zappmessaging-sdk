@@ -65,6 +65,10 @@ final class GroupLinkTests: XCTestCase {
         let update = ZMParse.joinUpdate(from: try decodePayload(#"{"linkId":"l1","status":"pending_approval"}"#))
         XCTAssertEqual(update?.status, .pendingApproval)
         XCTAssertEqual(update?.status.isWaiting, true)
+        XCTAssertEqual(update?.sent, true, "an older core that does not say is taken as sent")
+        let queued = ZMParse.joinUpdate(from: try decodePayload(#"{"linkId":"l1","status":"waiting","sent":false}"#))
+        XCTAssertEqual(queued?.sent, false)
+        XCTAssertEqual(ZMParse.joinResult(from: try decodePayload(#"{"status":"requested","linkId":"l1","sent":false}"#)).sent, false)
         let request = ZMParse.approvalRequest(conversationId: "g1", from: try decodePayload(
             #"{"joinerKey":"cdcd","joinerName":"Ben","requestedAt":1789800000000,"previouslyRemoved":true}"#))
         XCTAssertEqual(request?.joinerName, "Ben")

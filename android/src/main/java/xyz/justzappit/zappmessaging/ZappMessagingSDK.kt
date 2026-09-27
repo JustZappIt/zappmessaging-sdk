@@ -601,6 +601,7 @@ class ZappMessagingSDK internal constructor(
             status = ZMGroupJoinRequestStatus.fromRaw(response["status"]?.jsonPrimitive?.contentOrNull),
             linkId = response["linkId"]?.jsonPrimitive?.contentOrNull,
             conversationId = response["conversationId"]?.jsonPrimitive?.contentOrNull,
+            sent = response["sent"]?.jsonPrimitive?.booleanOrNull ?: true,
         )
     }
 
@@ -615,6 +616,7 @@ class ZappMessagingSDK internal constructor(
                 status = ZMGroupJoinStatus.fromRaw(obj["status"]?.jsonPrimitive?.contentOrNull),
                 conversationId = obj["conversationId"]?.jsonPrimitive?.contentOrNull,
                 nameHint = obj["nameHint"]?.jsonPrimitive?.contentOrNull,
+                sent = obj["sent"]?.jsonPrimitive?.booleanOrNull ?: true,
             )
         } ?: emptyList()
     }
@@ -1196,6 +1198,7 @@ class ZappMessagingSDK internal constructor(
                                 linkId = linkId,
                                 status = ZMGroupJoinStatus.fromRaw(payload["status"]?.jsonPrimitive?.contentOrNull),
                                 conversationId = payload["conversationId"]?.jsonPrimitive?.contentOrNull,
+                                sent = payload["sent"]?.jsonPrimitive?.booleanOrNull ?: true,
                             )
                         )
                     }

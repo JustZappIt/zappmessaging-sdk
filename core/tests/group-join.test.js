@@ -188,6 +188,7 @@ test('a joiner is admitted automatically when the owner next drains', async () =
 
   const result = await joiner.service.join(info.link)
   assert.strictEqual(result.status, 'requested')
+  assert.strictEqual(result.sent, true)
   assert.strictEqual(joiner.store.joinerRecord(result.linkId).status, 'waiting')
   assert.strictEqual(owner.admitCalls.length, 0, 'nothing happens until the owner is online')
 
@@ -250,9 +251,20 @@ test('requests wait while the owner is offline, and resends are spaced a day apa
 test('a request sent while the network is down goes out on the next drain', async () => {
   const { w, owner, joiner, info } = await setup()
   w.mailbox.online = false
-  assert.strictEqual((await joiner.service.join(info.link)).status, 'requested')
+  const result = await joiner.service.join(info.link)
+  assert.strictEqual(result.status, 'requested')
+  assert.strictEqual(result.sent, false, 'only queued on this device')
+  assert.strictEqual(joiner.service.joinStatus()[0].sent, false)
+  assert.strictEqual((await joiner.service.join(info.link)).sent, false, 'asking again while offline')
+
   w.mailbox.online = true
   await joiner.service.maintainJoinRequests()
+  assert.deepStrictEqual(joiner.eventsOf('group_link.join_updated'),
+    [{ linkId: result.linkId, status: 'waiting', conversationId: null, sent: true }])
+  assert.strictEqual(joiner.service.joinStatus()[0].sent, true)
+  await joiner.service.maintainJoinRequests()
+  assert.strictEqual(joiner.eventsOf('group_link.join_updated').length, 1, 'a resend is not news')
+
   await owner.service.drainOwnerMailboxes()
   assert.strictEqual(owner.admitCalls.length, 1)
 })

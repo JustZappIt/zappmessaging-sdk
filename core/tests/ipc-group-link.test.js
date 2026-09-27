@@ -206,8 +206,9 @@ async function ownerAndJoiner ({ approval = 'auto' } = {}) {
   const owner = makeHarness({ conversations: ownedGroup() })
   const { link } = await owner.handler.routeMessage('group_link.enable', { conversationId: 'g1', approval })
   const joiner = makeHarness({ keyPair: JOINER_KP })
-  const { status, linkId } = await joiner.handler.routeMessage('group_link.join', { link })
+  const { status, linkId, sent } = await joiner.handler.routeMessage('group_link.join', { link })
   assert.strictEqual(status, 'requested')
+  assert.strictEqual(sent, false, 'this harness has no mailbox to take it')
   return { owner, joiner, linkId }
 }
 
@@ -237,7 +238,7 @@ test('after cancelling, a later admission creates and joins nothing', async () =
   assert.deepStrictEqual(await joiner.handler.routeMessage('group_link.cancel', { linkId }), { cancelled: true })
   assert.strictEqual(joiner.handler.groupLinks.store.joinerRecord(linkId).status, 'cancelled')
   assert.deepStrictEqual(joiner.calls.events.find(e => e.type === 'group_link.join_updated').payload,
-    { linkId, status: 'cancelled', conversationId: null })
+    { linkId, status: 'cancelled', conversationId: null, sent: false })
 
   const invite = await admissionInvite(owner, linkId)
   assert.strictEqual(await joiner.handler._handleGroupInvite(invite, MY), true, 'finished with, so the mailbox copy goes')
