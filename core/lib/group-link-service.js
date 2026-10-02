@@ -293,6 +293,9 @@ class GroupLinkService {
       retiredAt: this.now()
     })
     entry.retired = entry.retired.slice(0, MAX_RETIRED)
+    // Once its signing key is gone, an old request cannot be approved safely.
+    entry.requests = entry.requests.filter(r =>
+      r.linkId === entry.current?.linkId || entry.retired.some(link => link.linkId === r.linkId))
   }
 
   listRequests (conversationId) {
@@ -315,6 +318,11 @@ class GroupLinkService {
     const request = entry && entry.requests.find(r => r.joinerKey === key)
     if (!request) throw new GroupLinkRequestError('REQUEST_NOT_FOUND', 'No such join request')
     const record = this._recordForLinkId(entry, request.linkId)
+    if (!record) {
+      entry.requests = entry.requests.filter(r => r !== request)
+      this.store.save()
+      throw new GroupLinkRequestError('REQUEST_NOT_FOUND', 'The invite link for this request expired')
+    }
 
     if (this._groupIsFull(conv) || (record === entry.current && record.maxJoins != null && record.joins >= record.maxJoins)) {
       if (record) await this._sendResult(record, key, 'full')
@@ -323,12 +331,18 @@ class GroupLinkService {
       return { status: 'full' }
     }
 
-    const viaLink = record ? this._viaLink(record, conv, key) : null
+    const viaLink = this._viaLink(record, conv, key)
     if (!await this.admit(conversationId, key, request.joinerName, viaLink)) {
       throw new GroupLinkRequestError('ADMIT_FAILED', 'The member could not be added')
     }
     entry.requests = entry.requests.filter(r => r !== request)
-    if (record) this._noteAdmitted(record, key, request.nonce)
+    // Withdrawal can arrive while admit awaits invitation delivery.
+    if (this._isWithdrawn(record, key, request.nonce)) {
+      await this.withdraw(conversationId, key)
+      this.store.save()
+      throw new GroupLinkRequestError('REQUEST_NOT_FOUND', 'The join request was cancelled')
+    }
+    this._noteAdmitted(record, key, request.nonce)
     if (record === entry.current) {
       record.joins += 1
       entry.admissions.push(this.now())
@@ -465,7 +479,8 @@ class GroupLinkService {
   _pruneOwnerEntry (entry) {
     const now = this.now()
     entry.retired = entry.retired.filter(r => now - r.retiredAt < RETIRED_KEEP_MS)
-    entry.requests = entry.requests.filter(r => now - r.receivedAt < REQUEST_TTL_MS)
+    entry.requests = entry.requests.filter(r => now - r.receivedAt < REQUEST_TTL_MS &&
+      (r.linkId === entry.current?.linkId || entry.retired.some(link => link.linkId === r.linkId)))
     entry.admissions = entry.admissions.filter(t => now - t < RATE_WINDOW_MS)
   }
 
@@ -560,6 +575,10 @@ class GroupLinkService {
       diag('Link admission failed: ' + (err.message || err))
     }
     if (!admitted) return false
+    if (this._isWithdrawn(record, joinerKey, nonce)) {
+      await this.withdraw(conversationId, joinerKey)
+      return true
+    }
     this._noteAdmitted(record, joinerKey, nonce)
     record.joins += 1
     entry.admissions.push(now)
@@ -729,14 +748,16 @@ class GroupLinkService {
   }
 
   joinStatus () {
-    return this.store.joinerRecords().map(r => ({
-      linkId: r.linkId,
-      status: r.status,
-      nameHint: r.nameHint,
-      createdAt: r.createdAt,
-      conversationId: r.conversationId || null,
-      sent: r.sendCount > 0
-    }))
+    return this.store.joinerRecords()
+      .filter(r => r.status !== 'joined' || this._liveConversation(r.conversationId))
+      .map(r => ({
+        linkId: r.linkId,
+        status: r.status,
+        nameHint: r.nameHint,
+        createdAt: r.createdAt,
+        conversationId: r.conversationId || null,
+        sent: r.sendCount > 0
+      }))
   }
 
   /**

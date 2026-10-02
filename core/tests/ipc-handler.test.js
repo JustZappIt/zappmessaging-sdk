@@ -306,6 +306,7 @@ test('message.send and media.send_message forward the quoted message type to the
   handler._mediaCoreDescriptor = async () => ({})
 
   const reply = { replyToId: 'quoted', replyToSenderName: 'alice', replyToContent: 'beach', replyToContentType: 'image/jpeg' }
+  handler.groupLinks = { store: { state: { pendingRemovals: {} } } }
   await handler.handleMessage('send', { conversationId: 'conversation', content: 'nice', ...reply })
   await handler.handleMedia('send_message', { conversationId: 'conversation', contentType: 'image/jpeg', mediaId: 'ff'.repeat(32), ...reply })
   await handler.handleMessage('send', { conversationId: 'conversation', content: 'plain' })

@@ -129,6 +129,8 @@ test('the owner removes a member: record first, then a new secret for everyone e
   assert.strictEqual(invite.groupId, h.conv.groupId)
   assert.deepStrictEqual(invite.participants, [OWNER, ANA, BEN])
   assert.ok(!sent.some(e => e[1] === CAL), 'the removed member gets nothing')
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [ANA]: G0, [BEN]: G0 }, 'a transport write is not receipt')
+  await h.handler.onMemberCaps('g1', ANA, ['group_admin_v1'], topic(h.conv.groupId))
   assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 })
   assert.ok(h.handler.groupLinks.store.removedKeys('g1').includes(CAL))
   assert.notStrictEqual(h.handler.groupLinks.getLink('g1').link, linkBefore, 'the link was reset')
@@ -147,6 +149,7 @@ test('a waiting member gets the new secret once their app announces support', as
   assert.strictEqual(sent.length, 1)
   assert.strictEqual(sent[0][1], BEN)
   assert.strictEqual(sent[0][2].rekeyOf, topic(G0), 'addressed to the secret Ben is still on')
+  await h.handler.onMemberCaps('g1', BEN, ['group_admin_v1'], topic(h.conv.groupId))
   assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [ANA]: G0 }, 'only Ana still waits')
   assert.deepStrictEqual(await h.handler.routeMessage('conversation.removal_status', { conversationId: 'g1' }), { olderMemberCount: 1 })
 })
@@ -160,6 +163,7 @@ test('a deferred secret that no transport took stays waiting and is retried at s
   assert.deepStrictEqual(Object.keys(h.handler.groupLinks.store.pendingRekey('g1')).sort(), [ANA, BEN].sort())
   h.handler.p2pManager.sendInvite = realSend
   await h.handler.retryDeferredRekeys()
+  await h.handler.onMemberCaps('g1', BEN, ['group_admin_v1'], topic(h.conv.groupId))
   assert.deepStrictEqual(Object.keys(h.handler.groupLinks.store.pendingRekey('g1')), [ANA], 'Ana has not announced support yet')
   assert.strictEqual(invites(h.log).filter(e => e[1] === BEN).length, 1)
 })
@@ -181,6 +185,7 @@ test('a new secret no transport took is kept on disk and sent at the next start'
   assert.strictEqual(sent[0][1], ANA)
   assert.strictEqual(sent[0][2].rekeyOf, topic(G0))
   assert.strictEqual(sent[0][2].groupId, h.conv.groupId)
+  await h.handler.onMemberCaps('g1', ANA, ['group_admin_v1'], topic(h.conv.groupId))
   assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 })
 })
 
@@ -195,7 +200,7 @@ test('members are recorded as waiting before the group changes secret', async ()
   }
   await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL })
   assert.deepStrictEqual(waitingAtSwitch, { [ANA]: G0, [BEN]: G0 })
-  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 }, 'Ana\'s invite was taken')
+  assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [ANA]: G0, [BEN]: G0 }, 'a transport write does not confirm receipt')
 })
 
 test('a secret still waiting from before the app stopped mid-rekey is not sent', async () => {
@@ -249,6 +254,8 @@ test('a new secret that failed is retried on mailbox drains, spaced out, without
 
   online = true
   h.handler._deliveryRetry.get('rekey:g1:' + ANA).dueAt = 0
+  await p2p.auxiliaryDrain()
+  await h.handler.onMemberCaps('g1', ANA, ['group_admin_v1'], topic(h.conv.groupId))
   await p2p.auxiliaryDrain()
   assert.deepStrictEqual(h.handler.groupLinks.store.pendingRekey('g1'), { [BEN]: G0 })
   assert.strictEqual(h.handler._deliveryRetry.size, 0)
@@ -368,7 +375,7 @@ test('the receiver drops rows for a removed group, accepts earlier topics, and r
   assert.deepStrictEqual(stored, ['old-topic', 'current-topic'])
 
   await receive('g1', BEN, { type: '__caps', v: 1, features: ['group_admin_v1'] }, { replicated: true })
-  assert.deepStrictEqual(caps, [['g1', BEN, ['group_admin_v1']]])
+  assert.deepStrictEqual(caps, [['g1', BEN, ['group_admin_v1'], undefined]])
 
   conv.removedAt = Date.now()
   await receive('g1', BEN, message('after-removal', 'b1'.repeat(32)), { replicated: true })
@@ -411,4 +418,108 @@ test('an image from before a new secret is fetched with the earlier key', async 
   } finally {
     mediaBlobs.download = originalDownload
   }
+})
+
+
+test('removal must finish key rotation after a local-core open failure', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  h.handler.groupLinks.store.setMemberCaps('g1', BEN, ['group_admin_v1'])
+  const real = h.handler.hypercoreManager.getOrCreateLocalCore
+  h.handler.hypercoreManager.getOrCreateLocalCore = async () => { throw new Error('injected local core open failure') }
+  await assert.rejects(h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL }))
+  h.handler.hypercoreManager.getOrCreateLocalCore = real
+  h.handler.groupLinks.store = new GroupLinkStore({ filePath: h.handler.groupLinks.store.filePath })
+  await h.handler.retryDeferredRekeys()
+  await h.handler.retryPendingDeliveries()
+  const retry = await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL }).catch(e => e.code)
+  assert.notStrictEqual(h.conv.groupId, G0, 'removed members must no longer know the current secret after recovery')
+})
+
+test('rekey handoff must remain recoverable after the mailbox expires it', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  const { MailboxStore } = require('../../server/invite-mailbox')
+  const { encryptInvite } = require('../lib/invite-mailbox')
+  const mailbox = new MailboxStore({ directory: path.join(tmpRoot, 'expiry-mailbox'), ttlMs: 1000 })
+  h.handler.p2pManager.sendInvite = async (key, invite) => { mailbox.put(key, encryptInvite(invite, kp(1), key), null); return true }
+  await h.handler.routeMessage('conversation.remove_member', { conversationId: 'g1', publicKey: CAL })
+  // sendInvite accepted the rekey into the mailbox, but Ana is offline and
+  // the mailbox deletes that envelope at its normal 30-day retention cutoff.
+  assert.strictEqual(mailbox.list(ANA).entries.length, 1)
+  const actualNow = Date.now
+  Date.now = () => actualNow() + 1001
+  try { assert.strictEqual(mailbox.list(ANA).entries.length, 0) } finally { Date.now = actualNow }
+  h.handler.p2pManager.sendInvite = async (key, invite) => { h.log.push(['invite', key, invite]); return true }
+  h.log.length = 0
+  await h.handler.retryDeferredRekeys()
+  await h.handler.onMemberCaps('g1', ANA, ['group_admin_v1'])
+  assert.ok(invites(h.log).some(e => e[1] === ANA), 'a remaining member must be able to recover the current secret')
+})
+
+test('joined status retained after removal bypasses Android rejoin preview', async () => {
+  const gl = require('../lib/group-link')
+  const material = gl.createLinkMaterial()
+  const link = gl.buildLink({ secret: material.secret, rendezvousPublicKey: material.rendezvous.publicKey, nameHint: 'Hiking Crew' })
+  const linkId = hex(material.linkId)
+  const h = harness({ me: ANA, conversation: { id: 'local-7', type: 'group', groupId: G0, creatorKey: OWNER, participantIds: [OWNER, BEN] } })
+  const service = h.handler.groupLinks
+  service.store.setJoinerRecord(linkId, { linkId, rendezvousPublicKey: hex(material.rendezvous.publicKey), status: 'joined', conversationId: 'local-7', createdAt: Date.now(), updatedAt: Date.now(), sendCount: 1 })
+  service.store.addJoinedVia('local-7', linkId)
+  service.store.save()
+  await h.handler._handleGroupMemberRemoved({ type: 'group_member_removed', removedKey: ANA, groupTopicHex: topic(G0) }, OWNER)
+  const statuses = service.joinStatus()
+  const newJoin = await service.join(link)
+  assert.deepStrictEqual(statuses, [], 'removed membership must not report joined to the preview')
+  assert.strictEqual(newJoin.status, 'requested')
+})
+
+test('an interrupted removal can be retried directly and blocks sends until finished', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  const realOpen = h.handler.hypercoreManager.getOrCreateLocalCore
+  h.handler.hypercoreManager.getOrCreateLocalCore = async () => { throw new Error('disk unavailable') }
+  await assert.rejects(h.handler._removeMember('g1', CAL))
+  await assert.rejects(h.handler.routeMessage('message.send', { conversationId: 'g1', content: 'hi' }), e => e.code === 'GROUP_REKEY_PENDING')
+  await assert.rejects(h.handler._removeMember('g1', BEN), e => e.code === 'GROUP_REKEY_PENDING')
+  h.handler.hypercoreManager.getOrCreateLocalCore = realOpen
+  const result = await h.handler._removeMember('g1', CAL)
+  assert.strictEqual(result.success, true)
+  assert.notStrictEqual(h.conv.groupId, G0)
+  assert.deepStrictEqual(h.handler.groupLinks.store.state.pendingRemovals, {})
+})
+
+test('recovery after saving the secret finishes the topic switch without another rotation', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  const realSwitch = h.handler.p2pManager.switchGroupTopic
+  h.handler.p2pManager.switchGroupTopic = async () => { throw new Error('topic switch interrupted') }
+  await assert.rejects(h.handler._removeMember('g1', CAL))
+  const savedSecret = h.conv.groupId
+  assert.notStrictEqual(savedSecret, G0)
+  assert.strictEqual(h.conv.groupEpoch, 1)
+  h.handler.groupLinks.store = new GroupLinkStore({ filePath: h.handler.groupLinks.store.filePath })
+  h.handler.p2pManager.switchGroupTopic = realSwitch
+  await h.handler.retryPendingDeliveries()
+  assert.strictEqual(h.conv.groupId, savedSecret)
+  assert.strictEqual(h.conv.groupEpoch, 1)
+  assert.deepStrictEqual(h.handler.groupLinks.store.state.pendingRemovals, {})
+  assert.ok(h.log.some(e => e[0] === 'append' && e[1] === '__epoch'))
+})
+
+test('only capabilities on the current topic confirm receipt of a rekey', async () => {
+  const h = harness({ conversation: ownerGroup() })
+  h.handler.groupLinks.store.setMemberCaps('g1', ANA, ['group_admin_v1'])
+  await h.handler._removeMember('g1', CAL)
+  const receive = createPeerReceiver(() => ({ chatStore: h.chatStore, identity: { publicKeyHex: OWNER }, ipcHandler: h.handler }))
+  await receive('g1', ANA, { type: '__caps', features: ['group_admin_v1'], groupTopicHex: topic(G0) }, { replicated: true })
+  assert.strictEqual(h.handler.groupLinks.store.pendingRekey('g1')[ANA], G0, 'an old replicated announcement is not receipt')
+  await receive('g1', ANA, { type: '__caps', features: ['group_admin_v1'], groupTopicHex: topic(h.conv.groupId) }, { replicated: true })
+  assert.strictEqual(h.handler.groupLinks.store.pendingRekey('g1')[ANA], undefined)
+  assert.strictEqual(h.handler.groupLinks.store.pendingRekey('g1')[BEN], G0)
+})
+
+test('a repeated rekey invitation reannounces capabilities to recover a lost confirmation', async () => {
+  const h = harness({ me: ANA, conversation: { id: 'local-7', type: 'group', groupId: G0, creatorKey: OWNER, participantIds: [OWNER, BEN] } })
+  await h.handler._handleGroupInvite(rekeyInvite(), OWNER)
+  await h.handler._handleGroupInvite(rekeyInvite(), OWNER)
+  assert.strictEqual(h.log.filter(e => e[0] === 'send' && e[1] === '__caps').length, 2)
 })

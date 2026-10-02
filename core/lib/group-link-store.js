@@ -18,8 +18,8 @@
  *   memberCaps: conversationId -> { memberKey: [feature, ...] }
  *   pendingRekey: conversationId -> { memberKey: groupId they were last sent }
  *     members still to be handed the group's new secret: on an older app
- *     until they announce they understand it, otherwise until a transport
- *     takes the invite
+ *     until they announce they understand it and are on the current topic
+ *   pendingRemovals: conversationId -> interrupted owner removal
  *   pendingAdmissions: conversationId -> { memberKey: { viaLink, queuedAt } }
  *     link admissions whose invite no transport has taken yet
  *   capsAnnounced: conversationId -> version this device announced there
@@ -35,7 +35,7 @@ const diag = createDiagnosticLogger('GLINK')
 const FILE_VERSION = 1
 
 function emptyState () {
-  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, pendingRekey: {}, pendingAdmissions: {}, capsAnnounced: {}, blockedKeys: [] }
+  return { version: FILE_VERSION, owner: {}, joiner: {}, joinedVia: {}, removed: {}, memberCaps: {}, pendingRekey: {}, pendingRemovals: {}, pendingAdmissions: {}, capsAnnounced: {}, blockedKeys: [] }
 }
 
 function isObject (value) {
@@ -62,7 +62,7 @@ class GroupLinkStore {
       return
     }
     const state = emptyState()
-    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps', 'pendingRekey', 'pendingAdmissions', 'capsAnnounced']) {
+    for (const key of ['owner', 'joiner', 'joinedVia', 'removed', 'memberCaps', 'pendingRekey', 'pendingRemovals', 'pendingAdmissions', 'capsAnnounced']) {
       if (isObject(stored[key])) state[key] = stored[key]
     }
     if (Array.isArray(stored.blockedKeys)) state.blockedKeys = stored.blockedKeys.filter(k => typeof k === 'string')
@@ -208,6 +208,7 @@ class GroupLinkStore {
     delete this.state.removed[conversationId]
     delete this.state.memberCaps[conversationId]
     delete this.state.pendingRekey[conversationId]
+    delete this.state.pendingRemovals[conversationId]
     delete this.state.pendingAdmissions[conversationId]
     delete this.state.capsAnnounced[conversationId]
   }

@@ -662,7 +662,7 @@ async function initialize() {
         // could not get before.
         if (ipcHandler) {
           for (const conv of conversations) {
-            if (conv.type === 'group') ipcHandler.announceGroupCaps(conv.id)
+            if (conv.type === 'group') ipcHandler.announceGroupCaps(conv.id, { force: true })
           }
           ipcHandler.retryDeferredRekeys().catch((err) => {
             diag('Deferred group secrets not retried: ' + (err.message || err))

@@ -9,6 +9,7 @@ function createPeerReceiver (getDependencies) {
   const chains = new Map()
   return async function receive (conversationId, peer, input, { replicated = false } = {}) {
     const record = normalizePeerRecord(input, peer)
+    const reportedTopic = record.groupTopicHex
     const findInvitedGroup = store => record.type === 'group_invite' && store &&
       [...store.conversations.values()].find(conv => conv.type === 'group' && conv.groupId === record.groupId)
     const invitedGroup = findInvitedGroup(getDependencies().chatStore)
@@ -46,7 +47,7 @@ function createPeerReceiver (getDependencies) {
           return
         }
         if (record.type === '__caps') {
-          if (conv && conv.type === 'group' && ipcHandler) ipcHandler.onMemberCaps(conv.id, peer, record.features)
+          if (conv && conv.type === 'group' && ipcHandler) await ipcHandler.onMemberCaps(conv.id, peer, record.features, reportedTopic)
           return
         }
         if (!GROUP_CONTROLS.has(record.type) && record.type !== 'direct_invite') return

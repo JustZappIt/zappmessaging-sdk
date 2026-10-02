@@ -61,6 +61,8 @@ function makeHarness ({ conversations = {}, keyPair = MY_KP, storePath = null } 
   p2pManager.groupConversations = new Map()
   p2pManager.joinGroupConversation = async (id) => { calls.joins.push(id); return true }
   p2pManager.openRemoteCore = async () => true
+  p2pManager.sendToConversationDurably = async () => ({ sent: true })
+  p2pManager.switchGroupTopic = async () => true
   p2pManager.sendInvite = async (key, invite) => { calls.invites.push({ key, invite }); return true }
   p2pManager.sendToConversation = (id, record) => { calls.broadcasts.push({ id, record }); return true }
 
@@ -69,7 +71,13 @@ function makeHarness ({ conversations = {}, keyPair = MY_KP, storePath = null } 
     chatStore,
     contactStore: { async getContact () { return null }, async clearAll () {} },
     p2pManager,
-    hypercoreManager: { getLocalCoreKey: () => 'cc'.repeat(32) },
+    hypercoreManager: {
+      getLocalCoreKey: () => 'cc'.repeat(32),
+      getOrCreateLocalCore: async () => ({ length: 0 }),
+      removeRemoteCore: async () => {},
+      rekeyConversation: () => ({ prevCoreKey: 'cc'.repeat(32), prevLength: 0 }),
+      appendMessage: async () => {}
+    },
     groupLinkStore: new GroupLinkStore({ filePath: storePath || path.join(tmpRoot, 'links-' + (++counter) + '.json') })
   })
   handler.pushEvent = (type, payload) => calls.events.push({ type, payload })
@@ -356,3 +364,75 @@ async function admissionInviteFrom (handler, linkId) {
   const viaLink = handler.groupLinks.viaLinkFor('g1', linkId, NEWCOMER)
   return handler._admitViaLink('g1', NEWCOMER, 'Ana', viaLink)
 }
+
+
+test('requests expire when repeated resets discard their signing key', async () => {
+  const h = makeHarness({ conversations: ownedGroup() })
+  const service = h.handler.groupLinks
+  const info = service.enableLink('g1', { approval: 'owner' })
+  const joiner = makeHarness({ keyPair: keyPairFrom(3) })
+  joiner.handler.p2pManager.putMailboxAs = async () => true
+  const joined = await joiner.handler.groupLinks.join(info.link)
+  const req = joiner.handler.groupLinks.store.joinerRecord(joined.linkId).request
+  const entry = service.store.ownerEntry('g1')
+  await service._handleRequest('g1', entry, entry.current, true, req)
+  for (let i = 0; i < 5; i++) service.resetLink('g1')
+  joiner.handler.p2pManager.putMailboxAs = async () => false
+  await joiner.handler.groupLinks.cancel(joined.linkId)
+  assert.strictEqual(service.listRequests('g1').length, 0, 'discard requests when their signing key is retired')
+  await assert.rejects(service.approve('g1', NEWCOMER), e => e.code === 'REQUEST_NOT_FOUND')
+  assert.strictEqual(h.calls.invites.length, 0)
+  assert.strictEqual(joiner.chatStore.conversations.size, 0, 'an old pending approval must not join someone who cancelled')
+})
+
+test('a delayed invite for a previous epoch must not create another group', async () => {
+  const previousId = GROUP_ID
+  const current = { id: 'g1', type: 'group', groupId: 'cd'.repeat(32), groupEpoch: 1, pastGroupIds: [{ groupId: previousId, epoch: 0 }], creatorKey: PEER, displayName: 'Hiking Crew', participantIds: [PEER] }
+  const h = makeHarness({ conversations: { g1: current } })
+  const invite = { type: 'group_invite', groupId: previousId, groupName: 'Hiking Crew', creatorKey: PEER, senderKey: PEER, participants: [PEER, MY] }
+  await h.handler._handleGroupInvite(invite, PEER)
+  assert.strictEqual(h.chatStore.conversations.size, 1, 'replaying an invite for a past secret must not resurrect a duplicate group')
+})
+
+test('withdrawal during approval must not leave an admitted ghost member', async () => {
+  const h = makeHarness({ conversations: ownedGroup() })
+  const service = h.handler.groupLinks
+  const info = service.enableLink('g1', { approval: 'owner' })
+  const parsed = gl.parseLink(info.link)
+  const req = gl.createJoinRequest({ secret: parsed.secret, rendezvousPublicKey: parsed.rendezvousPublicKey, joinerKeyPair: keyPairFrom(3), joinerName: 'Ben', requestedAt: Date.now() })
+  const entry = service.store.ownerEntry('g1')
+  await service._handleRequest('g1', entry, entry.current, true, req)
+  let releaseInvite
+  let inviteReached
+  const entered = new Promise(resolve => { inviteReached = resolve })
+  h.handler.p2pManager.sendInvite = async () => { inviteReached(); return new Promise(resolve => { releaseInvite = resolve }) }
+  const approval = service.approve('g1', NEWCOMER)
+  await entered
+  const withdrawal = gl.createJoinWithdrawal({ request: req, rendezvousPublicKey: parsed.rendezvousPublicKey, joinerKeyPair: keyPairFrom(3) })
+  await service._handleRequest('g1', entry, entry.current, true, withdrawal)
+  releaseInvite(true)
+  await assert.rejects(approval, e => e.code === 'REQUEST_NOT_FOUND')
+  assert.ok(!h.chatStore.conversations.get('g1').participantIds.includes(NEWCOMER), 'withdrawal must remove a member even while admission delivery is in flight')
+})
+
+test('withdrawal during automatic admission removes the joiner and rotates the shared secret', async () => {
+  const h = makeHarness({ conversations: ownedGroup() })
+  const service = h.handler.groupLinks
+  const info = service.enableLink('g1', { approval: 'auto' })
+  const parsed = gl.parseLink(info.link)
+  const request = gl.createJoinRequest({ secret: parsed.secret, rendezvousPublicKey: parsed.rendezvousPublicKey, joinerKeyPair: keyPairFrom(3), joinerName: 'Ben', requestedAt: Date.now() })
+  const entry = service.store.ownerEntry('g1')
+  let release
+  let entered
+  const sending = new Promise(resolve => { entered = resolve })
+  h.handler.p2pManager.sendInvite = async () => { entered(); return new Promise(resolve => { release = resolve }) }
+  const admission = service._handleRequest('g1', entry, entry.current, true, request)
+  await sending
+  const withdrawal = gl.createJoinWithdrawal({ request, rendezvousPublicKey: parsed.rendezvousPublicKey, joinerKeyPair: keyPairFrom(3) })
+  await service._handleRequest('g1', entry, entry.current, true, withdrawal)
+  release(true)
+  assert.strictEqual(await admission, true)
+  assert.ok(!h.chatStore.conversations.get('g1').participantIds.includes(NEWCOMER))
+  assert.notStrictEqual(h.chatStore.conversations.get('g1').groupId, GROUP_ID)
+  assert.strictEqual(entry.current.joins, 0)
+})
