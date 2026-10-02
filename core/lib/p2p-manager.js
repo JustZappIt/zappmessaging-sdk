@@ -134,6 +134,7 @@ class P2PManager extends EventEmitter {
     this._mailboxBootstrapInFlight = new Map()
     this._mailboxBootstrapAt = new Map()
     this._mailboxDrainInFlight = null
+    this._auxiliaryDrain = null
     this._platformHttpRequests = new Map()
     this._platformHttpRequestSequence = 0
 
@@ -620,10 +621,10 @@ class P2PManager extends EventEmitter {
    * which the caller closes when its fetch is over, or null when it cannot be
    * opened.
    */
-  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex) {
+  async openRemoteMediaCore (conversationId, peerKeyHex, coreKeyHex, groupIdOverride = null) {
     if (!this.hypercoreManager || !coreKeyHex) return null
     try {
-      const core = await this.hypercoreManager.openRemoteMediaCore(conversationId, peerKeyHex, coreKeyHex)
+      const core = await this.hypercoreManager.openRemoteMediaCore(conversationId, peerKeyHex, coreKeyHex, groupIdOverride)
       if (this.blindMirror) {
         this.blindMirror.addRemoteMediaCore(conversationId, coreKeyHex, core, this._remoteCoreReferrer(conversationId))
       }
@@ -980,6 +981,29 @@ class P2PManager extends EventEmitter {
       diag('joinGroupConversation ERROR:', error)
       return false
     }
+  }
+
+  /**
+   * The group has a new secret: stop announcing the old topic and join the
+   * new one. Connections stay up, since other chats may share them; the ones
+   * to remaining members are picked up again by joinGroupConversation.
+   * @returns {Promise<boolean>}
+   */
+  async switchGroupTopic (conversationId) {
+    const entry = this.groupConversations.get(conversationId)
+    if (entry) {
+      try {
+        if (entry.discovery) await entry.discovery.destroy()
+      } catch (error) {
+        diag('Error leaving the previous group topic: ' + (error.message || error))
+      }
+      this.groupTopicToConversation.delete(entry.groupTopicHex)
+      this.groupConversations.delete(conversationId)
+    }
+    const conv = this._getConversation && this._getConversation(conversationId)
+    if (!conv || conv.type !== 'group') return false
+    const self = this.keyPair ? b4a.toString(this.keyPair.publicKey, 'hex') : null
+    return this.joinGroupConversation(conversationId, conv.groupId, [self, ...(conv.participantIds || [])].filter(Boolean))
   }
 
   /**
@@ -2020,15 +2044,7 @@ class P2PManager extends EventEmitter {
     // Try sending via existing connections first. A write that did not land must
     // fall through to the mailbox below, not report the invite as sent: this is
     // the only path that carries the core key.
-    try {
-      const framed = this._firstLiveFramed(this.allPeerConnections.get(peerPublicKeyHex))
-      if (framed && framed.writeJSON(inviteData)) {
-        diag('Sent invite to', peerPublicKeyHex.substring(0, 12), 'via existing connection')
-        return true
-      }
-    } catch (e) {
-      diag('Failed to send via existing connection:', e.message)
-    }
+    if (this._writeInviteLive(peerPublicKeyHex, inviteData)) return true
 
     // Store as pending invite (delivered when peer connects)
     if (!this.pendingInvites.has(peerPublicKeyHex)) {
@@ -2085,6 +2101,36 @@ class P2PManager extends EventEmitter {
     return false // invite is pending
   }
 
+  _writeInviteLive (peerPublicKeyHex, inviteData) {
+    try {
+      const framed = this._firstLiveFramed(this.allPeerConnections.get(peerPublicKeyHex))
+      if (framed && framed.writeJSON(inviteData)) {
+        diag('Sent invite to', peerPublicKeyHex.substring(0, 12), 'via existing connection')
+        return true
+      }
+    } catch (e) {
+      diag('Failed to send via existing connection:', e.message)
+    }
+    return false
+  }
+
+  /**
+   * Try an invite again over a live connection or the mailbox only. Unlike
+   * sendInvite it queues nothing in memory: the caller keeps the invite and
+   * already has an earlier copy queued for when the peer connects.
+   * @returns {Promise<boolean>} whether a transport took it
+   */
+  async resendInvite (peerPublicKeyHex, inviteData) {
+    if (!this.swarm) return false
+    if (this._writeInviteLive(peerPublicKeyHex, inviteData)) return true
+    try {
+      return await this._putInviteMailbox(peerPublicKeyHex, inviteData)
+    } catch (e) {
+      diag('Invite mailbox put failed for ' + peerPublicKeyHex.substring(0, 12) + ': ' + (e.message || e))
+      return false
+    }
+  }
+
   /**
    * Run one mailbox operation over the first transport that answers.
    *
@@ -2093,14 +2139,17 @@ class P2PManager extends EventEmitter {
    * UDP outright. The Protomux mailbox on each configured blind peer is the
    * fallback for when the HTTPS endpoint is unreachable or unset.
    * @param {Function} operation (request) => Promise<any>
+   * @param {{publicKey: Buffer, secretKey: Buffer}} [keyPair] who the transport
+   *   authenticates as. Defaults to this identity; group links pass the link's
+   *   rendezvous key or a throwaway key so the identity never appears.
    * @returns {Promise<{ok: boolean, value?: any}>} ok is false when no transport answered
    */
-  async _throughMailbox (operation) {
-    if (!this.keyPair) return { ok: false }
+  async _throughMailbox (operation, keyPair = this.keyPair) {
+    if (!this.keyPair || !keyPair) return { ok: false }
 
     if (config.INVITE_MAILBOX_URL) {
       try {
-        const value = await throughHttps(config.INVITE_MAILBOX_URL, this.keyPair, operation, {
+        const value = await throughHttps(config.INVITE_MAILBOX_URL, keyPair, operation, {
           postJson: (url, body) => this._platformPostJson(url, body)
         })
         return { ok: true, value }
@@ -2114,7 +2163,7 @@ class P2PManager extends EventEmitter {
       try {
         const value = await throughDht(
           this.swarm.dht,
-          this.keyPair,
+          keyPair,
           key,
           config.BLIND_PEER_ADDRESS,
           operation
@@ -2135,10 +2184,48 @@ class P2PManager extends EventEmitter {
     return ok
   }
 
+  /**
+   * Deposit a record signed, and carried, as another key: a group link's
+   * rendezvous key, or a throwaway key for a join request.
+   * @returns {Promise<boolean>}
+   */
+  async putMailboxAs (senderKeyPair, recipientKeyHex, record) {
+    const { ok } = await this._throughMailbox(
+      request => putInvite(request, senderKeyPair, recipientKeyHex, record),
+      senderKeyPair
+    )
+    return ok
+  }
+
+  /**
+   * Drain the mailbox that belongs to keyPair (a group link's rendezvous key).
+   * `deliver` answers whether each entry is finished with, as for invites.
+   * @returns {Promise<boolean>} whether any transport answered
+   */
+  async drainMailboxAs (keyPair, deliver) {
+    const { ok } = await this._throughMailbox(request => drainInvites(request, keyPair, deliver), keyPair)
+    return ok
+  }
+
+  /** Runs after every drain of this identity's mailbox (group links use it). */
+  setAuxiliaryDrain (fn) {
+    this._auxiliaryDrain = typeof fn === 'function' ? fn : null
+  }
+
   async _drainInviteMailboxes () {
     if (this._mailboxDrainInFlight) return await this._mailboxDrainInFlight
 
-    const operation = this._drainInviteMailboxesOnce()
+    const operation = (async () => {
+      const delivered = await this._drainInviteMailboxesOnce()
+      if (this._auxiliaryDrain) {
+        try {
+          await this._auxiliaryDrain()
+        } catch (e) {
+          diag('Auxiliary mailbox drain failed: ' + (e.message || e))
+        }
+      }
+      return delivered
+    })()
     this._mailboxDrainInFlight = operation
     try {
       return await operation
@@ -2157,6 +2244,12 @@ class P2PManager extends EventEmitter {
     const deliver = async (entry) => {
       const invite = entry.invite
       const sender = entry.senderKeyHex
+      // A group link answer is signed by the link's rendezvous key, not by an
+      // identity, so the sender check below does not apply; the receiver
+      // checks the signature against the key of its own pending request.
+      if (invite && invite.type === 'group_join_result') {
+        return await this._deliverInvite(invite, sender)
+      }
       if (!invite || (invite.type !== 'direct_invite' && invite.type !== 'group_invite')) {
         diag('Discarded unsupported blind mailbox message')
         return true

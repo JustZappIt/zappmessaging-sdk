@@ -623,6 +623,8 @@ async function initialize() {
         // claimed by the pool first.
         const joins = []
         for (const conv of conversations) {
+          // Removed from the group: its history stays readable, nothing more flows.
+          if (conv.type === 'group' && conv.removedAt) continue
           if (conv.type === 'group' && conv.groupId) {
             const allKeys = [identity.publicKeyHex, ...conv.participantIds]
             joins.push({
@@ -655,6 +657,20 @@ async function initialize() {
         })
         coldStartMilestone('conversation_reconnect_finished')
         diag('Auto-reconnected ' + conversations.length + ' conversation(s)')
+        // Let each group's owner know this app understands removal, and as an
+        // owner, hand waiting members a group secret or a link admission they
+        // could not get before.
+        if (ipcHandler) {
+          for (const conv of conversations) {
+            if (conv.type === 'group') ipcHandler.announceGroupCaps(conv.id, { force: true })
+          }
+          ipcHandler.retryDeferredRekeys().catch((err) => {
+            diag('Deferred group secrets not retried: ' + (err.message || err))
+          })
+          ipcHandler.retryPendingAdmissions().catch((err) => {
+            diag('Pending link admissions not retried: ' + (err.message || err))
+          })
+        }
       } catch (e) {
         diag('Failed to auto-reconnect conversations: ' + (e.message || e))
       }

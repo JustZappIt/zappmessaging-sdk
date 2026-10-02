@@ -29,5 +29,7 @@ data class ZMConversation(
     /** Whether current user is the group owner */
     val isOwner: Boolean? = null,
     /** Number of unread messages */
-    val unreadCount: Int? = null
+    val unreadCount: Int? = null,
+    /** Set when the group owner removed us: history stays, nothing more flows. Epoch millis. */
+    val removedAt: Long? = null
 )

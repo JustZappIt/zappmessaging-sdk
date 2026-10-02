@@ -43,6 +43,11 @@ public struct ZMOperationalFailure: Equatable, Sendable {
         case groupDeleted = "conversation.group_deleted"
         case groupRenamed = "conversation.group_renamed"
         case memberAdded = "conversation.member_added"
+        case removeMember = "remove_member"
+        case approveJoin = "group_link.approve"
+        case memberRemoved = "conversation.member_removed"
+        case removedFromGroup = "conversation.removed_from_group"
+        case linkMemberJoined = "group_link.member_joined"
     }
 
     public enum Code: Equatable, Sendable {

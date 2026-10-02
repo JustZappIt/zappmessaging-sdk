@@ -1,4 +1,4 @@
-const { normalizePeerRecord, controlKey, GROUP_CONTROLS } = require('./peer-record')
+const { normalizePeerRecord, controlKey, GROUP_CONTROLS, CREATOR_CONTROLS } = require('./peer-record')
 const { ChatStore } = require('./chat-store')
 const { deriveGroupChatTopic } = require('./rooms')
 const b4a = require('b4a')
@@ -9,6 +9,7 @@ function createPeerReceiver (getDependencies) {
   const chains = new Map()
   return async function receive (conversationId, peer, input, { replicated = false } = {}) {
     const record = normalizePeerRecord(input, peer)
+    const reportedTopic = record.groupTopicHex
     const findInvitedGroup = store => record.type === 'group_invite' && store &&
       [...store.conversations.values()].find(conv => conv.type === 'group' && conv.groupId === record.groupId)
     const invitedGroup = findInvitedGroup(getDependencies().chatStore)
@@ -23,11 +24,16 @@ function createPeerReceiver (getDependencies) {
       let conv = conversationId ? await chatStore.getConversation(conversationId) : (findInvitedGroup(chatStore) || null)
       if (conversationId && chatStore.hasLeftConversation(conversationId)) return
       if (replicated && !conv) return
+      // Removed from this group: nothing more arrives in it.
+      if (conv && conv.removedAt) return
       if (conv) {
         if (!chatStore.isPeerAuthorized(conv.id, peer)) return
         if (conv.type === 'group') {
           const topic = b4a.toString(deriveGroupChatTopic(conv.groupId), 'hex')
-          if (record.groupTopicHex && record.groupTopicHex !== topic) return
+          // Records written before the group got a new secret carry an
+          // earlier topic; they still belong here.
+          const knownTopics = [topic, ...(conv.pastGroupIds || []).map(p => b4a.toString(deriveGroupChatTopic(p.groupId), 'hex'))]
+          if (record.groupTopicHex && !knownTopics.includes(record.groupTopicHex)) return
           // Legacy replicated controls have a sender-local id or no routing.
           // The registered core supplies the authoritative conversation scope.
           if (record.groupId && record.groupId !== conv.groupId) return
@@ -40,12 +46,15 @@ function createPeerReceiver (getDependencies) {
           if (conv) await processReceipt(conv.id, record, peer)
           return
         }
+        if (record.type === '__caps') {
+          if (conv && conv.type === 'group' && ipcHandler) await ipcHandler.onMemberCaps(conv.id, peer, record.features, reportedTopic)
+          return
+        }
         if (!GROUP_CONTROLS.has(record.type) && record.type !== 'direct_invite') return
         if (!conv && !['group_invite', 'direct_invite'].includes(record.type)) return
         if (conv && conv.type === 'group') {
           if (record.type === 'direct_invite') return
-          if (['group_invite', 'group_member_added', 'group_deleted'].includes(record.type) &&
-              conv.creatorKey !== peer) return
+          if (CREATOR_CONTROLS.has(record.type) && conv.creatorKey !== peer) return
         }
         if (record.type === 'group_invite' &&
             (record.creatorKey !== peer || !record.participants.includes(peer) ||

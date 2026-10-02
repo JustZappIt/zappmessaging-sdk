@@ -399,7 +399,7 @@ class ChatStore {
     if (!conv) return null
     const previous = { ...conv }
     // Allowlist: only permit known safe fields to be updated
-    const allowedFields = ['displayName', 'lastMessage', 'lastMessageTimestamp', 'participantIds', 'groupId', 'creatorKey', 'localCoreKey', 'remoteCoreKeys']
+    const allowedFields = ['displayName', 'lastMessage', 'lastMessageTimestamp', 'participantIds', 'groupId', 'creatorKey', 'localCoreKey', 'remoteCoreKeys', 'groupEpoch', 'pastGroupIds', 'removedAt']
     for (const key of allowedFields) {
       if (updates.hasOwnProperty(key)) {
         conv[key] = updates[key]
